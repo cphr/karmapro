@@ -4,4 +4,4 @@ Karma Pro is an open source code review tool (written in Swift) that can assist 
 
 To build Karma Pro download the repo and build it with `./build.sh` to download the self-signed release click [here](https://github.com/cphr/karmapro/releases/download/v0.10/Karma.Pro.dmg)
 
-Karma Pro post at [Cipher](https://www.cipher.org.uk) here [https://cipher.org.uk/2026/09/19/Karma-Pro-The-Code-Security-Review-tool/](https://cipher.org.uk/2026/09/08/Karma-Pro-The-Code-Security-Review-tool/)
+Karma Pro post at [Cipher](https://www.cipher.org.uk) here [https://cipher.org.uk/2026/09/19/Karma-Pro-The-Code-Security-Review-tool/](https://cipher.org.uk/2026/09/19/Karma-Pro-The-Code-Security-Review-tool/)
