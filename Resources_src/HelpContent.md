@@ -48,7 +48,7 @@ The Security Bugs Tracker window provides a centralised, interactive management 
 - **Interactive Filtering & Sorting**: Quickly filter findings by severity level, category (e.g. SQL Injection, Buffer Overflow, Command Injection), or reachability status. Click column headers to sort by file location or risk level.
 
 ## 7. AI Assistant 
-The **AI** toolbar button (right of the Bugs button) opens the AI Assistant window, which connects Karma Pro to [OpenRouter](https://openrouter.ai) so you can query large language models about the currently open project:
+The **AI** toolbar button (right of the Bugs button) opens the AI Assistant window, which connects Karma Pro to Ollama or to [OpenRouter](https://openrouter.ai) so you can query large language models about the currently open project:
 - **Connect**: Paste your OpenRouter API key (from `openrouter.ai/keys`) into the key field and click **Connect**. The key is saved on your machine and remembered across launches.
 - **Model Selection**: Pick any model from the dropdown (Claude, GPT-4o, Gemini, Llama, DeepSeek, Mistral, …). The list is fetched live from OpenRouter when a key is set; the **Refresh** button re-fetches it. Your chosen model is remembered and can be changed at any time.
 - **Project Context**: Every prompt is automatically anchored to the project currently open in Karma Pro, its path is included in the system message sent with each request. The AI window cannot be opened until a project folder is selected.
