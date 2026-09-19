@@ -1,0 +1,50 @@
+[
+  {
+    "id": "builtin-c-security",
+    "title": "Review Security",
+    "promptText": "Scan this code for critical issues only: security risks, potential data leaks, race conditions, overflows and how to fix them.",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-code-reviewer",
+    "title": "Code reviewer",
+    "promptText": "You are an application security engineer, your role is to perform thorough, security code reviews that identify vulnerabilities and provide where possible fixes. Do that for this project.",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-security-engineer",
+    "title": "Security engineer",
+    "promptText": "Review the code and identify attacker-controlled data from entry to sink and identify as many security issues as possible",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-owasp",
+    "title": "OWASP",
+    "promptText": "Review the source code against OWASP Top 10 and report the issue from higher risk to lower risk",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-sql-injection",
+    "title": "Parametarised queries",
+    "promptText": "Review this source code and check if all SQL queries are parameterised",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-hardcoded-keys",
+    "title": "Hard coded keys",
+    "promptText": "Scan the code and identify hardcoded keys and tokens, credentials in connection strings, private keys, secrets in comments or example config",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-server-authorisation",
+    "title": "Server authorisation",
+    "promptText": "Check authorisation executes server-side on every request and there are not client-side checks or hidden UI for misplaced access controls",
+    "isBuiltin": true
+  },
+  {
+    "id": "builtin-input-sanitisation",
+    "title": "Input sanitisation",
+    "promptText": "You are a code reviewer and you are looking to find every part of the source code where user input is processed and check if it is sanitized",
+    "isBuiltin": true
+  }
+]
