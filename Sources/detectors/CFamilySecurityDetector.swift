@@ -334,6 +334,10 @@ extension AstSecurityDetector {
             case .member(let b, let m, _, _):
                 guard let bk = exprKey(b) else { return nil }
                 return "\(bk).\(m)"
+            case .integerLiteral(let v, _):
+                return v
+            case .charLiteral(let v, _):
+                return v
             default:
                 return nil
             }
