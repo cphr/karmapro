@@ -598,6 +598,13 @@ struct JSSecurityDetector {
                                         message: "document.write can inject script into the page.",
                                         taint: taintPath(argVals.first).map { "\($0) → document.write" }))
             }
+        case "insertAdjacentHTML":
+            if args.count > 1, argVals[1].tainted {
+                findings.append(finding(def: def, offset: offset, category: "XSS (insertAdjacentHTML)",
+                                        severity: .high, reachable: reachable,
+                                        message: "Insertion of unescaped content via insertAdjacentHTML can inject markup or script.",
+                                        taint: taintPath(argVals[1]).map { "\($0) → insertAdjacentHTML" }))
+            }
         case "postMessage":
             if args.count >= 2, case .literal(let target, _) = args[1], target.contains("*") {
                 findings.append(finding(def: def, offset: offset, category: "postMessage Origin Validation",
@@ -680,13 +687,22 @@ struct JSSecurityDetector {
                                         taint: "\(taintPath(argVals.first) ?? "?") → request"))
             }
         case "query", "execute":
-            // Parameterized form db.query(text, params) binds values separately:
-            // tainted text alone is not an injection sink.
-            if args.count < 2, argVals.first?.tainted == true {
-                findings.append(finding(def: def, offset: offset, category: "SQL Injection",
-                                        severity: .critical, reachable: reachable,
-                                        message: "SQL query built from tainted input without parameterization.",
-                                        taint: "\(taintPath(argVals.first) ?? "?") → SQL query"))
+            // Parameterized form db.query(text, params[, cb]) / execute(text,
+            // params) binds values in a separate argument, so tainted text alone
+            // is not an injection sink. A trailing callback is NOT a parameter
+            // list: db.query(sql, cb) hands the query string straight to the
+            // database and IS an injection when the text is tainted.
+            if argVals.first?.tainted == true {
+                let hasParamBinding = args.dropFirst().contains { arg in
+                    if case .arrow = arg { return false }
+                    return true
+                }
+                if !hasParamBinding {
+                    findings.append(finding(def: def, offset: offset, category: "SQL Injection",
+                                            severity: .critical, reachable: reachable,
+                                            message: "SQL query built from tainted input without parameterization.",
+                                            taint: "\(taintPath(argVals.first) ?? "?") → SQL query"))
+                }
             }
         case "redirect":
             if argVals.first?.tainted == true {
@@ -871,11 +887,14 @@ struct JSSecurityDetector {
                                         taint: "\(taintPath(argVals.first) ?? "?") → \(leaf) index"))
             }
         case "evaluate":
-            if args.count >= 2, argVals[1].tainted {
+            // `doc.evaluate(xpathExpr, contextNode, nsResolver, type, result)` —
+            // the INJECTION surface is the tainted XPath expression (arg 0);
+            // the context node is a legitimate dynamic argument.
+            if argVals.first?.tainted == true {
                 findings.append(finding(def: def, offset: offset, category: "XPath Injection",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted XPath expression.",
-                                        taint: "\(taintPath(argVals[1]) ?? "?") → XPath"))
+                                        taint: "\(taintPath(argVals.first) ?? "?") → XPath"))
             }
         default:
             break
@@ -985,6 +1004,13 @@ struct JSSecurityDetector {
                 return
             }
             if case .ident(let bn, _) = base, ctx.objectLitVars.contains(bn) {
+                return
+            }
+            // Keyed lookups into request/URL/storage maps (`req.query[name]`,
+            // `location.search[key]`, `sessionStorage[k]`) are property reads, not
+            // positional array accesses: a miss yields `undefined`, never an
+            // out-of-bounds element read, so there is no index bound to validate.
+            if isDictionaryLookupBase(baseName) {
                 return
             }
             findings.append(finding(def: def, offset: offset,
@@ -1167,6 +1193,23 @@ struct JSSecurityDetector {
 
     private func isReachable(_ def: JSDef) -> Bool {
         reachableNames.contains(def.name) || reachableNames.isEmpty
+    }
+
+    /// True when the base of an indexed access is a known plain-object map
+    /// rather than a positional array. Express/Koa request bags, the URL query
+    /// parcel, and web storage are property collections; a tainted key into one
+    /// (commonly `req.query[fieldName]`) is a property lookup, so the
+    /// Unvalidated Array Index rule must not treat it as a bounds violation.
+    private func isDictionaryLookupBase(_ baseName: String) -> Bool {
+        let lower = baseName.lowercased()
+        if lower == "location.search" || lower == "location.query"
+            || lower == "sessionStorage" || lower == "localStorage" {
+            return true
+        }
+        let isBag = lower.hasPrefix("req.") || lower.hasPrefix("request.")
+            || lower.hasPrefix("ctx.") || lower.hasPrefix("event.")
+        guard isBag, let tail = lower.components(separatedBy: ".").last else { return false }
+        return ["query", "body", "params", "cookies", "headers", "session", "dataset"].contains(tail)
     }
 
     private func bodyTokens(of def: JSDef) -> [CAstToken] {

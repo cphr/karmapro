@@ -470,7 +470,7 @@ public final class JSExprParser {
             i += 1
             return .ident(t.text, t.offset)
         case .keyword:
-            if ["true", "false", "null", "undefined", "this", "super"].contains(t.text) {
+            if ["true", "false", "null", "undefined", "this", "super", "eval"].contains(t.text) {
                 i += 1
                 return .ident(t.text, t.offset)
             }
