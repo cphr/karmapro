@@ -12,6 +12,7 @@ extension AstSecurityDetector {
     /// `strcpy`, `printf` and `fopen`. Kernel categories are owned by the
     /// dedicated KernelAstDetector and are intentionally absent here.
 
+
     static let cSinks: [String: AstSinkRule] = [
         "strcpy": .init(category: "Buffer Overflow", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
         "strcat": .init(category: "Buffer Overflow", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
