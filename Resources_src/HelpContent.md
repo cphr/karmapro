@@ -5,7 +5,7 @@
 Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerability classification, and security auditing application. Karma Pro provides deep architectural inspection, multi-language support, interactive flowcharts, and security tracking.
 
 ## 1. Getting Started & Project Navigation
-- **Opening Files & Workspaces**: Use **File > Open...** (or press `Cmd+O`) project directory onto the Karma Pro window to load it into the sidebar file tree.
+- **Opening Files & Workspaces**: Use **File > Open...** project directory onto the Karma Pro window to load it into the sidebar file tree.
 - **Language Filtering**: Karma Pro supports 14 primary languages: **C, C++, Java, C#, Go, Kotlin, Ruby, Python, PHP, Cocoa (Objective-C), Rust, Solidity, Javascript and Swift**, plus an **All Languages** option. Use the language dropdown in the toolbar to isolate files by language.
 - **File Search**: Use the built-in file search window (**Edit > Find in Files...**) to quickly query filenames and navigate across large codebases.
 
@@ -61,4 +61,5 @@ The **AI** toolbar button (right of the Bugs button) opens the AI Assistant wind
 The **Wiki** toolbar button (next to Notes) opens a private research wiki shared across all projects. Write pages in a rich-text editor with a white background, hyperlink selected words instantly with the **Link…** button (or type `[[Page Name]]`), and click any link to open the page, creating it if it doesn't exist yet. Pages can be listed, searched, renamed and deleted, auto-save whenever their window closes, and the whole wiki can be backed up to a `.karmawiki` archive — optionally encrypted with a password and imported back later.
 
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
+
 **Brought to you by cipher.org.uk**
