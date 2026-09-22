@@ -407,6 +407,10 @@ struct AstSecurityDetector {
         // the claims without any signature verification is a complete auth bypass.
         if isKotlin {
             checkKotlinJwtAlgNone(fn: fn, function: name, findings: &findings, reachable: reachable)
+            checkKotlinMobileStructural(fn: fn, function: name, tainted: tainted, crossTainted: crossTainted, findings: &findings, reachable: reachable)
+            // Mobile post-sink suppressions run last so they see the structural
+            // findings (WebView property assignment, Intent routing, X509) too.
+            applyKotlinMobileSuppressions(fn: fn, findings: &findings)
         }
         // PHP: a loose `==` equality between two caller-supplied values used as
         // the authorization decision allows type-juggling bypasses
@@ -604,7 +608,7 @@ struct AstSecurityDetector {
             return checkGoSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, params: params, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         }
         if isKotlin {
-            return checkKotlinSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            return checkKotlinSinks(name: name, qualified: qualified, callee: callee, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         }
         if isPython {
             return checkPythonSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
@@ -680,7 +684,7 @@ struct AstSecurityDetector {
     /// The base identifier a call is dispatched on (`script` for
     /// `script.append(x)`, including `this.field.append(...)` chains), or nil
     /// for static/free calls.
-    private func identifierReceiver(_ callee: CExpr) -> String? {
+    func identifierReceiver(_ callee: CExpr) -> String? {
         switch callee {
         case .identifier(let n, _): return n
         case .member(let base, _, _, _): return identifierReceiver(base)

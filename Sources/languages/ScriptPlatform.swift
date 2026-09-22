@@ -33,6 +33,12 @@ let kotlinSourceAPIs: Set<String> = javaSourceAPIs.union([
     "readLine", "readText", "readBytes", "readLines", "readLinesSequence",
     "System.getenv", "System.getProperty",
     "readBytes", "readLong", "readInt", "readFully", "readUnsignedByte",
+    // Android: values carried in an incoming Intent/Bundle/clipboard are user
+    // data and seed the mobile AST taint pass (mirrors taintReturnFunctions).
+    "getStringExtra", "getIntExtra", "getLongExtra", "getBooleanExtra",
+    "getDoubleExtra", "getStringArrayExtra", "getStringArrayListExtra",
+    "getSerializableExtra", "getParcelableExtra", "getExtras", "getIntent",
+    "getPrimaryClip", "getItemAt",
 ])
 
 /// Write-through sinks for the Kotlin AST pass (reads that fill a parameter).
