@@ -117,7 +117,7 @@ SOURCES=(
   Sources/bayes/HeatmapWindowController.swift
   Sources/utils/HighlightedLinesViewController.swift
 )
-
+	
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Minimum macOS the built app will run on. Keep it as low as the code allows so
