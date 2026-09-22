@@ -58,7 +58,7 @@ The **AI** toolbar button (right of the Bugs button) opens the AI Assistant wind
 - **Import / Export Prompts**: **Export…** saves every stored prompt template (built-in and custom) to a file you can back up or share. **Import…** adds prompts from such a file entries that are already stored.
 
 ## 8. Private Research Wiki
-The **Wiki** toolbar button (next to Notes) opens a private research wiki shared across all projects. Write pages in a rich-text editor with a white background, hyperlink selected words instantly with the **Link…** button (or type `[[Page Name]]`), and click any link to open the page, creating it if it doesn't exist yet. Pages can be listed, searched, renamed and deleted, auto-save whenever their window closes, and the whole wiki can be backed up to a `.karmawiki` archive — optionally encrypted with a password and imported back later.
+The **Wiki** toolbar button (next to Notes) opens a private research wiki shared across all projects. Write pages in a rich-text editor with a white background, hyperlink selected words instantly with the **Link…** button (or type `[[Page Name]]`), and click any link to open the page, creating it if it doesn't exist yet. Pages can be listed, searched, renamed and deleted, auto-save whenever their window closes, and the whole wiki can be backed up to a `.karmawiki` archive, optionally encrypted with a password and imported back later.
 
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
 
