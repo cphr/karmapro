@@ -114,6 +114,9 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     /// Called when the user picks "(AI) How to fix it" from the context menu.
     /// Passes the file, the 1-based line number, and the text of that line.
     var onHowToFix: ((URL, Int, String) -> Void)?
+    /// Called when the user picks "Simulate '…' in the Debugger" from the context menu.
+    /// Passes the file and the function name to run.
+    var onSimulateRequest: ((URL, String) -> Void)?
     /// The charIndex of the right-click that built the current context menu, so
     /// menu actions can resolve which line was clicked.
     private var lastMenuCharIndex = 0
@@ -685,6 +688,15 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
             item.target = self
             item.representedObject = functionName
             menu.addItem(item)
+
+            let simulateItem = NSMenuItem(
+                title: "Simulate '\(functionName)' in the Debugger",
+                action: #selector(simulateFunction(_:)),
+                keyEquivalent: ""
+            )
+            simulateItem.target = self
+            simulateItem.representedObject = functionName
+            menu.addItem(simulateItem)
         }
 
         if let variableName = variableWord(at: charIndex) {
@@ -753,6 +765,12 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         guard let functionName = sender.representedObject as? String,
               let fileURL = currentFileURL else { return }
         onDiagramRequest?(fileURL, functionName)
+    }
+
+    @objc private func simulateFunction(_ sender: NSMenuItem) {
+        guard let functionName = sender.representedObject as? String,
+              let fileURL = currentFileURL else { return }
+        onSimulateRequest?(fileURL, functionName)
     }
 
     @objc private func followVariable(_ sender: NSMenuItem) {

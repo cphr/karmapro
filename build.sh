@@ -67,6 +67,8 @@ SOURCES=(
   Sources/graphs/VariableFlowTracer.swift
   Sources/graphs/VariableFlowDiagramView.swift
   Sources/graphs/VariableFlowWindowController.swift
+  Sources/tools/SimDebugEngine.swift
+  Sources/tools/SimDebugWindowController.swift
   Sources/graphs/BacktraceParser.swift
   Sources/graphs/BacktraceDiagramView.swift
   Sources/graphs/BacktraceAnalyserWindowController.swift
@@ -117,12 +119,18 @@ SOURCES=(
 )
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# Minimum macOS the built app will run on. Keep it as low as the code allows so
+# the app works on older macOS (the default target is the *current* OS, which
+# would otherwise prevent the app from launching on anything older).
 MIN_MACOS="12.0"
 
 echo "Compiling Karma Pro…"
 swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" -swift-version 5 -o "$BIN" "${SOURCES[@]}"
 
 echo "Copying Info.plist and icon…"
+# Always copy the Info.plist and icon from the source resources dir into the bundle,
+# so a clean rebuild always produces a complete bundle.
 cp Resources_src/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 if [ -f Resources_src/AppIcon.icns ]; then
@@ -141,6 +149,8 @@ if [ -f Resources_src/AIPrompts.json ]; then
   cp Resources_src/AIPrompts.json "$APP/Contents/Resources/AIPrompts.json"
 fi
 if [ -d Resources_src/Models ]; then
+  # Remove the previous copy first: plain `cp -R src existing-dir` would nest
+  # the models as Models/Models and duplicate them on every rebuild.
   rm -rf "$APP/Contents/Resources/Models"
   cp -R Resources_src/Models "$APP/Contents/Resources/Models"
 fi

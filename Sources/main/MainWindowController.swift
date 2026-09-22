@@ -17,6 +17,8 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     private var classUsageController: ClassUsageWindowController?
     private var backtraceController: BacktraceAnalyserWindowController?
     private var variableFlowController: VariableFlowWindowController?
+    /// Shared dynamic-debugger window for the "Simulate '…' in the Debugger" feature.
+    private var simulationController: SimDebugWindowController?
     /// Cached project-wide variable tracer, invalidated when the project root changes.
     private var variableFlowTracerCache: (root: URL, tracer: VariableFlowTracer)?
     /// Cancellation token for the in-flight variable-flow search, if any.
@@ -275,6 +277,11 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self.showVariableFlow(projectRoot: root, fileURL: fileURL, charIndex: charIndex, variableName: variableName)
         }
 
+        viewer.onSimulateRequest = { [weak self] fileURL, functionName in
+            guard let self = self else { return }
+            self.showSimulation(fileURL: fileURL, functionName: functionName)
+        }
+
         viewer.onFunctionSelected = { [weak self] _, functionName, source, ext in
             self?.flowPanel.show(functionName: functionName, source: source, fileExtension: ext)
         }
@@ -335,6 +342,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.variableFlowCancellation = nil
             self?.variableFlowTracerCache = nil
             self?.variableFlowController = nil
+            self?.simulationController = nil
             self?.buildProjectSourceIndex(for: url)
             self?.sourceViewer?.clear()
             self?.updateWindowTitle(forFile: nil)
@@ -691,6 +699,29 @@ extension MainWindowController: NSToolbarDelegate {
         sourceViewer?.display(fileAt: url)
         sourceViewer?.scrollToLine(line)
         updateWindowTitle(forFile: url)
+    }
+
+    /// Opens the dynamic-debugger simulation window for a function in a project
+    /// file clicked via the "Simulate '…' in the Debugger" context-menu item.
+    private func showSimulation(fileURL: URL, functionName: String) {
+        if simulationController == nil {
+            let controller = SimDebugWindowController(
+                sourceIndex: projectSourceIndexCache,
+                fileURL: fileURL,
+                functionName: functionName
+            )
+            controller.onOpenFile = { [weak self] url, line in
+                self?.showFile(at: url, line: line)
+            }
+            controller.onFinished = { [weak self] in
+                self?.simulationController = nil
+            }
+            simulationController = controller
+        } else {
+            simulationController?.reload(fileURL: fileURL, functionName: functionName)
+        }
+        simulationController?.showWindow(nil)
+        simulationController?.window?.makeKeyAndOrderFront(nil)
     }
 
     /// Sets the window title to "<project> Project" with the currently-open file's
