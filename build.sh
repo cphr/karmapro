@@ -159,5 +159,5 @@ if [ -d Resources_src/Models ]; then
 fi
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
-
+ 
 echo "Built $APP"
