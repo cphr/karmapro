@@ -48,7 +48,7 @@ The **Security bugs tracker** is a built-in vulnerability tracking tool that hel
 
 - **Create & manage reports**: Add, view, edit, and delete bug reports with a title, severity, exploitability, status, description, package name, and version.
 - **Use preset templates**: common vulnerability titles (SQLi, XSS, RCE, crypto, memory, mobile, cloud, business logic, DoS…) with ready-made descriptions or write your own.
-- **Search**: Live-filter reports by title, description, severity, status, package, or ID.
+- **Search**: Filter bugs by title, description, severity, status, package, or ID.
 - **Triage**: Color-coded severity and exploitability in the list and details, statuses track.
 - **Backup & import**: Export all reports to a .karmapro JSON backup (optionally password-protected) and import them back.
 
