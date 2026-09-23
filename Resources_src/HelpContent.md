@@ -43,10 +43,16 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
   - **Import Model**: Load previously exported Bayesian model JSON files into Karma Pro to instantly apply pretrained classification logic.
 - **ML Scan**: Run probabilistic scans across project files to discover hidden risks alongside confirmed findings. The ML pass is *complementary* to the ruleset/AST scanner: it surfaces probabilistic candidate defects (and can catch language-agnostic "interesting" numbers, variables and functions) that hard-coded rules may miss, while the deterministic scanner provides confirmed, taint-verified findings.
 
-## 6. Security Bugs Tracker Window
-The Security Bugs Tracker window provides a centralised, interactive management console for reviewing, filtering, triaging, and inspecting all discovered security vulnerabilities across your scanned project:
-- **Comprehensive Finding Grid**: Displays every detected vulnerability grouped or listed with its exact file path, line number, function name, severity badge (`Critical`, `High`, `Medium`, `Low`), and detection engine source.
-- **Interactive Filtering & Sorting**: Quickly filter findings by severity level, category (e.g. SQL Injection, Buffer Overflow, Command Injection), or reachability status. Click column headers to sort by file location or risk level.
+## 6. Security Bugs Tracker Tool
+The **Security bugs tracker** is a built-in vulnerability tracking tool that helps you organise and work through discovered vulnerabilities.
+
+- **Create & manage reports**: Add, view, edit, and delete bug reports with a title, severity, exploitability, status, description, package name, and version.
+- **Use preset templates**: common vulnerability titles (SQLi, XSS, RCE, crypto, memory, mobile, cloud, business logic, DoS…) with ready-made descriptions or write your own.
+- **Search**: Live-filter reports by title, description, severity, status, package, or ID.
+- **Triage**: Color-coded severity and exploitability in the list and details, statuses track.
+- **Backup & import**: Export all reports to a .karmapro JSON backup (optionally password-protected) and import them back.
+
+Reports persist locally (survive app restarts) and live in the Karma Pro application support directory.
 
 ## 7. AI Assistant 
 The **AI** toolbar button (right of the Bugs button) opens the AI Assistant window, which connects Karma Pro to [Ollama](https://ollama.com/) or to [OpenRouter](https://openrouter.ai) so you can query large language models about the currently open project:
