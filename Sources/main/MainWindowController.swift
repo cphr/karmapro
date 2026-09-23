@@ -17,6 +17,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     private var classUsageController: ClassUsageWindowController?
     private var backtraceController: BacktraceAnalyserWindowController?
     private var variableFlowController: VariableFlowWindowController?
+    private var entryPointsController: EntryPointsWindowController?
     /// Shared dynamic-debugger window for the "Simulate '…' in the Debugger" feature.
     private var simulationController: SimDebugWindowController?
     /// Cached project-wide variable tracer, invalidated when the project root changes.
@@ -277,6 +278,10 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self.showVariableFlow(projectRoot: root, fileURL: fileURL, charIndex: charIndex, variableName: variableName)
         }
 
+        viewer.onFindEntriesRequest = { [weak self] in
+            self?.showFindEntries()
+        }
+
         viewer.onSimulateRequest = { [weak self] fileURL, functionName in
             guard let self = self else { return }
             self.showSimulation(fileURL: fileURL, functionName: functionName)
@@ -416,6 +421,38 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
                 controller.display(result: result, variableName: variableName)
             }
         }
+    }
+
+    /// Opens (or reuses) the "Find external entries" window and starts the project-wide
+    /// entry-point enumeration. Reuses the shared source index when one exists;
+    /// otherwise the window builds its own index with progress shown.
+    private func showFindEntries() {
+        guard let folder = window?.representedURL ?? projectRootURL else {
+            let alert = NSAlert()
+            alert.messageText = "No Folder Open"
+            alert.informativeText = "Open a source folder before finding entry points."
+            alert.addButton(withTitle: "Open Folder")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn { promptForDirectory() }
+            return
+        }
+        let controller: EntryPointsWindowController
+        if let existing = entryPointsController {
+            controller = existing
+        } else {
+            let created = EntryPointsWindowController()
+            created.onOpenLocation = { [weak self] url, line in
+                self?.showFile(at: url, line: line)
+            }
+            entryPointsController = created
+            controller = created
+        }
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let stdRoot = folder.standardizedFileURL
+        let index = (projectSourceIndexCache?.root == stdRoot) ? projectSourceIndexCache : nil
+        controller.begin(projectRoot: stdRoot, sourceIndex: index)
     }
 
     /// Returns the shared variable-flow window, creating and wiring it if needed.

@@ -1,6 +1,17 @@
 // by cipher.org.uk
 import AppKit
 
+/// Visual settings for the animated data-flow edges. The default matches the
+/// app's other diagrams (orange `[8,6]` dash); the "Find external entries"
+/// window overrides this so its flows are visibly distinct.
+struct FlowEdgeStyle {
+    var color: NSColor = .systemOrange
+    var dashes: [CGFloat] = [8, 6]
+    var lineWidth: CGFloat = 2.5
+    /// Dash-phase drift per animation tick (pulse speed).
+    var phaseStep: CGFloat = 2.0
+}
+
 /// Renders a call/dataflow graph with animated edges showing data flowing
 /// between function nodes. Drawn natively with Core Graphics + Core Animation.
 final class DataFlowDiagramView: NSView {
@@ -29,6 +40,20 @@ final class DataFlowDiagramView: NSView {
     /// dashed `dataEdges` are drawn (no solid call arrows).
     var animatedOnlyEdges = false
 
+    /// Overridable style for the animated data-flow edges.
+    var flowStyle = FlowEdgeStyle()
+
+    /// Node names drawn as square "origin" boxes (no ƒ glyph) — the Internet /
+    /// Local source nodes injected by the external-entries window.
+    var originNodeNames: Set<String> = []
+
+    /// Layout direction forwarded to `GraphLayout.layered`. The external-entries
+    /// window uses `.topToBottom` so flows descend from the origin box.
+    var layoutDirection: GraphLayout.Direction = .leftToRight
+
+    /// Nodes pinned to rank 0 (top) in `.topToBottom` mode.
+    var layoutSourceNodes: Set<String> = []
+
     // Zoom / pan state
     private var hasUserViewTransform = false
     private let minScale: CGFloat = 0.4
@@ -41,8 +66,8 @@ final class DataFlowDiagramView: NSView {
 
     override var isFlipped: Bool { true }
 
-    private let nodeCornerRadius: CGFloat = 10
-    private let nodePadding: CGFloat = 12
+    private let nodeCornerRadius: CGFloat = 6
+    private let nodePadding: CGFloat = 8
 
     init() {
         super.init(frame: .zero)
@@ -62,11 +87,26 @@ final class DataFlowDiagramView: NSView {
         self.callEdges = callEdges
         self.dataEdges = dataEdges
         self.highlightNode = highlight
-        self.diagramLayout = GraphLayout.layered(graph: graph, callEdges: callEdges)
+        self.diagramLayout = GraphLayout.layered(graph: graph, callEdges: callEdges,
+                                             direction: layoutDirection,
+                                             sourceNodes: layoutSourceNodes)
         // Re-fit for every new graph — a stale user transform from a previous
         // diagram would render the new one at an unrelated scale/offset.
         hasUserViewTransform = false
         recenter()
+        needsDisplay = true
+    }
+
+    /// Empties the canvas (no graph) while a new trace is being computed.
+    func clear() {
+        graph = nil
+        callEdges = []
+        dataEdges = []
+        highlightNode = nil
+        diagramLayout = nil
+        originNodeNames = []
+        layoutSourceNodes = []
+        hasUserViewTransform = false
         needsDisplay = true
     }
 
@@ -107,7 +147,7 @@ final class DataFlowDiagramView: NSView {
     private func nodeSize(for name: String) -> NSSize {
         // Fixed-size box matching GraphLayout's spacing so nodes never overlap.
         // Function names are truncated to fit (see drawNode).
-        return NSSize(width: 160, height: 52)
+        return NSSize(width: 128, height: 34)
     }
 
     private func edgeEndpoints(from: String, to: String) -> (CGPoint, CGPoint) {
@@ -256,37 +296,40 @@ final class DataFlowDiagramView: NSView {
     }
 
     private func drawNode(rect: CGRect, name: String, highlighted: Bool) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: nodeCornerRadius, yRadius: nodeCornerRadius)
+        let isOrigin = originNodeNames.contains(name)
+        let path = isOrigin
+            ? NSBezierPath(rect: rect)
+            : NSBezierPath(roundedRect: rect, xRadius: nodeCornerRadius, yRadius: nodeCornerRadius)
 
         let fill: NSColor = highlighted
             ? NSColor(calibratedRed: 0.25, green: 0.60, blue: 1.0, alpha: 0.85)  // accent highlight
-            : NSColor.windowBackgroundColor
+            : (isOrigin ? NSColor.controlAccentColor.withAlphaComponent(0.08) : NSColor.windowBackgroundColor)
         fill.setFill()
         path.fill()
 
-        let stroke: NSColor = highlighted ? .controlAccentColor : .separatorColor
+        let stroke: NSColor = highlighted ? .controlAccentColor : (isOrigin ? .controlAccentColor : .separatorColor)
         stroke.setStroke()
-        path.lineWidth = highlighted ? 2.5 : 1.0
+        path.lineWidth = highlighted ? 2.5 : (isOrigin ? 1.6 : 1.0)
         path.stroke()
 
-        // Node icon (function 'f' glyph)
-        let iconColor: NSColor = highlighted ? .white : .secondaryLabelColor
+        // Node icon (function 'f' glyph, or a square marker for origin boxes)
+        let iconColor: NSColor = highlighted ? .white : (isOrigin ? .controlAccentColor : .secondaryLabelColor)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .heavy),
             .foregroundColor: iconColor
         ]
-        let icon = "ƒ" as NSString
-        icon.draw(at: CGPoint(x: rect.minX + 10, y: rect.midY - 7), withAttributes: attrs)
+        let icon = (isOrigin ? "◼" : "ƒ") as NSString
+        icon.draw(at: CGPoint(x: rect.minX + 8, y: rect.midY - 6), withAttributes: attrs)
 
         // Function name
         let para = NSMutableParagraphStyle()
         para.lineBreakMode = .byTruncatingTail
         let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: para
         ]
-        let textRect = CGRect(x: rect.minX + 30, y: rect.midY - 8, width: rect.width - 36, height: 16)
+        let textRect = CGRect(x: rect.minX + 23, y: rect.midY - 6, width: rect.width - 26, height: 14)
         (name as NSString).draw(in: textRect, withAttributes: textAttrs)
     }
 
@@ -321,14 +364,12 @@ final class DataFlowDiagramView: NSView {
             path.stroke()
             drawArrowhead(from: start, to: end, color: color)
         } else {
-            // Animated dashed data edge
-            NSColor.systemOrange.setStroke()
-            path.lineWidth = 2.5
-            let dashes: [CGFloat] = [8, 6]
-            path.setLineDash(dashes, count: 2, phase: lineDashPhase)
+            // Animated dashed data edge (style overridable)
+            flowStyle.color.setStroke()
+            path.lineWidth = flowStyle.lineWidth
+            path.setLineDash(flowStyle.dashes, count: flowStyle.dashes.count, phase: lineDashPhase)
             path.stroke()
-            // Arrowhead in orange
-            drawArrowhead(from: start, to: end, color: .systemOrange)
+            drawArrowhead(from: start, to: end, color: flowStyle.color)
         }
     }
 
@@ -400,7 +441,7 @@ final class DataFlowDiagramView: NSView {
     private func startTicker() {
         ticker = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self = self, self.window != nil else { return }
-            self.lineDashPhase -= 2.0
+            self.lineDashPhase -= self.flowStyle.phaseStep
             self.setNeedsDisplay(self.bounds)
         }
     }

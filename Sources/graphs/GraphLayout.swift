@@ -13,6 +13,14 @@ public struct LayoutPosition {
 /// within each rank they are reordered to minimize crossings with adjacent ranks.
 public enum GraphLayout {
 
+    /// Rank-to-axis mapping: how a layer is translated into screen coordinates.
+    public enum Direction {
+        /// Layers run down the screen (rank 0 at the top), nodes spread across.
+        case topToBottom
+        /// Keeps the historical layout the app's other diagrams use.
+        case leftToRight
+    }
+
     /// Output of the layout pass.
     public struct Result {
         public var positions: [String: CGPoint] = [:]
@@ -21,7 +29,14 @@ public enum GraphLayout {
     }
 
     /// Lays out the graph. `callEdges` defines direction used for ranking.
-    public static func layered(graph: CallGraph, callEdges: [(String, String)]) -> Result {
+    /// - Parameters:
+    ///   - direction: how layers are placed (`.topToBottom` starts from the
+    ///     `sourceNodes`, which are pinned to rank 0 / the top).
+    ///   - sourceNodes: nodes forced to rank 0 in `.topToBottom` mode (e.g. the
+    ///     Internet/Local origin box) so flow runs downwards from them.
+    public static func layered(graph: CallGraph, callEdges: [(String, String)],
+                               direction: Direction = .leftToRight,
+                               sourceNodes: Set<String> = []) -> Result {
         var result = Result()
         let names = Set(graph.nodes.keys)
 
@@ -33,26 +48,42 @@ public enum GraphLayout {
             incoming[b, default: []].append(a)
         }
 
-        // Compute ranks (longest-path layering).
+        // Compute ranks. Default mode: longest-path layering from sinks
+        // (keeps historical behaviour for the app's other diagrams). TopDown
+        // mode: longest path FROM the source nodes, so the origin tops the flow.
         var rank: [String: Int] = [:]
-        var inProgress: Set<String> = []
-        func rankOf(_ n: String) -> Int {
-            if let r = rank[n] { return r }
-            if inProgress.contains(n) { return 0 }
-            inProgress.insert(n)
-            defer { inProgress.remove(n) }
-            if outgoing[n] == nil {
-                rank[n] = 0
-                return 0
+        if direction == .topToBottom {
+            var inProgress: Set<String> = []
+            func depthOf(_ n: String, _ d: Int) {
+                if inProgress.contains(n) { return }
+                if let existing = rank[n], existing >= d { return }
+                rank[n] = d
+                inProgress.insert(n)
+                for next in outgoing[n] ?? [] { depthOf(next, d + 1) }
+                inProgress.remove(n)
             }
-            var r = 0
-            for next in outgoing[n] ?? [] {
-                r = max(r, rankOf(next) + 1)
+            for s in sourceNodes { depthOf(s, 0) }
+            for n in names where rank[n] == nil { depthOf(n, 0) }
+        } else {
+            var inProgress: Set<String> = []
+            func rankOf(_ n: String) -> Int {
+                if let r = rank[n] { return r }
+                if inProgress.contains(n) { return 0 }
+                inProgress.insert(n)
+                defer { inProgress.remove(n) }
+                if outgoing[n] == nil {
+                    rank[n] = 0
+                    return 0
+                }
+                var r = 0
+                for next in outgoing[n] ?? [] {
+                    r = max(r, rankOf(next) + 1)
+                }
+                rank[n] = r
+                return r
             }
-            rank[n] = r
-            return r
+            for n in names { _ = rankOf(n) }
         }
-        for n in names { _ = rankOf(n) }
 
         let maxRank = rank.values.max() ?? 0
         result.layerCount = maxRank + 1
@@ -63,11 +94,11 @@ public enum GraphLayout {
             layers[r, default: []].append(n)
         }
 
-        // Node sizing (uniform).
-        let nodeWidth: CGFloat = 160
-        let nodeHeight: CGFloat = 52
-        let hGap: CGFloat = 70
-        let vGap: CGFloat = 90
+        // Node sizing (uniform; kept in sync with DataFlowDiagramView.nodeSize).
+        let nodeWidth: CGFloat = 128
+        let nodeHeight: CGFloat = 34
+        let hGap: CGFloat = 44
+        let vGap: CGFloat = 56
         let maxPerRow = 9
 
         // Sort nodes within each rank by barycenter heuristic to reduce crossings.

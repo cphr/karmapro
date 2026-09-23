@@ -67,6 +67,9 @@ SOURCES=(
   Sources/graphs/VariableFlowTracer.swift
   Sources/graphs/VariableFlowDiagramView.swift
   Sources/graphs/VariableFlowWindowController.swift
+  Sources/graphs/EntryPointsWindowController.swift
+  Sources/tools/EntryPointCatalog.swift
+  Sources/tools/EntryPointCollector.swift
   Sources/tools/SimDebugEngine.swift
   Sources/tools/SimDebugWindowController.swift
   Sources/graphs/BacktraceParser.swift

@@ -23,6 +23,7 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
 ## 3. Diagrams: Control Flow & Data Flow
 - **Control Flow Diagrams**: Visualizes cyclomatic complexity, conditional branches (`if`/`else`), and loops (`while`/`for`) as an interactive flowchart (`FlowChartView`).
 - **Dataflow Analysis**: Traces variable assignments, function parameter taint propagation, and inter-procedural call graphs within the same file to reveal how untrusted input reaches critical sinks.
+- **Find external entries**: scans the whole project and lists every place where the application receives input from outside, remote-facing receive APIs such as HTTP request parameters, deep links, push payloads, web/client responses, and blockchain transaction input, plus local sources like environment variables and command-line arguments, files. Results are grouped by category and tagged by locality (Remote, Local). Selecting an entry plots its data-flow diagram: an origin box for the locality, then the entry point and the functions the received value flows through. Rows show project-relative paths and clicking a graph node jumps to the exact source line in the source viewer.
 
 ## 4. Security Scanning & Vulnerability Analysis
 - **Multi-Language Security Scanner**: Karma Pro parses source code using robust tokenizers, AST parsers, and inter-procedural data-flow analysis, performing precise taint tracking rather than simple regex matching.

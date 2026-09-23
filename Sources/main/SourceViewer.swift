@@ -117,6 +117,10 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     /// Called when the user picks "Simulate '…' in the Debugger" from the context menu.
     /// Passes the file and the function name to run.
     var onSimulateRequest: ((URL, String) -> Void)?
+    /// Called when the user picks "Find external entries" from the context menu. The
+    /// caller finds all user-controlled entry points project-wide and plots
+    /// them in the entry-point window.
+    var onFindEntriesRequest: (() -> Void)?
     /// The charIndex of the right-click that built the current context menu, so
     /// menu actions can resolve which line was clicked.
     private var lastMenuCharIndex = 0
@@ -721,6 +725,15 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         menu.addItem(backtraceItem)
 
         menu.addItem(NSMenuItem.separator())
+        let entriesItem = NSMenuItem(
+            title: "Find external entries",
+            action: #selector(findEntries(_:)),
+            keyEquivalent: ""
+        )
+        entriesItem.target = self
+        menu.addItem(entriesItem)
+
+        menu.addItem(NSMenuItem.separator())
         let howToFixItem = NSMenuItem(
             title: "(AI) How to fix it",
             action: #selector(howToFixIt(_:)),
@@ -795,6 +808,10 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
 
     @objc private func showBacktraceAnalyser(_ sender: NSMenuItem) {
         onBacktraceRequest?()
+    }
+
+    @objc private func findEntries(_ sender: NSMenuItem) {
+        onFindEntriesRequest?()
     }
 
     @objc private func howToFixIt(_ sender: NSMenuItem) {
