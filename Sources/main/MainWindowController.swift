@@ -18,6 +18,13 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     private var backtraceController: BacktraceAnalyserWindowController?
     private var variableFlowController: VariableFlowWindowController?
     private var entryPointsController: EntryPointsWindowController?
+    /// Shared reachability window for the "Show reachability of '…'" feature.
+    private var reachabilityController: ReachabilityWindowController?
+    /// Cached project-wide call graph for reachability, invalidated when the
+    /// project root changes.
+    private var reachabilityGraphCache: (root: URL, graph: ProjectCallGraph)?
+    /// Cancellation token for the in-flight reachability search, if any.
+    private var reachabilityCancellation: VariableFlowCancellation?
     /// Shared dynamic-debugger window for the "Simulate '…' in the Debugger" feature.
     private var simulationController: SimDebugWindowController?
     /// Cached project-wide variable tracer, invalidated when the project root changes.
@@ -282,6 +289,12 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.showFindEntries()
         }
 
+        viewer.onReachabilityRequest = { [weak self] fileURL, functionName in
+            guard let self = self,
+                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+            self.showReachability(projectRoot: root, fileURL: fileURL, functionName: functionName)
+        }
+
         viewer.onSimulateRequest = { [weak self] fileURL, functionName in
             guard let self = self else { return }
             self.showSimulation(fileURL: fileURL, functionName: functionName)
@@ -348,6 +361,10 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.variableFlowTracerCache = nil
             self?.variableFlowController = nil
             self?.simulationController = nil
+            self?.reachabilityCancellation?.cancel()
+            self?.reachabilityCancellation = nil
+            self?.reachabilityGraphCache = nil
+            self?.reachabilityController = nil
             self?.buildProjectSourceIndex(for: url)
             self?.sourceViewer?.clear()
             self?.updateWindowTitle(forFile: nil)
@@ -474,6 +491,103 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Returns the shared reachability window, creating and wiring it if needed.
+    private func reachabilityControllerInstance() -> ReachabilityWindowController {
+        if let existing = reachabilityController { return existing }
+        let controller = ReachabilityWindowController()
+        controller.onOpenLocation = { [weak self] url, line in
+            self?.showFile(at: url, line: line)
+        }
+        reachabilityController = controller
+        return controller
+    }
+
+    /// Presents a finished reachability walk in the (possibly new) shared window.
+    private func presentReachability(result: ReachabilityResult,
+                                     graph: ProjectCallGraph,
+                                     fileURL: URL,
+                                     functionName: String) {
+        let controller = reachabilityControllerInstance()
+        controller.onCancel = nil
+        controller.display(result: result, graph: graph, fileURL: fileURL, functionName: functionName)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Shows the project-wide reachability of a function right-clicked in the
+    /// source viewer. Reuses the cached call graph and the window across
+    /// requests so a rebuilt diagram is cheap; builds the graph in the
+    /// background (with a progress window only when the tree must be re-read
+    /// from disk) and displays the result when ready.
+    private func showReachability(projectRoot: URL, fileURL: URL, functionName: String) {
+        let stdRoot = projectRoot.standardizedFileURL
+
+        // Fast path: the call graph is already built, so walk and show immediately.
+        if let cached = reachabilityGraphCache, cached.root == stdRoot {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = cached.graph.reachability(of: functionName, in: fileURL)
+                DispatchQueue.main.async {
+                    self?.presentReachability(result: result, graph: cached.graph,
+                                              fileURL: fileURL, functionName: functionName)
+                }
+            }
+            return
+        }
+
+        // If the shared source index already exists for this root, derive the
+        // call graph in memory (no further I/O) and display the result directly
+        // without a separate progress window.
+        if let pidx = projectSourceIndexCache, pidx.root == stdRoot {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let graph = ProjectCallGraph(sourceIndex: pidx)
+                let result = graph.reachability(of: functionName, in: fileURL)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.reachabilityGraphCache = (stdRoot, graph)
+                    self.presentReachability(result: result, graph: graph,
+                                             fileURL: fileURL, functionName: functionName)
+                }
+            }
+            return
+        }
+
+        // Last resort: build the index on demand from disk with its own
+        // progress window, so the user still gets feedback.
+        reachabilityCancellation?.cancel()
+        let cancellation = VariableFlowCancellation()
+        reachabilityCancellation = cancellation
+        let startedAt = Date()
+
+        let controller = reachabilityControllerInstance()
+        controller.onCancel = { [weak self] in self?.reachabilityCancellation?.cancel() }
+        controller.beginProgress(functionName: functionName)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let graph = ProjectCallGraph(projectRoot: projectRoot,
+                                         cancellation: cancellation,
+                                         progress: { done, total in
+                DispatchQueue.main.async {
+                    controller.updateProgress(done: done, total: total, startedAt: startedAt)
+                }
+            })
+            guard !cancellation.isCancelled, !graph.wasCancelled else { return }
+            let result = graph.reachability(of: functionName, in: fileURL)
+            guard !cancellation.isCancelled else { return }
+            DispatchQueue.main.async {
+                guard let self = self, !cancellation.isCancelled else { return }
+                self.reachabilityGraphCache = (stdRoot, graph)
+                self.reachabilityCancellation = nil
+                controller.onCancel = nil
+                controller.display(result: result, graph: graph,
+                                   fileURL: fileURL, functionName: functionName)
+            }
+        }
     }
 
     private func showDirectoryRequiredAlert() {

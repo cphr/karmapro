@@ -47,6 +47,18 @@ final class DataFlowDiagramView: NSView {
     /// Local source nodes injected by the external-entries window.
     var originNodeNames: Set<String> = []
 
+    /// Node names drawn with an amber outline — the topmost boxes in the
+    /// reachability window's "no path from any entry point" state.
+    var outlinedNodeNames: Set<String> = []
+
+    /// Node names drawn as grey boxes with black text — the forward (callee)
+    /// overlay in the reachability window's combined diagram.
+    var greyedNodeNames: Set<String> = []
+
+    /// Per-name fill/stroke colour for origin boxes, overriding the default
+    /// accent (e.g. the amber "Topmost" terminal box).
+    var originNodeColors: [String: NSColor] = [:]
+
     /// Layout direction forwarded to `GraphLayout.layered`. The external-entries
     /// window uses `.topToBottom` so flows descend from the origin box.
     var layoutDirection: GraphLayout.Direction = .leftToRight
@@ -105,6 +117,9 @@ final class DataFlowDiagramView: NSView {
         highlightNode = nil
         diagramLayout = nil
         originNodeNames = []
+        outlinedNodeNames = []
+        greyedNodeNames = []
+        originNodeColors = [:]
         layoutSourceNodes = []
         hasUserViewTransform = false
         needsDisplay = true
@@ -297,23 +312,29 @@ final class DataFlowDiagramView: NSView {
 
     private func drawNode(rect: CGRect, name: String, highlighted: Bool) {
         let isOrigin = originNodeNames.contains(name)
+        let isGreyed = greyedNodeNames.contains(name)
+        let originColor = originNodeColors[name] ?? .controlAccentColor
         let path = isOrigin
             ? NSBezierPath(rect: rect)
             : NSBezierPath(roundedRect: rect, xRadius: nodeCornerRadius, yRadius: nodeCornerRadius)
 
         let fill: NSColor = highlighted
             ? NSColor(calibratedRed: 0.25, green: 0.60, blue: 1.0, alpha: 0.85)  // accent highlight
-            : (isOrigin ? NSColor.controlAccentColor.withAlphaComponent(0.08) : NSColor.windowBackgroundColor)
+            : (isOrigin ? originColor.withAlphaComponent(0.08)
+                        : (isGreyed ? NSColor(calibratedWhite: 0.78, alpha: 1) : NSColor.windowBackgroundColor))
         fill.setFill()
         path.fill()
 
-        let stroke: NSColor = highlighted ? .controlAccentColor : (isOrigin ? .controlAccentColor : .separatorColor)
+        let stroke: NSColor = highlighted ? .controlAccentColor
+            : (isOrigin ? originColor : (isGreyed ? NSColor.systemGray : .separatorColor))
         stroke.setStroke()
         path.lineWidth = highlighted ? 2.5 : (isOrigin ? 1.6 : 1.0)
         path.stroke()
 
         // Node icon (function 'f' glyph, or a square marker for origin boxes)
-        let iconColor: NSColor = highlighted ? .white : (isOrigin ? .controlAccentColor : .secondaryLabelColor)
+        let iconColor: NSColor = isGreyed
+            ? .black
+            : (highlighted ? .white : (isOrigin ? originColor : .secondaryLabelColor))
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .heavy),
             .foregroundColor: iconColor
@@ -326,11 +347,24 @@ final class DataFlowDiagramView: NSView {
         para.lineBreakMode = .byTruncatingTail
         let textAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 10, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: isGreyed ? NSColor.black : NSColor.labelColor,
             .paragraphStyle: para
         ]
         let textRect = CGRect(x: rect.minX + 23, y: rect.midY - 6, width: rect.width - 26, height: 14)
         (name as NSString).draw(in: textRect, withAttributes: textAttrs)
+
+        // Amber "topmost reached" halo (reachability's no-entry state): drawn
+        // last so it stays on top of the fill and the regular stroke.
+        if outlinedNodeNames.contains(name) {
+            let halo = NSBezierPath(roundedRect: rect.insetBy(dx: -3, dy: -3),
+                                    xRadius: nodeCornerRadius + 3,
+                                    yRadius: nodeCornerRadius + 3)
+            NSColor.systemOrange.withAlphaComponent(0.14).setFill()
+            halo.fill()
+            NSColor.systemOrange.setStroke()
+            halo.lineWidth = 2.5
+            halo.stroke()
+        }
     }
 
     private func drawEdges() {

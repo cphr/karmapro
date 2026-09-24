@@ -121,6 +121,10 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     /// caller finds all user-controlled entry points project-wide and plots
     /// them in the entry-point window.
     var onFindEntriesRequest: (() -> Void)?
+    /// Called when the user picks "Show reachability of '…'" from the context
+    /// menu. Passes the file and the function name to walk in the project
+    /// call graph.
+    var onReachabilityRequest: ((URL, String) -> Void)?
     /// The charIndex of the right-click that built the current context menu, so
     /// menu actions can resolve which line was clicked.
     private var lastMenuCharIndex = 0
@@ -701,6 +705,15 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
             simulateItem.target = self
             simulateItem.representedObject = functionName
             menu.addItem(simulateItem)
+
+            let reachabilityItem = NSMenuItem(
+                title: "Show reachability of '\(functionName)'",
+                action: #selector(showReachability(_:)),
+                keyEquivalent: ""
+            )
+            reachabilityItem.target = self
+            reachabilityItem.representedObject = functionName
+            menu.addItem(reachabilityItem)
         }
 
         if let variableName = variableWord(at: charIndex) {
@@ -784,6 +797,12 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         guard let functionName = sender.representedObject as? String,
               let fileURL = currentFileURL else { return }
         onSimulateRequest?(fileURL, functionName)
+    }
+
+    @objc private func showReachability(_ sender: NSMenuItem) {
+        guard let functionName = sender.representedObject as? String,
+              let fileURL = currentFileURL else { return }
+        onReachabilityRequest?(fileURL, functionName)
     }
 
     @objc private func followVariable(_ sender: NSMenuItem) {

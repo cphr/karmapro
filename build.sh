@@ -68,6 +68,8 @@ SOURCES=(
   Sources/graphs/VariableFlowDiagramView.swift
   Sources/graphs/VariableFlowWindowController.swift
   Sources/graphs/EntryPointsWindowController.swift
+  Sources/graphs/ProjectCallGraph.swift
+  Sources/graphs/ReachabilityWindowController.swift
   Sources/tools/EntryPointCatalog.swift
   Sources/tools/EntryPointCollector.swift
   Sources/tools/SimDebugEngine.swift
@@ -159,5 +161,5 @@ if [ -d Resources_src/Models ]; then
 fi
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
- 
+
 echo "Built $APP"
