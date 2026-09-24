@@ -535,6 +535,9 @@ final class EntryPointsWindowController: NSWindowController, NSOutlineViewDataSo
             ) + attributed("  \(site.snippet.isEmpty ? "→ " + site.apiPath : site.snippet)",
                            font: NSFont.systemFont(ofSize: 11),
                            color: .secondaryLabelColor)
+                + attributed("  · \(site.sourceKind)",
+                             font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                             color: .tertiaryLabelColor)
         }
         return cell
     }

@@ -213,6 +213,7 @@ enum EntryPointCatalog {
         e.append(.prop("search", prefix: "window.location", httpRequest, .internet,
                        langs: [.javascript]))
         // PHP superglobals and URL handling.
+        // PHP superglobals and URL handling.
         e.append(.bare("_GET", httpRequest, .internet, langs: [.php]))
         e.append(.bare("_POST", httpRequest, .internet, langs: [.php]))
         e.append(.bare("_REQUEST", httpRequest, .internet, langs: [.php]))
@@ -223,6 +224,40 @@ enum EntryPointCatalog {
         e.append(.call("parse_str", httpRequest, .internet, langs: [.php]))
         e.append(.call("parse_url", httpRequest, .internet, langs: [.php]))
         e.append(.call("php_input", httpRequest, .internet, langs: [.php]))
+        // PHP frameworks: Laravel/Slim request accessors (`$request->input(…)`).
+        // The collector's receiver-path resolves `->` like `.`, so the struck
+        // chain is `request`.
+        for leaf in ["input", "get", "query", "post", "header", "cookie", "json",
+                     "all", "only", "except", "files", "file", "request", "server",
+                     "ip", "has", "filled", "boolean", "integer"] {
+            e.append(.call(leaf, prefix: "request", httpRequest, .internet, langs: [.php]))
+        }
+        // Kotlin/Ktor: routing `call.request.*` reads and `call.receive<T>()`.
+        for leaf in ["queryParameters", "parameters", "pathParameters", "headers",
+                     "cookies", "body", "queryString"] {
+            e.append(.prop(leaf, prefix: "call.request", httpRequest, .internet, langs: [.kotlin]))
+        }
+        e.append(.call("receive", prefix: "call", httpRequest, .internet, langs: [.kotlin]))
+        e.append(.call("receiveText", prefix: "call", httpRequest, .internet, langs: [.kotlin]))
+        // Python: fully-qualified flask.request reads (when `request` is imported
+        // as `flask.request` rather than the bare Flask global).
+        for leaf in ["args", "form", "json", "values", "files", "cookies", "headers",
+                     "data", "query", "params", "body", "GET", "POST"] {
+            e.append(.prop(leaf, prefix: "flask.request", httpRequest, .internet, langs: [.python]))
+        }
+        // Python: async server (aiohttp/web) and Tornado request reads.
+        for leaf in ["query", "json", "post", "rel_url", "text", "read"] {
+            e.append(.call(leaf, prefix: "request", httpRequest, .internet, langs: [.python]))
+        }
+        // Ruby/Rack: request-derived reads beyond the bare `params`.
+        for leaf in ["headers", "body", "query_string", "remote_ip", "request_method",
+                     "session", "env"] {
+            e.append(.prop(leaf, prefix: "request", httpRequest, .internet, langs: [.ruby]))
+        }
+        // Swift Vapor: content/query decoding off a handler `req`.
+        e.append(.call("decode", prefix: "req.query", httpRequest, .internet, langs: [.swift]))
+        e.append(.call("decode", prefix: "req.content", httpRequest, .internet, langs: [.swift]))
+        e.append(.prop("query", prefix: "req", httpRequest, .internet, langs: [.swift]))
         // C# / ASP.NET request accessors.
         for leaf in ["QueryString", "Form", "Params", "Headers", "Cookies",
                      "ServerVariables", "RequestType", "Url", "RawUrl", "Path",
@@ -254,6 +289,27 @@ enum EntryPointCatalog {
         e.append(.call("fetch", webClient, .internet, langs: [.javascript]))
         e.append(.call("json", webClient, .internet, langs: [.javascript]))
         e.append(.call("get_headers", webClient, .internet, langs: [.php]))
+        // Go HTTP client response bodies (`http.Get(…)`, `client.Do(…)`).
+        for leaf in ["Get", "Post", "PostForm", "Do", "Head"] {
+            e.append(.call(leaf, prefix: "http", webClient, .internet, langs: [.go]))
+        }
+        // Python client stacks.
+        for leaf in ["get", "post", "put", "delete", "patch", "head"] {
+            e.append(.call(leaf, prefix: "requests", webClient, .internet, langs: [.python]))
+            e.append(.call(leaf, prefix: "aiohttp.session", webClient, .internet, langs: [.python]))
+        }
+        e.append(.call("urlopen", prefix: "urllib.request", webClient, .internet, langs: [.python]))
+        e.append(.call("urlopen", prefix: "urllib", webClient, .internet, langs: [.python]))
+        // JavaScript: response-body readers and TCP socket data callbacks.
+        for leaf in ["json", "text", "arrayBuffer", "formData", "blob"] {
+            e.append(.call(leaf, prefix: "res", webClient, .internet, langs: [.javascript]))
+            e.append(.call(leaf, prefix: "response", webClient, .internet, langs: [.javascript]))
+        }
+        // Rust: reqwest top-level and per-client receivers.
+        for leaf in ["get", "post", "put", "delete", "patch", "head"] {
+            e.append(.call(leaf, prefix: "reqwest", webClient, .internet, langs: [.rust]))
+        }
+        e.append(.call("response", prefix: "reqwest", webClient, .internet, langs: [.rust]))
         for leaf in ["data", "dataTask", "downloadTask", "uploadTask", "bytes",
                      "dataFrom", "dataFromURL", "start", "trigger", "send",
                      "open", "stream"] {
@@ -269,7 +325,10 @@ enum EntryPointCatalog {
                      "getDoubleExtra", "getBooleanExtra", "getCharSequenceExtra",
                      "getSerializableExtra", "getParcelableExtra", "getBundleExtra",
                      "getExtras", "getData", "getDataString", "getScheme",
-                     "getEncodedPath", "getQueryParameter", "getPathSegments"] {
+                     "getEncodedPath", "getQueryParameter", "getPathSegments",
+                     "getCharSequenceArrayExtra", "getStringArrayListExtra",
+                     "getIntegerArrayListExtra", "getParcelableArrayListExtra",
+                     "getStringArrayExtra", "getClipData", "getInputExtras"] {
             e.append(.call(leaf, deepLinks, .internet, langs: javaKotlin))
         }
         for leaf in ["getInitialLink", "getInitialUri", "streamLinks", "getDeepLink",
@@ -331,6 +390,12 @@ enum EntryPointCatalog {
         e.append(.bare("_ENV", cliEnv, .local, langs: [.php]))
         e.append(.prop("arguments", prefix: "CommandLine", cliEnv, .local, langs: [.swift]))
         e.append(.prop("unsafeArgv", prefix: "CommandLine", cliEnv, .local, langs: [.swift]))
+        e.append(.prop("environment", prefix: "ProcessInfo.processInfo", cliEnv, .local,
+                       langs: [.swift, .objc]))
+        e.append(.prop("environment", prefix: "processInfo", cliEnv, .local, langs: [.objc]))
+        // Node / Deno.
+        e.append(.prop("argv", prefix: "process", cliEnv, .local, langs: [.javascript]))
+        e.append(.call("get", prefix: "Deno.env", cliEnv, .local, langs: [.javascript]))
         // Rust: std::env and the env crate.
         for leaf in ["var", "vars", "args"] {
             e.append(.call(leaf, prefix: "std.env", cliEnv, .local, langs: [.rust]))
@@ -376,6 +441,8 @@ enum EntryPointCatalog {
         e.append(.call("NewReader", prefix: "bufio", stdin, .local, langs: [.go]))
         e.append(.bare("STDIN", stdin, .local, langs: [.php]))
         e.append(.bare("argv", stdin, .local, langs: [.php]))
+        e.append(.call("readline", stdin, .local, langs: [.php]))
+        e.append(.call("readLine", stdin, .local, langs: [.swift]))
 
         // MARK: Kernel: userland → kernel (syscall/ioctl/device)
 
@@ -461,6 +528,13 @@ enum EntryPointCatalog {
         e.append(.call("read", prefix: "std.fs", fileReads, .local, .indirect, langs: [.rust]))
         e.append(.call("read_to_string", prefix: "fs", fileReads, .local, .indirect, langs: [.rust]))
         e.append(.call("read", prefix: "fs", fileReads, .local, .indirect, langs: [.rust]))
+        e.append(.call("open", prefix: "File", fileReads, .local, .indirect, langs: [.rust]))
+        e.append(.call("Open", prefix: "path", fileReads, .local, .indirect, langs: [.go]))
+        // Node / Deno file readers.
+        for leaf in ["readFile", "readFileSync", "createReadStream", "readdirSync"] {
+            e.append(.call(leaf, prefix: "fs", fileReads, .local, .indirect, langs: [.javascript]))
+        }
+        e.append(.call("readTextFile", prefix: "Deno", fileReads, .local, .indirect, langs: [.javascript]))
 
         // MARK: Local storage & persisted data (indirect)
 
@@ -476,9 +550,11 @@ enum EntryPointCatalog {
         e.append(.call("Get", prefix: "UserDefaults", persisted, .local, .indirect, langs: [.csharp]))
         e.append(.call("GetString", prefix: "UserDefaults", persisted, .local, .indirect,
                        langs: [.csharp]))
-        e.append(.call("standardUserDefaults", prefix: "NSUserDefaults", persisted, .local,
-                       .indirect, langs: [.objc]))
+e.append(.call("standardUserDefaults", prefix: "NSUserDefaults", persisted, .local,
+                        .indirect, langs: [.objc]))
         e.append(.call("value", prefix: "UserDefaults", persisted, .local, .indirect, langs: [.csharp]))
+        e.append(.bare("_SESSION", persisted, .local, .indirect, langs: [.php]))
+        e.append(.call("getSession", prefix: "req", persisted, .local, .indirect, langs: [.php]))
 
         // MARK: Encoding & serialization decode (indirect)
 
@@ -492,6 +568,15 @@ enum EntryPointCatalog {
         e.append(.call("parse", prefix: "JSON", encoding, .local, .indirect, langs: [.ruby]))
         e.append(.call("load", prefix: "Marshal", encoding, .local, .indirect, langs: [.ruby]))
         e.append(.call("load", prefix: "YAML", encoding, .local, .indirect, langs: [.ruby]))
+        e.append(.call("parse", prefix: "Nokogiri.XML", encoding, .local, .indirect, langs: [.ruby]))
+        e.append(.call("json_decode", encoding, .local, .indirect, langs: [.php]))
+        e.append(.call("DeserializeObject", prefix: "JsonConvert", encoding, .local, .indirect,
+                       langs: [.csharp]))
+        e.append(.call("Deserialize", prefix: "XmlSerializer", encoding, .local, .indirect,
+                       langs: [.csharp]))
+        e.append(.call("from_str", prefix: "serde_json", encoding, .local, .indirect, langs: [.rust]))
+        e.append(.call("from_str", prefix: "serde_yaml", encoding, .local, .indirect, langs: [.rust]))
+        e.append(.call("ReadValue", prefix: "Json", encoding, .local, .indirect, langs: [.csharp]))
         e.append(.call("decode", prefix: "JSONDecoder", encoding, .local, .indirect, langs: [.swift]))
         e.append(.call("decode", prefix: "PropertyListDecoder", encoding, .local, .indirect,
                        langs: [.swift]))
