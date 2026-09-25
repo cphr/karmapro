@@ -70,6 +70,8 @@ SOURCES=(
   Sources/graphs/EntryPointsWindowController.swift
   Sources/graphs/ProjectCallGraph.swift
   Sources/graphs/ReachabilityWindowController.swift
+  Sources/graphs/ComplexityScatterView.swift
+  Sources/graphs/ComplexityScatterWindowController.swift
   Sources/tools/EntryPointCatalog.swift
   Sources/tools/EntryPointCollector.swift
   Sources/tools/SimDebugEngine.swift

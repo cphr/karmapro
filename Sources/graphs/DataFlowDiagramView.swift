@@ -477,6 +477,10 @@ final class DataFlowDiagramView: NSView {
         super.viewDidMoveToWindow()
         stopTicker()
         if window != nil {
+            // Re-fit on attach to a real window: the initial layout pass may have
+            // run while the view still had zero-sized bounds (diagram built in a
+            // controller init before the window is shown).
+            recenter()
             startTicker()
         }
     }

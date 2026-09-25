@@ -129,6 +129,21 @@ final class ControlFlowParser {
                        functionName: functionName, ext: "")
     }
 
+    /// Analyses every defined function in the source file and returns its
+    /// cyclomatic complexity plus its 1-based source line, in definition order.
+    static func analyzeAll(source: String, ext: String) -> [(name: String, complexity: Int, line: Int)] {
+        let defs = diagramDefinitions(source: source, ext: ext)
+        var out: [(name: String, complexity: Int, line: Int)] = []
+        for def in defs {
+            guard def.bodyRange.location != NSNotFound, def.bodyRange.length > 0 else { continue }
+            guard let flow = analyze(bodySource: source, bodyRange: def.bodyRange,
+                                     functionName: def.name, ext: ext) else { continue }
+            let line = newlinesBefore(def.nameRange.location, in: source) + 1
+            out.append((def.name, flow.complexity, line))
+        }
+        return out
+    }
+
     /// Core flow builder over an exact function body range. `ext` is needed only
     /// for Python/Ruby bodies, which are normalized to brace form first.
     private static func analyze(bodySource: String, bodyRange: NSRange,
@@ -264,9 +279,13 @@ final class FlowTokenizer {
                 let quote = c, startLoc = i
                 i += 1
                 while i < end && ns.character(at: i) != quote {
-                    if ns.character(at: i) == 0x5C { i += 2 } else { i += 1 }
+                    if ns.character(at: i) == 0x5C && i + 1 < end { i += 2 } else { i += 1 }
                 }
-                i += 1
+                // Unterminated literal (or an escape at the very end): never advance
+                // past `end`, otherwise the substring below goes out of bounds and
+                // NSString throws, which cannot be caught in Swift.
+                if i < end { i += 1 }
+                if i > end { i = end }
                 let s = ns.substring(with: NSRange(location: startLoc, length: i - startLoc))
                 out.append(Token(kind: .string, text: s, location: startLoc))
                 continue

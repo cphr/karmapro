@@ -21,6 +21,12 @@ final class DataFlowWindowController: NSWindowController {
         loadGraph(fileURL: fileURL, functionName: functionName)
     }
 
+    /// Centers the window on screen every time it is shown.
+    override func showWindow(_ sender: Any?) {
+        window?.center()
+        super.showWindow(sender)
+    }
+
     private func buildContent() {
         guard let content = window?.contentView else { return }
 

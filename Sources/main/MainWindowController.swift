@@ -20,6 +20,8 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     private var entryPointsController: EntryPointsWindowController?
     /// Shared reachability window for the "Show reachability of '…'" feature.
     private var reachabilityController: ReachabilityWindowController?
+    /// Shared complexity-distribution window for the context-menu chart.
+    private var complexityController: ComplexityScatterWindowController?
     /// Cached project-wide call graph for reachability, invalidated when the
     /// project root changes.
     private var reachabilityGraphCache: (root: URL, graph: ProjectCallGraph)?
@@ -295,6 +297,25 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self.showReachability(projectRoot: root, fileURL: fileURL, functionName: functionName)
         }
 
+        viewer.onComplexityRequest = { [weak self] _ in
+            guard let self = self,
+                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+            let controller: ComplexityScatterWindowController
+            if let existing = self.complexityController {
+                controller = existing
+            } else {
+                controller = ComplexityScatterWindowController()
+                controller.onOpenFile = { [weak self] url, line in
+                    self?.showFile(at: url, line: line)
+                }
+                self.complexityController = controller
+            }
+            controller.loadProject(root: root)
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
         viewer.onSimulateRequest = { [weak self] fileURL, functionName in
             guard let self = self else { return }
             self.showSimulation(fileURL: fileURL, functionName: functionName)
@@ -365,6 +386,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.reachabilityCancellation = nil
             self?.reachabilityGraphCache = nil
             self?.reachabilityController = nil
+            self?.complexityController = nil
             self?.buildProjectSourceIndex(for: url)
             self?.sourceViewer?.clear()
             self?.updateWindowTitle(forFile: nil)

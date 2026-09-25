@@ -125,6 +125,9 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     /// menu. Passes the file and the function name to walk in the project
     /// call graph.
     var onReachabilityRequest: ((URL, String) -> Void)?
+    /// Called when the user picks "Complexity distribution" from the context
+    /// menu. Passes the open file whose functions should be plotted.
+    var onComplexityRequest: ((URL) -> Void)?
     /// The charIndex of the right-click that built the current context menu, so
     /// menu actions can resolve which line was clicked.
     private var lastMenuCharIndex = 0
@@ -686,6 +689,16 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         lensItem.target = self
         menu.addItem(lensItem)
 
+        // Opens the per-function complexity chart; available at any position.
+        menu.addItem(NSMenuItem.separator())
+        let complexityItem = NSMenuItem(
+            title: "Complexity distribution",
+            action: #selector(showComplexityDistribution(_:)),
+            keyEquivalent: ""
+        )
+        complexityItem.target = self
+        menu.addItem(complexityItem)
+
         if let functionName = functionName(at: charIndex) {
             menu.addItem(NSMenuItem.separator())
             let item = NSMenuItem(
@@ -803,6 +816,11 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         guard let functionName = sender.representedObject as? String,
               let fileURL = currentFileURL else { return }
         onReachabilityRequest?(fileURL, functionName)
+    }
+
+    @objc private func showComplexityDistribution(_ sender: NSMenuItem) {
+        guard let fileURL = currentFileURL else { return }
+        onComplexityRequest?(fileURL)
     }
 
     @objc private func followVariable(_ sender: NSMenuItem) {
