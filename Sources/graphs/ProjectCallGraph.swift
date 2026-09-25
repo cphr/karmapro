@@ -227,8 +227,24 @@ final class ProjectCallGraph {
         guard nameR.location != NSNotFound, nameR.length > 0,
               bodyR.location != NSNotFound, bodyR.length > 0 else { return nil }
         if sigR.location == NSNotFound || sigR.length <= 0 { sigR = nameR }
-        // Skip function-like macros: no real body to scan for calls.
-        if Self.substring(source, sigR)?.contains("#define") == true { return nil }
+        // Skip function-like macros (no real body to scan for calls). A macro is
+        // recognised by its *name* being declared by `#define` on the same line
+        // (`#define NAME(...) ...`). Never by the coarse signature range: the C
+        // function parser's ranges can span earlier lines, so a real function
+        // whose range overlaps a file-scope `#define` (common in kernel drivers)
+        // must not be dropped as a macro.
+        let nameLoc = nameR.location
+        if nameLoc != NSNotFound,
+           nameR.length > 0,
+           nameLoc <= (source as NSString).length {
+            let ns = source as NSString
+            var lineStart = nameLoc
+            while lineStart > 0, ns.character(at: lineStart - 1) != 0x0A { lineStart -= 1 }
+            let prefix = ns.substring(with: NSRange(location: lineStart, length: nameLoc - lineStart))
+            if prefix.trimmingCharacters(in: .whitespaces).hasPrefix("#define") {
+                return nil
+            }
+        }
         let enclosingR = NSUnionRange(sigR, bodyR)
         return ProjectCallFunc(name: def.name,
                                fileURL: url,

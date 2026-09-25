@@ -66,6 +66,11 @@ final class DataFlowDiagramView: NSView {
     /// Nodes pinned to rank 0 (top) in `.topToBottom` mode.
     var layoutSourceNodes: Set<String> = []
 
+    /// When set, the diagram uses a butterfly layout centred on this node
+    /// (callers fan out to the left, callees to the right). Used by the
+    /// "Show flow diagram for" window; leave nil for the other diagrams.
+    var layoutCenterNode: String?
+
     // Zoom / pan state
     private var hasUserViewTransform = false
     private let minScale: CGFloat = 0.4
@@ -99,9 +104,13 @@ final class DataFlowDiagramView: NSView {
         self.callEdges = callEdges
         self.dataEdges = dataEdges
         self.highlightNode = highlight
-        self.diagramLayout = GraphLayout.layered(graph: graph, callEdges: callEdges,
-                                             direction: layoutDirection,
-                                             sourceNodes: layoutSourceNodes)
+        if let center = layoutCenterNode {
+            self.diagramLayout = GraphLayout.butterfly(graph: graph, callEdges: callEdges, center: center)
+        } else {
+            self.diagramLayout = GraphLayout.layered(graph: graph, callEdges: callEdges,
+                                                 direction: layoutDirection,
+                                                 sourceNodes: layoutSourceNodes)
+        }
         // Re-fit for every new graph — a stale user transform from a previous
         // diagram would render the new one at an unrelated scale/offset.
         hasUserViewTransform = false
@@ -121,6 +130,7 @@ final class DataFlowDiagramView: NSView {
         greyedNodeNames = []
         originNodeColors = [:]
         layoutSourceNodes = []
+        layoutCenterNode = nil
         hasUserViewTransform = false
         needsDisplay = true
     }

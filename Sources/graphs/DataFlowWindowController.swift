@@ -75,13 +75,15 @@ final class DataFlowWindowController: NSWindowController {
         graph.pruneTo(defined: Set(defs.map { $0.name }))
 
         titleLabel.stringValue = "Dataflow around “\(functionName)”"
-        captionLabel.stringValue = "Solid arrows: function calls · Animated dashed arrows: data flow"
+        captionLabel.stringValue = "Butterfly layout: callers to the left · callees to the right · Solid arrows: function calls · Animated dashed arrows: data flow"
 
+        let centerName = graph.hasNode(functionName) ? functionName : graph.functionNames.first
+        diagramView.layoutCenterNode = centerName
         diagramView.display(
             graph: graph,
             callEdges: calls.filter { graph.hasNode($0.0) && graph.hasNode($0.1) },
             dataEdges: data.filter { graph.hasNode($0.0) && graph.hasNode($0.1) },
-            highlight: graph.hasNode(functionName) ? functionName : graph.functionNames.first
+            highlight: centerName
         )
     }
 }
