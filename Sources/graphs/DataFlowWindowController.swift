@@ -81,9 +81,26 @@ final class DataFlowWindowController: NSWindowController {
         graph.pruneTo(defined: Set(defs.map { $0.name }))
 
         titleLabel.stringValue = "Dataflow around “\(functionName)”"
-        captionLabel.stringValue = "Butterfly layout: callers to the left · callees to the right · Solid arrows: function calls · Animated dashed arrows: data flow"
 
         let centerName = graph.hasNode(functionName) ? functionName : graph.functionNames.first
+
+        // Direct-neighbour scope: keep only the selected function plus its
+        // immediate callers and callees within this file. Transitive
+        // callees-of-callees (and unrelated in-file functions) are dropped so
+        // the diagram shows a single hop instead of the whole file's call graph.
+        if let center = centerName {
+            var keep: Set<String> = [center]
+            for (from, to) in calls where graph.hasNode(from) && graph.hasNode(to) {
+                if to == center || from == center {
+                    keep.insert(from)
+                    keep.insert(to)
+                }
+            }
+            graph.pruneTo(defined: keep)
+        }
+
+        captionLabel.stringValue = "Butterfly layout: callers to the left · callees to the right · Solid arrows: function calls · Animated dashed arrows: data flow · Direct callees only"
+
         diagramView.layoutCenterNode = centerName
         diagramView.display(
             graph: graph,
