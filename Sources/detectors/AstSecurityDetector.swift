@@ -348,6 +348,9 @@ struct AstSecurityDetector {
         if let wb = walkBounded[name], !wb.isEmpty { sizeB.formUnion(wb) }
         if let wn = walkNonZero[name], !wn.isEmpty { zeroCheckedRef.vars.formUnion(wn) }
         overflowConstBoundedRef.vars = walkConstBounded[name] ?? []
+        if isGo {
+            goZeroIVRef.vars = goZeroIVVars(in: fn.body)
+        }
 
         var findings: [AstFinding] = []
         scanStmt(fn.body, function: name, params: Set(fn.params.compactMap { $0.name }), tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeB, findings: &findings, reachable: reachable)
@@ -372,6 +375,10 @@ struct AstSecurityDetector {
         }
         if isGo {
             applyGoSuppressions(fn: fn, findings: &findings)
+            // Whole-function structural Go checks (XSS-via-unsafe-format, CORS,
+            // timing-unsafe comparisons, ECB-style block loops, JWT `alg:none`,
+            // defer-in-loop closes, plaintext-password logging, verbose errors).
+            checkGoStructural(fn: fn, function: name, params: Set(fn.params.compactMap { $0.name }), tainted: tainted, crossTainted: crossTainted, findings: &findings, reachable: reachable)
         }
         // Rust path-join + SSRF hardening (see RustSecurityDetector.swift).
         if isRust {
@@ -1155,6 +1162,15 @@ struct AstSecurityDetector {
         var vars: Set<String> = []
     }
     let overflowConstBoundedRef = OverflowConstBoundedBox()
+
+    /// Go variables initialized with `make(...)` in the current function body
+    /// (`iv := make([]byte, aes.BlockSize)`). A zero-valued make buffer passed
+    /// as the IV of a block-cipher stream is a static/zero IV, not a freshly
+    /// generated random nonce.
+    final class GoZeroIVBox {
+        var vars: Set<String> = []
+    }
+    let goZeroIVRef = GoZeroIVBox()
 
     private func constantStringVars(in body: CStmt) -> Set<String> {
         var literalAssigns = Set<String>()
