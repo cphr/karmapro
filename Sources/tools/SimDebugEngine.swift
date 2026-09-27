@@ -1881,6 +1881,7 @@ extension SimDebugEngine {
     }
 
     private func runSilentProjectCall(location: DefinitionLocation, argValues: [SimDebugValue?], call: SimCall) -> SimDebugValue? {
+        guard callDepth < maxCallDepth else { return nil }
         guard let source = resolveSource(for: location.fileURL) else { return nil }
         let ext = location.fileURL.pathExtension.lowercased()
         let defs = diagramDefinitions(source: source, ext: ext)
@@ -1898,6 +1899,7 @@ extension SimDebugEngine {
             }
             argCursor += 1
         }
+        callDepth += 1
         frames.append(frame)
         var guardSteps = 0
         while frames.count > depthBefore, guardSteps < maxSilentSteps {
@@ -1916,6 +1918,7 @@ extension SimDebugEngine {
         while frames.count > depthBefore {
             frames.removeLast()
         }
+        callDepth = max(0, callDepth - 1)
         return rv
     }
 
@@ -2694,6 +2697,9 @@ private struct SimFunctionBuilder {
                 continue
             }
             if c == "\n" {
+                if current.trimmingCharacters(in: .whitespaces).isEmpty {
+                    stmtStartOutLine = outLine + 1
+                }
                 outLine += 1
                 i += 1
                 continue
@@ -2721,6 +2727,9 @@ private struct SimFunctionBuilder {
                     flushCode()
                     let fileLine = fileLineValue(outLine: outLine, lineMap: lineMap, bodyOffset: bodyOffset)
                     instrs.append(SimInstruction(kind: .open, text: "{", line: fileLine))
+                    if pending.hasSuffix("=>") {
+                        pDepth = 0
+                    }
                 }
                 depth = max(0, depth + 1)
                 stmtStartOutLine = outLine
