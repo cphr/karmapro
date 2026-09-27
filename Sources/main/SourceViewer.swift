@@ -72,6 +72,17 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     /// mapped to their probability (0.8...1.0). Applied as a background highlight.
     private var highRiskLines: [Int: Double] = [:]
 
+    /// When true, control-flow arrows (T/F branches, loop back-edges, exits) are
+    /// overlaid on the source from the parsed control-flow graphs. Defaults to off
+    /// so the code looks identical unless the user opts in.
+    private var isFlowArrowsOn = false
+    /// Last computed arrows for the open file; cached so toggling doesn't reparse.
+    private var cachedFlowArrows: [FlowArrow] = []
+    /// Character offset of each line's start (index N = line N+1), cached so the
+    /// overlay can map arrow lines to glyph positions without rescanning.
+    private var cachedFlowLineStarts: [Int] = []
+    private var cachedFlowArrowsSource: String?
+
     /// Compact clickable table at the top of the viewer listing the highlighted
     /// lines for the current file. Clicking a row scrolls the source to that line.
     private lazy var resultsViewController: HighlightedLinesViewController = {
@@ -298,7 +309,10 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         lineNumberRuler?.markedLines = []
         lineNumberRuler?.highRiskLines = [:]
         lineNumberRuler?.cachedLineCount = 1
-        lineNumberRuler?.needsDisplay = true
+        textView.flowArrows = []
+        textView.showFlowArrows = false
+        textView.flowLineStarts = []
+        textView.needsDisplay = true
         emptyLabel.isHidden = false
         scrollView.isHidden = true
     }
@@ -326,6 +340,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
             lineNumberRuler?.markedLines = NoteStore.shared.lineNumbers(for: url)
             lineNumberRuler?.highRiskLines = highRiskLines
             lineNumberRuler?.cachedLineCount = text.components(separatedBy: "\n").count
+            refreshFlowArrows()
             lineNumberRuler?.needsDisplay = true
 
             let attributed = highlighter.highlight(text, for: url.pathExtension)
@@ -689,6 +704,12 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         lensItem.target = self
         menu.addItem(lensItem)
 
+        let flowTitle = isFlowArrowsOn ? "Hide Flow Arrows on Code" : "Show Flow Arrows on Code"
+        let flowItem = NSMenuItem(title: flowTitle, action: #selector(toggleFlowArrows(_:)), keyEquivalent: "")
+        flowItem.target = self
+        flowItem.state = isFlowArrowsOn ? .on : .off
+        menu.addItem(flowItem)
+
         // Opens the per-function complexity chart; available at any position.
         menu.addItem(NSMenuItem.separator())
         let complexityItem = NSMenuItem(
@@ -798,6 +819,161 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     private func handleMouseMoved(_ event: NSEvent) {
         guard isMagnifyingEnabled, let glass = magnifyingGlass else { return }
         glass.updatePosition(withEvent: event)
+    }
+
+    @objc private func toggleFlowArrows(_ sender: NSMenuItem) {
+        isFlowArrowsOn.toggle()
+        refreshFlowArrows()
+    }
+
+    /// Recomputes the flow arrows from the open file (when enabled) and pushes
+    /// them to the text view's overlay, along with the line-start offsets the
+    /// overlay needs to place each arrow. Clears the overlay when off/no file.
+    private func refreshFlowArrows() {
+        guard isFlowArrowsOn, let source = currentSource, !source.isEmpty else {
+            textView.flowArrows = []
+            textView.showFlowArrows = false
+            textView.needsDisplay = true
+            return
+        }
+        let (arrows, lineStarts) = flowArrows(for: source)
+        textView.flowArrows = arrows
+        textView.flowLineStarts = lineStarts
+        textView.showFlowArrows = true
+        textView.needsDisplay = true
+    }
+
+    /// Builds the control-flow arrows for every function defined in `source`
+    /// (C/C++/ObjC, Java, C#, Kotlin, Go, Rust, Python, Ruby, JS/TS). Returns an
+    /// empty array for unsupported languages or files with no parseable flows.
+    private func flowArrows(for source: String) -> ([FlowArrow], [Int]) {
+        if cachedFlowArrowsSource == source {
+            return (cachedFlowArrows, cachedFlowLineStarts)
+        }
+        cachedFlowLineStarts = flowLineStarts(in: source)
+        let ext = currentFileURL?.pathExtension ?? ""
+        guard DiagramLanguage.from(ext: ext) != nil else {
+            cachedFlowArrowsSource = source
+            cachedFlowArrows = []
+            return (cachedFlowArrows, cachedFlowLineStarts)
+        }
+        let defs = diagramDefinitions(source: source, ext: ext)
+        var arrows: [FlowArrow] = []
+        var seen: Set<FlowArrow> = []
+        for def in defs {
+            guard let flow = ControlFlowParser.analyze(source: source, ext: ext, functionName: def.name) else { continue }
+            for arrow in controlFlowArrows(from: flow) where seen.insert(arrow).inserted {
+                arrows.append(arrow)
+            }
+        }
+        // Drop arrows referencing lines outside the document.
+        let lineCount = cachedFlowLineStarts.count
+        cachedFlowArrows = arrows.filter { $0.fromLine <= lineCount && $0.toLine <= lineCount && $0.fromLine >= 1 && $0.toLine >= 1 }
+        cachedFlowArrowsSource = source
+        return (cachedFlowArrows, cachedFlowLineStarts)
+    }
+
+    /// Character offset of each logical line's start (index N → line N+1).
+    private func flowLineStarts(in source: String) -> [Int] {
+        var starts: [Int] = [0]
+        var index = 0
+        for unit in source.utf16 {
+            index += 1
+            if unit == 0x0A { starts.append(index) }
+        }
+        return starts
+    }
+
+    /// Converts one control-flow graph into overlay arrows. Walks **every edge**
+    /// of the parsed CFG (mirroring how the flow diagram draws them) so a flow is
+    /// traced statement→statement through a whole branch body, then on into the
+    /// join/continuation — not just a single decision-to-landing hop. Kinds, from
+    /// the parser's structured edges: decision T/F fan-out, loop back-edges,
+    /// merge (rejoin), plain sequential flow, and terminator (exit) markers.
+    private func controlFlowArrows(from flow: ControlFlowParser) -> [FlowArrow] {
+        var arrows: [FlowArrow] = []
+        let nodes = flow.nodes
+        let nodeById = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        func line(_ id: Int) -> Int? { nodeById[id]?.sourceLine }
+
+        for edge in flow.edges {
+            guard let fromNode = nodeById[edge.from],
+                  let fromLine = fromNode.sourceLine else { continue }
+            // A terminator node gets a marker chevron (kind .exit) instead of a
+            // continuation arrow — execution does not flow out of it.
+            if case let .block(text) = fromNode.kind, isExitStatement(text) { continue }
+
+            // Target line: the node's own line, or (for join/exit nodes without a
+            // line) the first real line reachable from it — the continuation.
+            var toLine = nodeById[edge.to]?.sourceLine
+            if toLine == nil {
+                toLine = resolvedLine(for: edge.to, in: flow)
+            }
+            guard let tl = toLine, tl != fromLine else { continue }
+
+            let kind: FlowArrow.Kind
+            if edge.isBackEdge {
+                kind = .loopBack
+            } else if isDecisionNode(fromNode) && edge.branch == "T" {
+                kind = .branchTrue
+            } else if isDecisionNode(fromNode) && edge.branch == "F" {
+                kind = .branchFalse
+            } else if nodeById[edge.to].map({ isJoinNode($0) }) == true {
+                kind = .rejoin   // block end merging into the continuation
+            } else {
+                kind = .flow     // sequential statement→statement flow
+            }
+            arrows.append(FlowArrow(fromLine: fromLine, toLine: tl, kind: kind))
+        }
+
+        // Exit markers: return/break/continue/goto/throw and, for Swift/Rust, any
+        // statement node flagged as exiting in the parsed body.
+        for node in nodes {
+            guard case let .block(text) = node.kind else { continue }
+            if isExitStatement(text), let l = node.sourceLine {
+                arrows.append(FlowArrow(fromLine: l, toLine: l, kind: .exit))
+            }
+        }
+
+        return arrows
+    }
+
+    /// The nearest source line reachable from `id`'s outgoing non-back edge —
+    /// resolves joins to the line execution resumes after the merge.
+    private func resolvedLine(for id: Int, in flow: ControlFlowParser) -> Int? {
+        let nodeById = Dictionary(uniqueKeysWithValues: flow.nodes.map { ($0.id, $0) })
+        var current = id
+        var hops = 0
+        while hops < flow.nodes.count {
+            hops += 1
+            guard let node = nodeById[current] else { return nil }
+            if let l = node.sourceLine { return l }
+            guard let next = flow.edges.first(where: { $0.from == current && !$0.isBackEdge }) else { return nil }
+            current = next.to
+        }
+        return nil
+    }
+
+    private func isDecisionNode(_ node: ControlFlowParser.Node) -> Bool {
+        switch node.kind {
+        case .decision, .switchCase: return true
+        default: return false
+        }
+    }
+
+    private func isJoinNode(_ node: ControlFlowParser.Node) -> Bool {
+        if case .join = node.kind { return true }
+        return false
+    }
+
+    private func isExitStatement(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let first = trimmed.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ";" }).first else {
+            return false
+        }
+        return first == "return" || first == "break" ||
+            first == "continue" || first == "goto" ||
+            first == "throw" || first == "exit"
     }
 
     @objc private func showFlowDiagram(_ sender: NSMenuItem) {
@@ -1161,6 +1337,23 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
 
 /// A vertical ruler that draws clickable line numbers beside the source text view.
 /// AppKit keeps it in sync with the text view's vertical scrolling automatically.
+/// Describes one control-flow arrow overlaid on the source: an edge of the
+/// parsed CFG mapped to source lines. Stored in line numbers; the overlay
+/// resolves them to document coordinates when drawing.
+struct FlowArrow: Hashable {
+    enum Kind {
+        case branchTrue    // decision T → branch body
+        case branchFalse   // decision F → else / skip-to-continuation / loop exit
+        case loopBack      // loop body end → loop header (upward)
+        case rejoin        // branch/block end → continuation (merge)
+        case flow          // plain statement-to-statement sequential flow
+        case exit          // return/break/continue/goto marker
+    }
+    let fromLine: Int
+    let toLine: Int
+    let kind: Kind
+}
+
 final class LineNumberRulerView: NSRulerView {
     private var gutterWidth: CGFloat = 36
 
@@ -1410,6 +1603,14 @@ final class ClickableTextView: NSTextView {
     private var lastTypeCharIndex: Int = NSNotFound
     private var wholeViewArea: NSTrackingArea?
 
+    /// Control-flow arrows drawn directly over the source (document coordinates).
+    var flowArrows: [FlowArrow] = []
+    /// When true (and arrows are present) the control-flow overlay is drawn.
+    var showFlowArrows = false
+    /// Character offset of each logical line's start (index N → line N+1), so the
+    /// overlay can map an arrow's line number to its glyph position.
+    var flowLineStarts: [Int] = []
+
     enum ClickTargetKind {
         case function
         case className
@@ -1417,6 +1618,144 @@ final class ClickableTextView: NSTextView {
     }
 
     override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if showFlowArrows && !flowArrows.isEmpty {
+            drawFlowArrowsOverlay(in: dirtyRect)
+        }
+    }
+
+    // MARK: - Control-flow overlay
+
+    /// Y of a logical line's vertical centre, in this text view's document
+    /// coordinates (scrolled text scrolls with it). Falls back to the first
+    /// visible fragment for the line, which for unwrapped lines is the line itself.
+    private func flowAnchorY(forLine line: Int) -> CGFloat? {
+        guard line >= 1, line <= flowLineStarts.count,
+              let lm = layoutManager else { return nil }
+        let ns = string as NSString
+        let charIndex = flowLineStarts[line - 1]
+        guard charIndex < ns.length else { return nil }
+        let charRange = NSRange(location: charIndex, length: min(ns.length - charIndex, 1))
+        var actualRange = NSRange()
+        let glyphRange = lm.glyphRange(forCharacterRange: charRange, actualCharacterRange: &actualRange)
+        guard glyphRange.length > 0 else { return nil }
+        let lineRect = lm.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
+        return lineRect.midY
+    }
+
+    /// X where a logical line's code begins (container outset + leading
+    /// indentation), so hooks stop short of the glyphs. Measuring the actual
+    /// leading-whitespace substring keeps tabs/spaces correct with the font.
+    private func flowTextStartX(forLine line: Int) -> CGFloat {
+        guard line >= 1, line <= flowLineStarts.count else { return textContainerOrigin.x }
+        let ns = string as NSString
+        let start = flowLineStarts[line - 1]
+        var idx = start
+        while idx < ns.length {
+            let c = ns.character(at: idx)
+            if c != 0x20 && c != 0x09 { break }
+            idx += 1
+        }
+        guard idx > start, let font else { return textContainerOrigin.x }
+        let indent = ns.substring(with: NSRange(location: start, length: idx - start))
+        return textContainerOrigin.x + (indent as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    /// Draws the control-flow arrows over the source, mirroring the flow
+    /// diagram's edge style. Each CFG edge is a curved bow: it leaves the source
+    /// line's code, sweeps into a left lane, and curves back into the target
+    /// line's code, ending in an arrowhead at the target (a start dot marks the
+    /// flow's beginning). Consecutive statements share the lane so the flow reads
+    /// as one connected path through the branch body and into its continuation.
+    private func drawFlowArrowsOverlay(in dirtyRect: NSRect) {
+        // Lane offsets per kind keep T/F loop/rejoin bows from collapsing onto
+        // one another. The spine stays at x=2..6 — left of every glyph (code
+        // starts at the 8pt inset) — so the vertical run is always in whitespace,
+        // and the horizontal runs only cross each line's own leading whitespace.
+        let laneFor: [FlowArrow.Kind: CGFloat] = [
+            .branchTrue: 0,
+            .branchFalse: 2,
+            .loopBack: 4,
+            .rejoin: 4,
+            .flow: 0
+        ]
+
+        for arrow in flowArrows {
+            guard let fromY = flowAnchorY(forLine: arrow.fromLine),
+                  let toY = flowAnchorY(forLine: arrow.toLine) else { continue }
+            // Skip arrows fully outside the region being redrawn.
+            let top = min(fromY, toY), bottom = max(fromY, toY)
+            if bottom < dirtyRect.minY || top > dirtyRect.maxY { continue }
+
+            let color: NSColor
+            switch arrow.kind {
+            case .branchTrue: color = NSColor.systemGreen
+            case .branchFalse: color = NSColor.systemRed
+            case .loopBack: color = NSColor.systemBlue
+            case .rejoin: color = NSColor.systemTeal
+            case .flow: color = NSColor.secondaryLabelColor
+            case .exit: color = NSColor.systemOrange
+            }
+            let strokeColor = color.withAlphaComponent(0.9)
+
+            if case .exit = arrow.kind {
+                // Short right-pointing chevron marking a terminator line.
+                let x = max(flowTextStartX(forLine: arrow.fromLine) - 12, 0)
+                let tip = NSPoint(x: x + 7, y: fromY)
+                let shaft = NSBezierPath()
+                shaft.move(to: NSPoint(x: tip.x - 7, y: fromY))
+                shaft.line(to: NSPoint(x: tip.x - 4, y: fromY))
+                shaft.lineWidth = 1.2
+                strokeColor.setStroke()
+                shaft.stroke()
+                let head = NSBezierPath()
+                head.move(to: NSPoint(x: tip.x - 4, y: fromY - 2.4))
+                head.line(to: tip)
+                head.line(to: NSPoint(x: tip.x - 4, y: fromY + 2.4))
+                head.close()
+                color.withAlphaComponent(0.9).setFill()
+                head.fill()
+                continue
+            }
+
+            guard abs(toY - fromY) > 2 else { continue }
+
+            let fromX = max(flowTextStartX(forLine: arrow.fromLine) - 2, 0)
+            let toX = max(flowTextStartX(forLine: arrow.toLine) - 2, 0)
+            let startP = NSPoint(x: fromX, y: fromY)
+            let endP = NSPoint(x: toX, y: toY)
+
+            // Fixed spine lane (left of the code inset), nudged per kind.
+            let laneX: CGFloat = 2 + (laneFor[arrow.kind] ?? 0)
+
+            // One smooth S-bow: leave the source, hug the lane, arrive at target.
+            let path = NSBezierPath()
+            path.lineWidth = arrow.kind == .flow ? 1.0 : 1.3
+            path.move(to: startP)
+            path.curve(to: endP,
+                       controlPoint1: NSPoint(x: laneX, y: fromY),
+                       controlPoint2: NSPoint(x: laneX, y: toY))
+            strokeColor.setStroke()
+            path.stroke()
+
+            // Start dot: marks where the flow begins on the source line.
+            let startDot = NSBezierPath(ovalIn: NSRect(x: startP.x - 1.6, y: startP.y - 1.6, width: 3.2, height: 3.2))
+            color.withAlphaComponent(0.95).setFill()
+            startDot.fill()
+
+            // Arrowhead into the target line. The bow's final segment is
+            // horizontal (control point on the lane), so the head points right.
+            let head = NSBezierPath()
+            head.move(to: NSPoint(x: toX + 1, y: toY))
+            head.line(to: NSPoint(x: toX + 1 - 5, y: toY - 2.6))
+            head.line(to: NSPoint(x: toX + 1 - 5, y: toY + 2.6))
+            head.close()
+            color.withAlphaComponent(0.95).setFill()
+            head.fill()
+        }
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
