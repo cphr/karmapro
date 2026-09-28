@@ -41,6 +41,16 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     var projectRootURL: URL?
     private var selectedLanguage: Language?
     private var bugBadgeView: BugBadgeView?
+    /// Chronological list of files opened in the source viewer. The currently
+    /// shown file is `fileHistory[historyIndex]`; entries after it form the
+    /// forward stack that is dropped whenever a brand-new file is opened.
+    private var fileHistory: [URL] = []
+    private var historyIndex: Int = -1
+    /// True while a back/forward/menu restore is in flight, so the restored file
+    /// isn't pushed onto the history again.
+    private var isRestoringHistory = false
+    private weak var backHistoryButton: HistoryMenuButton?
+    private weak var forwardHistoryButton: HistoryMenuButton?
 
     private final class BugBadgeView: NSView {
         private let countLabel = NSTextField(labelWithString: "")
@@ -84,6 +94,41 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             isHidden = !hasCount
             if hasCount {
                 countLabel.stringValue = count > 99 ? "99+" : "\(count)"
+            }
+        }
+    }
+
+    /// Toolbar button whose left click fires `action` on `target`, and whose
+    /// press-and-hold (or Control-click) pops up a list of the last several
+    /// files opened, letting the user jump straight to one.
+    private final class HistoryMenuButton: NSButton {
+        /// Builds the menu shown on hold; invoked lazily so it is always fresh.
+        var menuProvider: (() -> NSMenu?)?
+        private var holdTimer: Timer?
+        private var didShowHoldMenu = false
+
+        override func mouseDown(with event: NSEvent) {
+            didShowHoldMenu = false
+            holdTimer?.invalidate()
+            isHighlighted = true
+            let holdDuration: TimeInterval = 0.5
+            holdTimer = Timer.scheduledTimer(withTimeInterval: holdDuration, repeats: false) { [weak self] _ in
+                guard let self, let menu = self.menuProvider?(), !menu.items.isEmpty else { return }
+                self.didShowHoldMenu = true
+                self.isHighlighted = false
+                menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: self)
+            }
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            let wasHoldMenu = didShowHoldMenu
+            holdTimer?.invalidate()
+            holdTimer = nil
+            isHighlighted = false
+            if wasHoldMenu { return }
+            // A plain click: dispatch the ordinary action.
+            if let action = action, target != nil {
+                NSApp.sendAction(action, to: target, from: self)
             }
         }
     }
@@ -263,6 +308,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.flowPanel.clear()
             self?.sourceViewer?.display(fileAt: url)
             self?.updateWindowTitle(forFile: url)
+            self?.recordHistory(url)
         }
 
         viewer.onDiagramRequest = { [weak self] fileURL, functionName in
@@ -273,7 +319,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
         viewer.onBacktraceRequest = { [weak self] in
             guard let self = self,
-                  let projectRoot = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let projectRoot = self.projectRootURL else { return }
             let controller = BacktraceAnalyserWindowController(projectRoot: projectRoot) { [weak self] url, line in
                 self?.showFile(at: url, line: line)
             }
@@ -283,7 +329,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
         viewer.onVariableFlowRequest = { [weak self] fileURL, charIndex, variableName in
             guard let self = self,
-                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let root = self.projectRootURL else { return }
             self.showVariableFlow(projectRoot: root, fileURL: fileURL, charIndex: charIndex, variableName: variableName)
         }
 
@@ -293,13 +339,13 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
         viewer.onReachabilityRequest = { [weak self] fileURL, functionName in
             guard let self = self,
-                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let root = self.projectRootURL else { return }
             self.showReachability(projectRoot: root, fileURL: fileURL, functionName: functionName)
         }
 
         viewer.onComplexityRequest = { [weak self] _ in
             guard let self = self,
-                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let root = self.projectRootURL else { return }
             let controller: ComplexityScatterWindowController
             if let existing = self.complexityController {
                 controller = existing
@@ -330,7 +376,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
         viewer.onClassRequest = { [weak self] requestedClassName in
             guard let self = self,
-                  let root = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let root = self.projectRootURL else { return }
             if self.classUsageController == nil || self.classUsageController!.requestedClass != requestedClassName {
                 let controller = ClassUsageWindowController(className: requestedClassName)
                 controller.onOpenFile = { [weak self] url, line in
@@ -347,7 +393,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
         viewer.onHowToFix = { [weak self] fileURL, line, lineText in
             guard let self = self,
-                  let folder = self.window?.representedURL ?? self.projectRootURL else { return }
+                  let folder = self.projectRootURL else { return }
             let controller: AIWindowController
             if let existing = self.aiController {
                 controller = existing
@@ -380,6 +426,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self?.fileTreeViewController.load(directory: url)
             self?.projectRootURL = url
             self?.window?.representedURL = url
+            self?.resetHistory()
             self?.variableFlowCancellation?.cancel()
             self?.variableFlowCancellation = nil
             self?.variableFlowTracerCache = nil
@@ -469,7 +516,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     /// entry-point enumeration. Reuses the shared source index when one exists;
     /// otherwise the window builds its own index with progress shown.
     private func showFindEntries() {
-        guard let folder = window?.representedURL ?? projectRootURL else {
+        guard let folder = projectRootURL else {
             let alert = NSAlert()
             alert.messageText = "No Folder Open"
             alert.informativeText = "Open a source folder before finding entry points."
@@ -654,6 +701,9 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 extension NSToolbarItem.Identifier {
     static let toggleSidebar = NSToolbarItem.Identifier("toggleSidebar")
     static let openFolder = NSToolbarItem.Identifier("openFolder")
+    static let historyBack = NSToolbarItem.Identifier("historyBack")
+    static let historyForward = NSToolbarItem.Identifier("historyForward")
+    static let historyGroup = NSToolbarItem.Identifier("historyGroup")
     static let search = NSToolbarItem.Identifier("search")
     static let language = NSToolbarItem.Identifier("language")
     static let findInFile = NSToolbarItem.Identifier("findInFile")
@@ -669,15 +719,19 @@ extension NSToolbarItem.Identifier {
 
 extension MainWindowController: NSToolbarDelegate {
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        return [.openFolder, .toggleSidebar, .language, .findInFile, .searchFiles, .search, .flexibleSpace, .securityScan, .mlTrain, .mlScan, .notes, .wiki, .bugs, .ai]
+        return [.historyGroup, .openFolder, .toggleSidebar, .language, .findInFile, .searchFiles, .search, .flexibleSpace, .securityScan, .mlTrain, .mlScan, .notes, .wiki, .bugs, .ai]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        return [.openFolder, .toggleSidebar, .language, .findInFile, .searchFiles, .securityScan, .mlTrain, .mlScan, .notes, .wiki, .bugs, .ai, .flexibleSpace, .search]
+        return [.historyGroup, .openFolder, .toggleSidebar, .language, .findInFile, .searchFiles, .securityScan, .mlTrain, .mlScan, .notes, .wiki, .bugs, .ai, .flexibleSpace, .search]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch itemIdentifier {
+        case .historyBack, .historyForward:
+            return makeHistoryToolbarItem(identifier: itemIdentifier)
+        case .historyGroup:
+            return makeHistoryToolbarGroup()
         case .openFolder:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = "Open Folder"
@@ -820,6 +874,59 @@ extension MainWindowController: NSToolbarDelegate {
         }
     }
 
+    /// Builds a single back/forward toolbar button. A click navigates; a
+    /// press-and-hold pops up the recent-files menu.
+    private func makeHistoryToolbarItem(identifier: NSToolbarItem.Identifier) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        let button = buttonForHistoryItem(identifier: identifier)
+        if identifier == .historyBack {
+            item.label = "Back"
+            item.toolTip = "Go to the previously opened file (hold to choose)"
+            button.toolTip = "Go back (hold for recent files)"
+            item.image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "Go back")
+            item.action = #selector(goBackInHistory)
+            self.backHistoryButton = button
+        } else {
+            item.label = "Forward"
+            item.toolTip = "Go to the next opened file (hold to choose)"
+            button.toolTip = "Go forward (hold for recent files)"
+            item.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: "Go forward")
+            item.action = #selector(goForwardInHistory)
+            self.forwardHistoryButton = button
+        }
+        button.target = self
+        button.action = identifier == .historyBack ? #selector(goBackInHistory) : #selector(goForwardInHistory)
+        button.menuProvider = { [weak self] in self?.historyMenu() }
+        item.isBordered = true
+        item.view = button
+        updateHistoryButtonStates()
+        return item
+    }
+
+    /// Groups Back + Forward into a single segmented toolbar control so they
+    /// sit together as one unit on the left of "Open Folder".
+    private func makeHistoryToolbarGroup() -> NSToolbarItemGroup {
+        let back = makeHistoryToolbarItem(identifier: .historyBack)
+        let forward = makeHistoryToolbarItem(identifier: .historyForward)
+        let group = NSToolbarItemGroup(itemIdentifier: .historyGroup)
+        group.label = "History"
+        group.toolTip = "Navigate between recently opened files"
+        group.subitems = [back, forward]
+        group.controlRepresentation = .expanded
+        return group
+    }
+
+    /// Creates the custom bordered button view backing a history toolbar item.
+    private func buttonForHistoryItem(identifier: NSToolbarItem.Identifier) -> HistoryMenuButton {
+        let button = HistoryMenuButton()
+        button.bezelStyle = .texturedRounded
+        button.imagePosition = .imageOnly
+        button.isBordered = true
+        button.image = NSImage(systemSymbolName: identifier == .historyBack ? "chevron.left" : "chevron.right",
+                               accessibilityDescription: nil)
+        return button
+    }
+
     private func makeLanguagePopup() -> NSView {
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 200, height: 26), pullsDown: false)
         popup.addItems(withTitles: Language.supported.map { $0.name })
@@ -875,7 +982,7 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     @objc private func searchFilesClicked() {
-        let controller = FileSearchWindowController(folderURL: window?.representedURL, language: selectedLanguage)
+        let controller = FileSearchWindowController(folderURL: projectRootURL, language: selectedLanguage)
         controller.onOpenResult = { [weak self] url, line in
             self?.showFile(at: url, line: line)
         }
@@ -891,6 +998,88 @@ extension MainWindowController: NSToolbarDelegate {
         sourceViewer?.display(fileAt: url)
         sourceViewer?.scrollToLine(line)
         updateWindowTitle(forFile: url)
+        recordHistory(url)
+    }
+
+    /// Discards all history (used when opening a brand-new folder).
+    private func resetHistory() {
+        fileHistory.removeAll()
+        historyIndex = -1
+        updateHistoryButtonStates()
+    }
+
+    /// Adds a file to the browser-style open history unless it equals the
+    /// current entry. Opening anything new discards the forward stack.
+    private func recordHistory(_ url: URL) {
+        guard !isRestoringHistory else { return }
+        if historyIndex >= 0, historyIndex < fileHistory.count,
+           fileHistory[historyIndex].standardizedFileURL == url.standardizedFileURL {
+            return
+        }
+        if historyIndex < fileHistory.count - 1 {
+            fileHistory.removeSubrange((historyIndex + 1)...)
+        }
+        fileHistory.append(url)
+        historyIndex = fileHistory.count - 1
+        updateHistoryButtonStates()
+    }
+
+    /// Jumps to a specific history entry (from the press-and-hold menu),
+    /// dropping the forward stack past that point like a browser.
+    @objc private func goBackInHistory() {
+        navigateHistory(by: -1)
+    }
+
+    @objc private func goForwardInHistory() {
+        navigateHistory(by: 1)
+    }
+
+    private func navigateHistory(by delta: Int) {
+        let target = historyIndex + delta
+        guard !fileHistory.isEmpty, (0..<fileHistory.count).contains(target) else { return }
+        historyIndex = target
+        isRestoringHistory = true
+        showFile(at: fileHistory[historyIndex], line: 1)
+        isRestoringHistory = false
+        updateHistoryButtonStates()
+    }
+
+    @objc private func historyMenuChosen(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int, (0..<fileHistory.count).contains(index) else { return }
+        historyIndex = index
+        if historyIndex < fileHistory.count - 1 {
+            fileHistory.removeSubrange((historyIndex + 1)...)
+        }
+        isRestoringHistory = true
+        showFile(at: fileHistory[historyIndex], line: 1)
+        isRestoringHistory = false
+        updateHistoryButtonStates()
+    }
+
+    /// Menu shown on press-and-hold: the last 10 files opened, most recent
+    /// first, taken from the whole history (including any forward entries).
+    /// Choosing one jumps to it and, like a browser, discards everything after.
+    private func historyMenu() -> NSMenu {
+        let menu = NSMenu()
+        let shown = min(fileHistory.count, 10)
+        guard shown > 0 else {
+            menu.addItem(withTitle: "No Files Opened Yet", action: nil, keyEquivalent: "")
+            return menu
+        }
+        for i in stride(from: fileHistory.count - 1, through: fileHistory.count - shown, by: -1) {
+            let url = fileHistory[i]
+            let item = NSMenuItem(title: url.lastPathComponent, action: #selector(historyMenuChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = i
+            item.toolTip = url.path
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func updateHistoryButtonStates() {
+        backHistoryButton?.isEnabled = historyIndex > 0 && !fileHistory.isEmpty
+        forwardHistoryButton?.isEnabled = (historyIndex >= 0 && historyIndex < fileHistory.count - 1)
     }
 
     /// Opens the dynamic-debugger simulation window for a function in a project
@@ -918,17 +1107,21 @@ extension MainWindowController: NSToolbarDelegate {
 
     /// Sets the window title to "<project> Project" with the currently-open file's
     /// name shown in parentheses next to "Project", e.g. "MyApp Project (App.java)".
+    /// The represented URL tracks the open file so the title bar offers a tooltip
+    /// (and Command-click path menu) with the full file path; with no file open it
+    /// falls back to the project root.
     private func updateWindowTitle(forFile url: URL?) {
-        let projectName = window?.representedURL?.lastPathComponent ?? projectRootURL?.lastPathComponent ?? "Project"
+        let projectName = projectRootURL?.lastPathComponent ?? "Project"
         if let fileURL = url {
             window?.title = "\(projectName) Project (\(fileURL.lastPathComponent))"
         } else {
             window?.title = "\(projectName) Project"
         }
+        window?.representedURL = url ?? projectRootURL
     }
 
     @objc private func securityScanClicked() {
-        guard let folder = window?.representedURL ?? projectRootURL else {
+        guard let folder = projectRootURL else {
             let alert = NSAlert()
             alert.messageText = "No Folder Open"
             alert.informativeText = "Open a source folder before running a security scan."
@@ -970,12 +1163,12 @@ extension MainWindowController: NSToolbarDelegate {
             }
             notesController = controller
         }
-        controller.projectRootURL = window?.representedURL
+        controller.projectRootURL = projectRootURL
         controller.reloadNotes()
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        if let folder = window?.representedURL {
+        if let folder = projectRootURL {
             controller.window?.title = "Notes — \((folder as NSURL).lastPathComponent ?? "")"
         }
     }
@@ -1006,7 +1199,7 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     @objc private func aiClicked() {
-        guard let folder = window?.representedURL ?? projectRootURL else {
+        guard let folder = projectRootURL else {
             let alert = NSAlert()
             alert.messageText = "No Project Selected"
             alert.informativeText = "You need to first select a project before using the AI assistant."
@@ -1064,7 +1257,7 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     @objc private func mlScanClicked() {
-        let folder = window?.representedURL ?? projectRootURL
+        let folder = projectRootURL
         guard folder != nil else {
             let alert = NSAlert()
             alert.messageText = "No Folder Open"
