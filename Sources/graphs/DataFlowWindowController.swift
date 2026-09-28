@@ -6,6 +6,7 @@ final class DataFlowWindowController: NSWindowController {
     private let diagramView = DataFlowDiagramView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let captionLabel = NSTextField(wrappingLabelWithString: "")
+    private let emptyLabel = NSTextField(wrappingLabelWithString: "")
 
     convenience init(fileURL: URL, functionName: String) {
         let window = EscClosableWindow(
@@ -45,6 +46,13 @@ final class DataFlowWindowController: NSWindowController {
         diagramView.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(diagramView)
 
+        emptyLabel.font = NSFont.systemFont(ofSize: 14)
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.alignment = .center
+        emptyLabel.isHidden = true
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(emptyLabel)
+
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
@@ -55,7 +63,11 @@ final class DataFlowWindowController: NSWindowController {
             diagramView.topAnchor.constraint(equalTo: captionLabel.bottomAnchor, constant: 12),
             diagramView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             diagramView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            diagramView.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            diagramView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            emptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: 40),
+            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -40)
         ])
     }
 
@@ -78,11 +90,17 @@ final class DataFlowWindowController: NSWindowController {
         }
 
         // Only keep nodes that are actually defined functions in this file.
+        for def in defs { _ = graph.node(for: def.name) }
         graph.pruneTo(defined: Set(defs.map { $0.name }))
 
         titleLabel.stringValue = "Dataflow around “\(functionName)”"
 
-        let centerName = graph.hasNode(functionName) ? functionName : graph.functionNames.first
+        let centerName: String?
+        if defs.contains(where: { $0.name == functionName }) {
+            centerName = functionName
+        } else {
+            centerName = graph.functionNames.first
+        }
 
         // Direct-neighbour scope: keep only the selected function plus its
         // immediate callers and callees within this file. Transitive
@@ -99,13 +117,24 @@ final class DataFlowWindowController: NSWindowController {
             graph.pruneTo(defined: keep)
         }
 
-        captionLabel.stringValue = "Butterfly layout: callers to the left · callees to the right · Solid arrows: function calls · Animated dashed arrows: data flow · Direct callees only"
+        captionLabel.stringValue = "Callers to the left · Callees to the right · Solid arrows: function calls · Animated dashed arrows: data flow · Direct callees only"
+
+        let visibleCalls = calls.filter { graph.hasNode($0.0) && graph.hasNode($0.1) }
+        let visibleData = data.filter { graph.hasNode($0.0) && graph.hasNode($0.1) }
+
+        guard !visibleCalls.isEmpty || !visibleData.isEmpty else {
+            emptyLabel.stringValue = "No direct flow was identified within the same file, try the reachability diagram if you want cross-file"
+            emptyLabel.isHidden = false
+            diagramView.clear()
+            return
+        }
+        emptyLabel.isHidden = true
 
         diagramView.layoutCenterNode = centerName
         diagramView.display(
             graph: graph,
-            callEdges: calls.filter { graph.hasNode($0.0) && graph.hasNode($0.1) },
-            dataEdges: data.filter { graph.hasNode($0.0) && graph.hasNode($0.1) },
+            callEdges: visibleCalls,
+            dataEdges: visibleData,
             highlight: centerName
         )
     }

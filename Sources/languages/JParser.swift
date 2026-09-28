@@ -36,7 +36,7 @@ public final class JParser {
         "native", "strictfp", "default", "transient", "volatile", "void"
     ]
 
-    public func parseMethods() -> [JMethodDef] {
+    public func parseMethods(keepOverloads: Bool = false) -> [JMethodDef] {
         var defs: [JMethodDef] = []
         let n = tokens.count
         var braceDepth = 0
@@ -99,10 +99,13 @@ public final class JParser {
         // parameterized constructor that stores its param into a field) are all
         // analyzed instead of collapsing onto the first (mirrors the C path, but
         // the name alone would drop constructors with different arities entirely).
+        // When `keepOverloads` is set (source-viewer path) each distinct
+        // definition site is retained (keyed by name + position) so even
+        // same-arity overloads differing only by parameter type stay clickable.
         var seen = Set<String>()
         var result: [JMethodDef] = []
         for d in defs {
-            let key = "\(d.name)#\(d.params.count)"
+            let key = keepOverloads ? "\(d.name)#\(d.startOffset)" : "\(d.name)#\(d.params.count)"
             if !seen.contains(key) {
                 seen.insert(key)
                 result.append(d)

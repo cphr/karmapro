@@ -30,7 +30,7 @@ public final class CCFunctionParser {
     /// definition is recognized as `name ( params ) { body }` at any brace depth, so
     /// the same logic covers all cases while plain calls (`foo()`) are discarded because
     /// they are followed by `;` rather than a body `{`.
-    public func parseDefinitions() -> [FunctionDef] {
+    public func parseDefinitions(keepOverloads: Bool = false) -> [FunctionDef] {
         var defs: [FunctionDef] = []
 
         // Strip comments/preprocessor and tokenize with brace tracking.
@@ -162,12 +162,15 @@ public final class CCFunctionParser {
             i += 1
         }
 
-        // Deduplicate by name, keep first (definition) occurrence.
+        // Deduplicate by name, keep first (definition) occurrence. When
+        // `keepOverloads` is set (source-viewer path) each distinct overload
+        // site is retained keyed by name + location so overloads stay clickable.
         var seen = Set<String>()
         var result: [FunctionDef] = []
         for def in defs {
-            if !seen.contains(def.name) {
-                seen.insert(def.name)
+            let key = keepOverloads ? "\(def.name)\u{1}\(def.nameRange.location)" : def.name
+            if !seen.contains(key) {
+                seen.insert(key)
                 result.append(def)
             }
         }

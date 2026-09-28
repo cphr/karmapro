@@ -52,19 +52,22 @@ enum DiagramLanguage: Equatable {
 
 /// Resolves the defined functions/methods in `source` for the file's language,
 /// as `CCFunctionParser.FunctionDef`s so all downstream consumers share one shape.
-func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.FunctionDef] {
+/// `keepOverloads` retains every distinct definition site (so overloads stay
+/// clickable in the source viewer); when false, each name collapses to its first
+/// occurrence (scanner/index behavior, preserving name-keyed analysis maps).
+func diagramDefinitions(source: String, ext: String, keepOverloads: Bool = true) -> [CCFunctionParser.FunctionDef] {
     guard let lang = DiagramLanguage.from(ext: ext) else { return [] }
     switch lang {
     case .c:
-        return CCFunctionParser(source: source).parseDefinitions() + macroDefinitions(source: source)
+        return CCFunctionParser(source: source).parseDefinitions(keepOverloads: keepOverloads) + macroDefinitions(source: source)
     case .objc:
         // A Cocoa file (.m/.mm) typically mixes declared C functions with
         // ObjC methods (`-`/`+`), so both must be included. The C parser only
         // sees top-level C functions and the ObjC parser only sees `-`/`+`
         // methods, so unioning the two is non-overlapping.
-        var defs = CCFunctionParser(source: source).parseDefinitions()
+        var defs = CCFunctionParser(source: source).parseDefinitions(keepOverloads: keepOverloads)
         defs += macroDefinitions(source: source)
-        defs += ObjCMethodParser(source: source).parseDefinitions().map { def in
+        defs += ObjCMethodParser(source: source).parseDefinitions(keepOverloads: keepOverloads).map { def in
             CCFunctionParser.FunctionDef(name: def.name,
                                          bodyRange: def.bodyRange,
                                          signatureRange: def.signatureRange,
@@ -72,7 +75,7 @@ func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.Functi
         }
         return defs
     case .java:
-        return JParser(source: source).parseMethods().map { def in
+        return JParser(source: source).parseMethods(keepOverloads: keepOverloads).map { def in
             CCFunctionParser.FunctionDef(name: def.name,
                                          bodyRange: def.bodyRange,
                                          signatureRange: NSRange(location: def.startOffset,
@@ -81,7 +84,7 @@ func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.Functi
                                                             length: (def.name as NSString).length))
         }
     case .csharp:
-        return CSharpParser(source: source).parseMethods().map { def in
+        return CSharpParser(source: source).parseMethods(keepOverloads: keepOverloads).map { def in
             CCFunctionParser.FunctionDef(name: def.name,
                                          bodyRange: def.bodyRange,
                                          signatureRange: NSRange(location: def.startOffset,
@@ -90,7 +93,7 @@ func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.Functi
                                                             length: (def.name as NSString).length))
         }
     case .solidity:
-        return SolidityParser(source: source).parseMethods().map { def in
+        return SolidityParser(source: source).parseMethods(keepOverloads: keepOverloads).map { def in
             CCFunctionParser.FunctionDef(name: def.name,
                                          bodyRange: def.bodyRange,
                                          signatureRange: NSRange(location: def.startOffset,
@@ -100,7 +103,7 @@ func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.Functi
         }
     case .kotlin, .php, .python, .ruby, .go, .rust:
         guard let kind = lang.scriptKind else { return [] }
-        return ScriptMethodParser(language: kind, source: source).parseMethods().map { def in
+        return ScriptMethodParser(language: kind, source: source).parseMethods(keepOverloads: keepOverloads).map { def in
             CCFunctionParser.FunctionDef(name: def.name,
                                           bodyRange: def.bodyRange,
                                           signatureRange: NSRange(location: def.startOffset,
@@ -116,7 +119,7 @@ func diagramDefinitions(source: String, ext: String) -> [CCFunctionParser.Functi
                                           nameRange: d.nameRange)
         }
     case .swift:
-        return SwiftParser(source: source).parseDefinitions().map { d in
+        return SwiftParser(source: source).parseDefinitions(keepOverloads: keepOverloads).map { d in
             CCFunctionParser.FunctionDef(name: d.name,
                                           bodyRange: d.bodyRange,
                                           signatureRange: d.signatureRange,

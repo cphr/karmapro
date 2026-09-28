@@ -111,6 +111,20 @@ final class ControlFlowParser {
     /// C/C++/ObjC, Java, C#, Kotlin, Go, Rust (brace bodies) and Python/Ruby (whose
     /// indentation/`end`-based bodies are normalized to braces first).
     static func analyze(source: String, ext: String, functionName: String) -> ControlFlowParser? {
+        analyze(source: source, ext: ext, functionName: functionName, definition: nil)
+    }
+
+    /// Analyzes the control flow of a *specific* definition (`definition`), or of
+    /// the first name match when `nil`. The definition must be passed whenever the
+    /// file can contain same-name overloads, otherwise every occurrence of the name
+    /// resolves to the first body. Returns the flow graph for the clicked/analysed
+    /// overload, not just the first instance.
+    static func analyze(source: String, ext: String, functionName: String,
+                        definition: CCFunctionParser.FunctionDef?) -> ControlFlowParser? {
+        if let def = definition {
+            return analyze(bodySource: source, bodyRange: def.bodyRange,
+                           functionName: def.name, ext: ext)
+        }
         let defs = diagramDefinitions(source: source, ext: ext)
         guard let def = defs.first(where: { $0.name == functionName }) else { return nil }
         return analyze(bodySource: source, bodyRange: def.bodyRange,

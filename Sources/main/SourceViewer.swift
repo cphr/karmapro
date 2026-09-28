@@ -73,9 +73,10 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     private var highRiskLines: [Int: Double] = [:]
 
     /// When true, control-flow arrows (T/F branches, loop back-edges, exits) are
-    /// overlaid on the source from the parsed control-flow graphs. Defaults to off
-    /// so the code looks identical unless the user opts in.
-    private var isFlowArrowsOn = false
+    /// overlaid on the source from the parsed control-flow graphs. Defaults to on
+    /// so the arrows are visible from launch; the user can turn them off via the
+    /// source-pane's right-click menu.
+    private var isFlowArrowsOn = true
     /// Last computed arrows for the open file; cached so toggling doesn't reparse.
     private var cachedFlowArrows: [FlowArrow] = []
     /// Character offset of each line's start (index N = line N+1), cached so the
@@ -114,7 +115,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     var onDiagramRequest: ((URL, String) -> Void)?
     /// Called when a function name is clicked — passes the file, function name, full source, and file extension,
     /// enabling downstream panels to compute complexity/flowcharts.
-    var onFunctionSelected: ((URL, String, String, String) -> Void)?
+    var onFunctionSelected: ((URL, String, String, String, CCFunctionParser.FunctionDef?) -> Void)?
     /// Called when a Java class name is clicked. Passes the class name.
     var onClassRequest: ((String) -> Void)?
     /// Called when the user picks "Backtrace Analyser" from the context menu.
@@ -470,8 +471,8 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
             functionRanges.append((name: def.name, range: def.nameRange))
         }
         textView.functionRanges = functionRanges
-        textView.onFunctionClick = { [weak self] name in
-            self?.handleFunctionClick(name)
+        textView.onFunctionClick = { [weak self] name, charIndex in
+            self?.handleFunctionClick(name, at: charIndex)
         }
 
         classRanges.removeAll()
@@ -625,12 +626,16 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         }
     }
 
-    private func handleFunctionClick(_ functionName: String) {
+    private func handleFunctionClick(_ functionName: String, at charIndex: Int) {
         guard let fileURL = currentFileURL else { return }
+        // Resolve the exact overload def that contains the click so the flow panel
+        // analyses the clicked occurrence, not the first same-name function.
+        let def = diagramDefinitions(source: currentSource ?? "", ext: fileURL.pathExtension)
+            .first(where: { $0.name == functionName && NSLocationInRange(charIndex, $0.nameRange) })
         showFunctionDataflow(functionName: functionName)
         if let source = currentSource {
             let ext = fileURL.pathExtension
-            onFunctionSelected?(fileURL, functionName, source, ext)
+            onFunctionSelected?(fileURL, functionName, source, ext, def)
         }
     }
 
@@ -861,7 +866,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         var arrows: [FlowArrow] = []
         var seen: Set<FlowArrow> = []
         for def in defs {
-            guard let flow = ControlFlowParser.analyze(source: source, ext: ext, functionName: def.name) else { continue }
+            guard let flow = ControlFlowParser.analyze(source: source, ext: ext, functionName: def.name, definition: def) else { continue }
             for arrow in controlFlowArrows(from: flow) where seen.insert(arrow).inserted {
                 arrows.append(arrow)
             }
@@ -1584,7 +1589,7 @@ final class ClickableTextView: NSTextView {
     var classRanges: [(name: String, range: NSRange)] = []
     /// Character ranges (call site) that should trigger `onCallSiteClick`.
     var callSiteRanges: [(name: String, range: NSRange)] = []
-    var onFunctionClick: ((String) -> Void)?
+    var onFunctionClick: ((String, Int) -> Void)?
     var onClassClick: ((String) -> Void)?
     /// Called when a *call site* is clicked — passes the called symbol's name.
     var onCallSiteClick: ((String) -> Void)?
@@ -1695,7 +1700,7 @@ final class ClickableTextView: NSTextView {
             case .branchFalse: color = NSColor.systemRed
             case .loopBack: color = NSColor.systemBlue
             case .rejoin: color = NSColor.systemTeal
-            case .flow: color = NSColor.secondaryLabelColor
+            case .flow: color = NSColor.systemGray
             case .exit: color = NSColor.systemOrange
             }
             let strokeColor = color.withAlphaComponent(0.9)
@@ -1778,7 +1783,7 @@ final class ClickableTextView: NSTextView {
     /// the layout manager's current layout. Unlike a cached screen-rect lookup,
     /// this can never go stale: re-wraps, resizes and file switches are picked up
     /// immediately because the layout manager IS the current state.
-    private func clickableTarget(at point: NSPoint) -> (kind: ClickTargetKind, name: String)? {
+    private func clickableTarget(at point: NSPoint) -> (kind: ClickTargetKind, name: String, charIndex: Int)? {
         guard let lm = layoutManager, let tc = textContainer else { return nil }
         let containerPoint = NSPoint(x: point.x - textContainerOrigin.x,
                                      y: point.y - textContainerOrigin.y)
@@ -1790,13 +1795,13 @@ final class ClickableTextView: NSTextView {
         guard lineRect.insetBy(dx: -2, dy: -3).contains(containerPoint) else { return nil }
         let charIndex = lm.characterIndexForGlyph(at: glyphIndex)
         for entry in callSiteRanges where NSLocationInRange(charIndex, entry.range) {
-            return (.callSite, entry.name)
+            return (.callSite, entry.name, charIndex)
         }
         for entry in functionRanges where NSLocationInRange(charIndex, entry.range) {
-            return (.function, entry.name)
+            return (.function, entry.name, charIndex)
         }
         for entry in classRanges where NSLocationInRange(charIndex, entry.range) {
-            return (.className, entry.name)
+            return (.className, entry.name, charIndex)
         }
         return nil
     }
@@ -1809,7 +1814,7 @@ final class ClickableTextView: NSTextView {
         let point = convert(event.locationInWindow, from: nil)
         if let target = clickableTarget(at: point) {
             switch target.kind {
-            case .function: onFunctionClick?(target.name)
+            case .function: onFunctionClick?(target.name, target.charIndex)
             case .className: onClassClick?(target.name)
             case .callSite: onCallSiteClick?(target.name)
             }

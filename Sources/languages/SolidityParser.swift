@@ -38,7 +38,7 @@ public final class SolidityParser {
     private static let containerKeywords: Set<String> = ["contract", "interface", "library", "struct", "enum"]
     private static let nonBodyKeywords: Set<String> = ["if", "for", "while", "else", "switch", "try", "catch", "do"]
 
-    public func parseMethods() -> [SolidityMethodDef] {
+    public func parseMethods(keepOverloads: Bool = false) -> [SolidityMethodDef] {
         var defs: [SolidityMethodDef] = []
         let n = tokens.count
         var braceDepth = 0
@@ -98,11 +98,16 @@ public final class SolidityParser {
         }
 
         // Dedupe by name (last definition wins for overloads; keep first).
+        // When `keepOverloads` is set (source-viewer path) each distinct
+        // definition site is retained keyed by name + position.
         var seen = Set<String>()
         var result: [SolidityMethodDef] = []
-        for d in defs where !seen.contains(d.name) {
-            seen.insert(d.name)
-            result.append(d)
+        for d in defs {
+            let key = keepOverloads ? "\(d.name)\u{1}\(d.startOffset)" : d.name
+            if !seen.contains(key) {
+                seen.insert(key)
+                result.append(d)
+            }
         }
         return result
     }

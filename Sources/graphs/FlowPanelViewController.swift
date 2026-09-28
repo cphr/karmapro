@@ -125,8 +125,11 @@ final class FlowPanelViewController: NSViewController {
 
     // MARK: - Data
 
-    /// Shows the flowchart + complexity for `functionName` in `source`.
-    func show(functionName: String, source: String, fileExtension: String = "") {
+    /// Shows the flowchart + complexity for `functionName` in `source`. When
+    /// `definition` is provided (the exact overload the user clicked) its body is
+    /// analysed; otherwise the first same-name definition is used.
+    func show(functionName: String, source: String, fileExtension: String = "",
+              definition: CCFunctionParser.FunctionDef? = nil) {
         enforceHeaderZOrder()
         currentSource = source
         currentFunction = functionName
@@ -134,7 +137,9 @@ final class FlowPanelViewController: NSViewController {
         placeholder.isHidden = true
 
         // Use the C/C++/Java/C# control-flow parser for all supported languages.
-        guard let flow = ControlFlowParser.analyze(source: source, ext: fileExtension, functionName: functionName) else {
+        guard let flow = ControlFlowParser.analyze(source: source, ext: fileExtension,
+                                                   functionName: functionName,
+                                                   definition: definition) else {
             complexityBadge.stringValue = "Cyclomatic complexity: —"
             complexityBadge.textColor = .secondaryLabelColor
             return

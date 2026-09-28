@@ -74,7 +74,7 @@ public final class SwiftParser {
         "public", "private", "internal", "fileprivate", "open",
     ]
 
-    public func parseDefinitions() -> [SwiftDef] {
+    public func parseDefinitions(keepOverloads: Bool = false) -> [SwiftDef] {
         var defs: [SwiftDef] = []
         let n = tokens.count
         var i = 0
@@ -110,11 +110,17 @@ public final class SwiftParser {
 
         // Overloads: keep the first definition of each name so the taint maps /
         // definition tables stay unambiguous (mirrors Solidity/JS behavior).
+        // When `keepOverloads` is set (source-viewer path) each distinct
+        // definition site is retained keyed by name + position so overloads
+        // stay clickable.
         var seen = Set<String>()
         var result: [SwiftDef] = []
-        for d in defs where !seen.contains(d.name) {
-            seen.insert(d.name)
-            result.append(d)
+        for d in defs {
+            let key = keepOverloads ? "\(d.name)\u{1}\(d.nameOffset)" : d.name
+            if !seen.contains(key) {
+                seen.insert(key)
+                result.append(d)
+            }
         }
         return result
     }

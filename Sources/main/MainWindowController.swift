@@ -321,8 +321,11 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             self.showSimulation(fileURL: fileURL, functionName: functionName)
         }
 
-        viewer.onFunctionSelected = { [weak self] _, functionName, source, ext in
-            self?.flowPanel.show(functionName: functionName, source: source, fileExtension: ext)
+        viewer.onFunctionSelected = { [weak self] _, functionName, source, ext, definition in
+            self?.flowPanel.show(functionName: functionName,
+                                 source: source,
+                                 fileExtension: ext,
+                                 definition: definition)
         }
 
         viewer.onClassRequest = { [weak self] requestedClassName in
@@ -534,21 +537,34 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         let controller = reachabilityControllerInstance()
         controller.onCancel = nil
         controller.display(result: result, graph: graph, fileURL: fileURL, functionName: functionName)
+        // If the user closed the window while the walk ran, don't surprise them
+        // by reopening it — the cached graph makes a repeat request instant.
+        guard controller.window?.isVisible == true else { return }
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     /// Shows the project-wide reachability of a function right-clicked in the
-    /// source viewer. Reuses the cached call graph and the window across
-    /// requests so a rebuilt diagram is cheap; builds the graph in the
-    /// background (with a progress window only when the tree must be re-read
-    /// from disk) and displays the result when ready.
+    /// source viewer. The window is shown immediately with an "Analysing"
+    /// spinner (reachability walks can be slow on large projects, so they must
+    /// not block or look like a hang), then the graph is reused or built in the
+    /// background and the result is rendered when ready.
     private func showReachability(projectRoot: URL, fileURL: URL, functionName: String) {
         let stdRoot = projectRoot.standardizedFileURL
 
+        // Show the window with a spinner right away; every path below replaces
+        // it with the finished diagram. Keeps a large-project walk from freezing
+        // the UI while the reachability analysis runs in the background.
+        let controller = reachabilityControllerInstance()
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
         // Fast path: the call graph is already built, so walk and show immediately.
         if let cached = reachabilityGraphCache, cached.root == stdRoot {
+            controller.onCancel = nil
+            controller.beginAnalysis(functionName: functionName)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let result = cached.graph.reachability(of: functionName, in: fileURL)
                 DispatchQueue.main.async {
@@ -560,9 +576,10 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         }
 
         // If the shared source index already exists for this root, derive the
-        // call graph in memory (no further I/O) and display the result directly
-        // without a separate progress window.
+        // call graph in memory (no further I/O) and display the result directly.
         if let pidx = projectSourceIndexCache, pidx.root == stdRoot {
+            controller.onCancel = nil
+            controller.beginAnalysis(functionName: functionName)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let graph = ProjectCallGraph(sourceIndex: pidx)
                 let result = graph.reachability(of: functionName, in: fileURL)
@@ -576,19 +593,16 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             return
         }
 
-        // Last resort: build the index on demand from disk with its own
-        // progress window, so the user still gets feedback.
+        // Last resort: build the index on demand from disk. The spinner stays up
+        // while the graph is built; once built, switch to an indeterminate
+        // spinner since the reachability walk itself has no unit-of-work.
         reachabilityCancellation?.cancel()
         let cancellation = VariableFlowCancellation()
         reachabilityCancellation = cancellation
         let startedAt = Date()
 
-        let controller = reachabilityControllerInstance()
         controller.onCancel = { [weak self] in self?.reachabilityCancellation?.cancel() }
         controller.beginProgress(functionName: functionName)
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let graph = ProjectCallGraph(projectRoot: projectRoot,
@@ -599,6 +613,11 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
                 }
             })
             guard !cancellation.isCancelled, !graph.wasCancelled else { return }
+            // The disk read is done; switch to the indeterminate spinner while
+            // the reachability walk (the slow part on big projects) runs.
+            DispatchQueue.main.async {
+                controller.beginAnalysis(functionName: functionName)
+            }
             let result = graph.reachability(of: functionName, in: fileURL)
             guard !cancellation.isCancelled else { return }
             DispatchQueue.main.async {

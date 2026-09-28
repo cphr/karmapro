@@ -61,7 +61,7 @@ public final class ScriptMethodParser {
         }
     }
 
-    public func parseMethods() -> [ScriptMethodDef] {
+    public func parseMethods(keepOverloads: Bool = false) -> [ScriptMethodDef] {
         var defs: [ScriptMethodDef] = []
         let n = tokens.count
         var i = 0
@@ -97,11 +97,17 @@ public final class ScriptMethodParser {
 
         // Deduplicate by name, keeping the first (body-bearing) definition so
         // overloads / local shadowed funs do not produce duplicate findings.
+        // When `keepOverloads` is set (source-viewer path), each distinct
+        // overload site is retained keyed by name + body position so every
+        // definition stays clickable instead of collapsing onto the first.
         var seen = Set<String>()
         var result: [ScriptMethodDef] = []
-        for d in defs where !seen.contains(d.name) {
-            seen.insert(d.name)
-            result.append(d)
+        for d in defs {
+            let key = keepOverloads ? "\(d.name)\u{1}\(d.bodyRange.location)" : d.name
+            if !seen.contains(key) {
+                seen.insert(key)
+                result.append(d)
+            }
         }
         return result
     }

@@ -35,7 +35,7 @@ public final class CSharpParser {
         "virtual", "override", "new", "readonly", "async", "unsafe", "extern", "partial", "void"
     ]
 
-    public func parseMethods() -> [CSharpMethodDef] {
+    public func parseMethods(keepOverloads: Bool = false) -> [CSharpMethodDef] {
         var defs: [CSharpMethodDef] = []
         let n = tokens.count
         var braceDepth = 0
@@ -93,9 +93,12 @@ public final class CSharpParser {
 
         var seen = Set<String>()
         var result: [CSharpMethodDef] = []
-        for d in defs where !seen.contains(d.name) {
-            seen.insert(d.name)
-            result.append(d)
+        for d in defs {
+            let key = keepOverloads ? "\(d.name)\u{1}\(d.startOffset)" : d.name
+            if !seen.contains(key) {
+                seen.insert(key)
+                result.append(d)
+            }
         }
         return result
     }

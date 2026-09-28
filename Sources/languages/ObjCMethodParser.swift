@@ -25,7 +25,7 @@ public final class ObjCMethodParser {
         self.length = ns.length
     }
 
-    public func parseDefinitions() -> [ObjCMethodDef] {
+    public func parseDefinitions(keepOverloads: Bool = false) -> [ObjCMethodDef] {
         var defs: [ObjCMethodDef] = []
         var i = 0
         while i < length {
@@ -40,11 +40,16 @@ public final class ObjCMethodParser {
 
         // Deduplicate by name, keeping the first (body-bearing) definition so
         // duplicate signatures (e.g. in .h + @implementation duplicates) don't
-        // produce duplicate diagram nodes.
+        // produce duplicate diagram nodes. When `keepOverloads` is set
+        // (source-viewer path) each distinct definition site is retained keyed
+        // by name + body position so same-selector methods stay clickable.
         var seen = Set<String>()
         var result: [ObjCMethodDef] = []
-        for def in defs where seen.insert(def.name).inserted {
-            result.append(def)
+        for def in defs {
+            let key = keepOverloads ? "\(def.name)\u{1}\(def.bodyRange.location)" : def.name
+            if seen.insert(key).inserted {
+                result.append(def)
+            }
         }
         return result
     }

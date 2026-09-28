@@ -61,12 +61,6 @@ final class ReachabilityWindowController: NSWindowController {
         captionLabel.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(captionLabel)
 
-        let controlRow = NSStackView()
-        controlRow.orientation = .horizontal
-        controlRow.alignment = .centerY
-        controlRow.spacing = 12
-        controlRow.translatesAutoresizingMaskIntoConstraints = false
-
         progressBar.style = .bar
         progressBar.isIndeterminate = false
         progressBar.minValue = 0
@@ -75,25 +69,24 @@ final class ReachabilityWindowController: NSWindowController {
         progressBar.controlSize = .small
         progressBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        progressLabel.font = NSFont.systemFont(ofSize: 11)
-        progressLabel.textColor = .secondaryLabelColor
+        progressLabel.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        progressLabel.textColor = .labelColor
         progressLabel.lineBreakMode = .byTruncatingMiddle
 
-        progressStack.orientation = .horizontal
-        progressStack.alignment = .centerY
-        progressStack.spacing = 8
+        progressStack.orientation = .vertical
+        progressStack.alignment = .centerX
+        progressStack.spacing = 12
         progressStack.isHidden = true
-        progressBar.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        progressStack.addArrangedSubview(progressBar)
+        progressStack.translatesAutoresizingMaskIntoConstraints = false
+        progressStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        progressBar.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        progressBar.heightAnchor.constraint(equalToConstant: 32).isActive = true
         progressStack.addArrangedSubview(progressLabel)
-        content.addSubview(progressStack)
-
-        controlRow.addArrangedSubview(NSView())
-        controlRow.addArrangedSubview(progressStack)
-        content.addSubview(controlRow)
+        progressStack.addArrangedSubview(progressBar)
 
         diagramView.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(diagramView)
+        content.addSubview(progressStack)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
@@ -102,13 +95,12 @@ final class ReachabilityWindowController: NSWindowController {
             captionLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             captionLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             captionLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
-            controlRow.topAnchor.constraint(equalTo: captionLabel.bottomAnchor, constant: 10),
-            controlRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            controlRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            diagramView.topAnchor.constraint(equalTo: controlRow.bottomAnchor, constant: 12),
+            diagramView.topAnchor.constraint(equalTo: captionLabel.bottomAnchor, constant: 10),
             diagramView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             diagramView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            diagramView.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            diagramView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            progressStack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            progressStack.centerYAnchor.constraint(equalTo: content.centerYAnchor)
         ])
 
         diagramView.onNodeClick = { [weak self] name in
@@ -119,12 +111,32 @@ final class ReachabilityWindowController: NSWindowController {
 
     // MARK: - Progress
 
+    /// Switches the window into an indeterminate "analysing" state with a
+    /// spinning indicator and clears the canvas. Shown immediately when the
+    /// window opens so the reachability walk (which can be slow on large
+    /// projects) runs invisibly in the background instead of hanging the UI —
+    /// `display(result:...)` replaces the spinner when the walk finishes.
+    func beginAnalysis(functionName: String) {
+        isBusy = true
+        window?.title = "Reachability — \(functionName)"
+        titleLabel.stringValue = "Reachability of “\(functionName)”"
+        captionLabel.stringValue = "Analysing the project call graph…"
+        progressBar.style = .spinning
+        progressBar.isIndeterminate = true
+        progressBar.startAnimation(nil)
+        progressLabel.stringValue = "Analysing…"
+        progressStack.isHidden = false
+        diagramView.clear()
+    }
+
     /// Switches the window into its "searching" state and shows the progress bar.
     func beginProgress(functionName: String) {
         isBusy = true
         window?.title = "Reachability — \(functionName)"
         titleLabel.stringValue = "Reachability of “\(functionName)”"
         captionLabel.stringValue = "Building the project call graph…"
+        progressBar.style = .bar
+        progressBar.isIndeterminate = false
         progressBar.doubleValue = 0
         progressLabel.stringValue = "Enumerating source files…"
         progressStack.isHidden = false
@@ -163,6 +175,7 @@ final class ReachabilityWindowController: NSWindowController {
                  fileURL: URL,
                  functionName: String) {
         isBusy = false
+        progressBar.stopAnimation(nil)
         progressStack.isHidden = true
         present(result: result)
     }
@@ -233,6 +246,19 @@ final class ReachabilityWindowController: NSWindowController {
 
         for e in edges { graph.addCall(from: e.0, to: e.1) }
 
+        // One-path focus: start the diagram on a single readable origin→start
+        // chain (shortest hop count); the rest of the caller set is revealed on
+        // demand via each node's ⊕ badge. Only applied when there is a real path
+        // and the graph is large enough to be busy.
+        let startName = result.nodes.first(where: { $0.isStart })?.displayName
+        if let start = startName,
+           let path = shortestPath(from: sourceNodes, to: start, in: edges),
+           path.count > 3 {
+            diagramView.focusNodes = Set(path)
+        } else {
+            diagramView.focusNodes = nil
+        }
+
         nodeLocations = locations
         diagramView.display(graph: graph,
                             callEdges: edges,
@@ -242,9 +268,12 @@ final class ReachabilityWindowController: NSWindowController {
         titleLabel.stringValue = "Reachability of “\(result.functionName)”"
 
         let fileCount = Set(result.nodes.map { $0.fileURL.path }).count
-        let base = "\(result.nodes.count) function\(result.nodes.count == 1 ? "" : "s") "
+        var base = "\(result.nodes.count) function\(result.nodes.count == 1 ? "" : "s") "
             + "across \(fileCount) file\(fileCount == 1 ? "" : "s"). "
             + "Click any node to open it."
+        if diagramView.focusNodes != nil {
+            base += " Focused on one path — click a node's ⊕ to reveal its other callers/callees."
+        }
 
         let note: String
         if result.unverified {
@@ -265,6 +294,38 @@ final class ReachabilityWindowController: NSWindowController {
             caption += "\n\nNote: " + result.warnings.joined(separator: " ")
         }
         captionLabel.stringValue = caption
+    }
+
+    /// BFS shortest path (fewest hops, deterministic tie-break by insertion
+    /// order) from any `sources` node to `target` using `edges` as a directed
+    /// caller→callee chain. Returns nil when no path exists.
+    private func shortestPath(from sources: Set<String>, to target: String,
+                              in edges: [(String, String)]) -> [String]? {
+        guard !sources.isEmpty else { return nil }
+        var parents: [String: String] = [:]
+        var visited = sources
+        var frontier = Array(sources).sorted()
+        while !frontier.isEmpty {
+            var next: [String] = []
+            for node in frontier {
+                if node == target {
+                    var path = [node]
+                    var cur = node
+                    while let p = parents[cur] {
+                        path.insert(p, at: 0)
+                        cur = p
+                    }
+                    return path
+                }
+                for (from, to) in edges where from == node && !visited.contains(to) {
+                    visited.insert(to)
+                    parents[to] = node
+                    next.append(to)
+                }
+            }
+            frontier = next.sorted()
+        }
+        return nil
     }
 }
 
