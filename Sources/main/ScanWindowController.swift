@@ -677,7 +677,9 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
         case "msg":
             var parts: [String] = []
             if let path = f.taintPath, !path.isEmpty { parts.append("flow: \(path)") }
-            parts.append(f.message)
+            var message = f.message
+            if f.scanningSource == "AI" { message = "flow: \(message)" }
+            parts.append(message)
             if !f.reachable { parts.append("(function not reachable from entry point)") }
             let base = parts.joined(separator: "\n")
             cellView.textField?.stringValue = base
@@ -700,6 +702,7 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
         let f = findings[row]
         let width = columnWidth(for: "msg")
         var text = f.message
+        if f.scanningSource == "AI" { text = "flow: " + text }
         if let path = f.taintPath, !path.isEmpty { text = "flow: \(path)\n" + text }
         if !f.reachable { text += "\n(function not reachable)" }
 
