@@ -3,7 +3,7 @@
 // Extracted from AstSecurityDetector.swift / VulnerabilityScanner.swift to
 // keep per-language vulnerability detection modular. Shared wire-up stays in
 // AstSecurityDetector.swift · VulnerabilityScanner.swift (dispatch lines only).
-
+ 
 import Foundation
 
 extension AstSecurityDetector {
@@ -26,8 +26,19 @@ extension AstSecurityDetector {
         }
     }
 
-    func checkCSharpSinks(name: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
+    /// Lowercased slice of the scanned source around an offset, for cheap
+    /// local-mitigation checks (mirrors the Java LDAP filter window).
+    func nearSource(_ offset: Int, _ before: Int = 240, _ after: Int = 160) -> String {
+        let ns = source as NSString
+        let lo = max(0, offset - before)
+        let hi = min(ns.length, offset + after)
+        guard hi > lo else { return "" }
+        return ns.substring(with: NSRange(location: lo, length: hi - lo)).lowercased()
+    }
+
+    func checkCSharpSinks(name: String, qualified: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
         let shortName = lastSeg(name)
+        let ql = qualified.lowercased()
         // Open redirect: Response.Redirect(tainted) / Redirect(tainted).
         // `Url.IsLocalUrl(...)` rejection is the standard mitigation.
         if shortName == "Redirect", args.count >= 1,
@@ -110,6 +121,94 @@ extension AstSecurityDetector {
                 return
             }
         }
+        // Zip-slip: ZipArchiveEntry.ExtractToFile with a tainted destination. The
+        // canonical GetFullPath + StartsWith containment check is removed by
+        // applyCSharpSuppressions, so hardened extractions stay clean.
+        if shortName == "ExtractToFile", args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil,
+           !isGuarded(args[0], guarded: guarded, category: "Path Traversal") {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Path Traversal", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) writes an archive entry to a destination derived from untrusted data; path traversal (zip-slip) is possible.",
+                 taint: nil, reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
+        // Reflected XSS: HttpResponse.Write-family output with unsanitized data.
+        // HtmlEncode/WebUtility.HtmlEncode-style sanitizers already strip the
+        // taint at the expression level, so encoded outputs never reach here.
+        if ql.contains("response.write") || (ql.contains("response.output") && ["Write", "WriteLine"].contains(shortName)) {
+            for a in args where exprTainted(a, tainted: tainted) != nil {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "XSS (HTML Injection)", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "\(name) writes attacker-controlled data into an HTTP response without encoding; reflected XSS is possible.",
+                     taint: nil, reachable: reachable, crossFile: exprCrossFile(a, crossTainted: crossTainted))
+                return
+            }
+        }
+        // HTTP response splitting / header injection via Response headers.
+        if ["AddHeader", "AppendHeader"].contains(shortName), ql.contains("response"),
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Header Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) sets an HTTP header from untrusted data; CRLF injection is possible.",
+                 taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // XPath injection: XPathNavigator queries built from untrusted data.
+        if ["Select", "Evaluate", "Compile", "SelectNodes", "SelectSingleNode"].contains(shortName),
+           (ql.contains("xpathnavigator") || nearSource(offset).contains("xpathnavigator")),
+           args.count >= 1, exprTainted(args[0], tainted: tainted) != nil {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "XPath Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) evaluates an XPath query built from untrusted data.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
+        // SSRF: WebRequest.Create / HttpWebRequest.Create with a tainted URL.
+        if shortName == "Create", ql.contains("webrequest"), args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil,
+           !source.lowercased().contains("allowedhosts") {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "SSRF", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) builds an outbound request to an attacker-controlled URL; SSRF is possible.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
+        // Insecure deserialization via Newtonsoft/JavaScript-style reads:
+        // JsonConvert.DeserializeObject builds objects from untrusted payloads.
+        // (DataContractSerializer.ReadObject is deliberately excluded: the
+        // allowlist-based contract serializer is a supported safe pattern.)
+        if shortName == "DeserializeObject" {
+            for a in args where exprTainted(a, tainted: tainted) != nil {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "Insecure Deserialization", severity: .critical, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "\(name) deserializes untrusted data.",
+                     taint: nil, reachable: reachable, crossFile: exprCrossFile(a, crossTainted: crossTainted))
+                return
+            }
+        }
+        // ReDoS via regex *patterns* built from untrusted data. Only the static
+        // System.Text.RegularExpressions methods carry the pattern as argument 1;
+        // instance `.IsMatch(input)` has no pattern argument and is skipped.
+        if ["Match", "IsMatch", "Replace", "Split"].contains(shortName),
+           ql.hasPrefix("regex."), args.count >= 2,
+           exprTainted(args[1], tainted: tainted) != nil {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "ReDoS", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) compiles a regular expression pattern built from untrusted data; ReDoS is possible.",
+                 taint: exprTainted(args[1], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[1], crossTainted: crossTainted))
+            return
+        }
+        // Unsafe reflection: loading assemblies from untrusted paths.
+        if ["LoadFrom", "LoadFile"].contains(shortName) {
+            for a in args where exprTainted(a, tainted: tainted) != nil {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "Unsafe Reflection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "\(name) loads a .NET assembly from a path derived from untrusted data.",
+                     taint: nil, reachable: reachable, crossFile: exprCrossFile(a, crossTainted: crossTainted))
+                return
+            }
+        }
     }
 
     func checkCSharpNewExprSinks(name: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
@@ -143,6 +242,43 @@ extension AstSecurityDetector {
                      AstSinkRule(category: cat, severity: sev, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
                      message: "\(name) instantiated with untrusted data.",
                      taint: nil, reachable: reachable, crossFile: exprCrossFile(a, crossTainted: crossTainted))
+                return
+            }
+        }
+        // ReDoS: compiling a regex from an attacker-controlled pattern. A third
+        // (TimeSpan) argument or an explicit matchTimeout in the call marks a
+        // hardened instance and is not flagged.
+        if shortName == "Regex", args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil,
+           args.count < 3, !nearSource(offset).contains("timespan") {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "ReDoS", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "new Regex() compiles a pattern derived from untrusted data; ReDoS is possible.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
+        // Command injection: ProcessStartInfo whose executable or argument list
+        // is built from untrusted data (a shell binary with a command string, or
+        // a tainted executable/file name).
+        if shortName == "ProcessStartInfo",
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil && !isGuarded($0, guarded: guarded, category: "Command Injection") }) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Command Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "ProcessStartInfo builds an OS command from untrusted data.",
+                 taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // LDAP injection: DirectorySearcher constructed with a filter derived from
+        // untrusted data. LDAP escaping (`\5c`, `\2a`, ...) near the construction
+        // hardens it and is not flagged.
+        if shortName == "DirectorySearcher", args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil {
+            let near = nearSource(args[0].offset)
+            if !near.contains("escapeforldap") && !near.contains("\\5c") && !near.contains("\\2a") && !near.contains("escape(") {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "LDAP Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "new DirectorySearcher() builds an LDAP filter from untrusted data without escaping; filter manipulation is possible.",
+                     taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
                 return
             }
         }

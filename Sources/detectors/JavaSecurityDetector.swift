@@ -3,7 +3,7 @@
 // Extracted from AstSecurityDetector.swift / VulnerabilityScanner.swift to
 // keep per-language vulnerability detection modular. Shared wire-up stays in
 // AstSecurityDetector.swift · VulnerabilityScanner.swift (dispatch lines only).
-
+ 
 import Foundation
 
 extension AstSecurityDetector {
@@ -113,7 +113,8 @@ extension AstSecurityDetector {
         return hasCanonical && hasStartsWith
     }
 
-    func checkJavaSinks(name: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
+    func checkJavaSinks(name: String, qualified: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
+        let ql = qualified.lowercased()
         // Weak-crypto via MessageDigest/Cipher.getInstance("MD5"/...).
         if name == "getInstance", let lit = stringLiteralOf(args.first) {
             if isWeakAlgorithm(lit) {
@@ -220,6 +221,94 @@ extension AstSecurityDetector {
                 return
             }
         }
+        // SQL injection via prepared/statement construction with a query built by
+        // concatenation (parameterized `?` queries are string literals and skip).
+        if ["prepareStatement", "createStatement"].contains(name), args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil,
+           !isGuarded(args[0], guarded: guarded, category: "SQL Injection") {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "SQL Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) builds a SQL statement from untrusted data without parameterization.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
+        // HTTP response splitting / header injection via servlet headers.
+        if ["setHeader", "addHeader", "setIntHeader", "addIntHeader"].contains(name),
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Header Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) sets an HTTP header from untrusted data; CRLF injection is possible.",
+                 taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // ReDoS via java.util.regex patterns built from untrusted data.
+        // `Pattern.quote(...)` (and friends) neutralize the pattern and are skipped.
+        if name == "compile", ql.hasPrefix("pattern."), args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil {
+            let near = self.nearSource(args[0].offset)
+            if !near.contains("pattern.quote") && !near.contains(".quote(") {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "ReDoS", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "Pattern.compile() builds a regular expression pattern from untrusted data; ReDoS is possible.",
+                     taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+                return
+            }
+        }
+        // Insecure deserialization via ObjectInputStream.readObject/readUnshared.
+        // A `setObjectInputFilter(...)` in the body removes these findings
+        // (applyJavaSuppressions), so filtered streams stay clean.
+        if ["readObject", "readUnshared"].contains(name) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Insecure Deserialization", severity: .critical, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) deserializes object data from an untrusted stream.",
+                 taint: nil, reachable: reachable, crossFile: false)
+            return
+        }
+        // Reflected XSS: an HTTP response writer / JSP `out` written with
+        // unsanitized data. Escaping/encoding near the write skips the check.
+        if ["write", "print", "println"].contains(name),
+           (ql.contains("getwriter") || ql.hasPrefix("out.")),
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+            let near = self.nearSource(offset)
+            if !near.contains("escape") && !near.contains("encode") {
+                emit(&findings, function, offset,
+                     AstSinkRule(category: "XSS (HTML Injection)", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                     message: "\(name) writes attacker-controlled data into an HTTP response without encoding.",
+                     taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+                return
+            }
+        }
+        // Server-side template injection: TemplateEngine/Template render/process
+        // driven by tainted names/models.
+        if ["process", "render"].contains(name),
+           (ql.contains("template") || ql.contains("thymeleaf") || ql.contains("freemarker")),
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Template Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) renders a server-side template using untrusted data; template injection is possible.",
+                 taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // Arbitrary code loading: System.load/loadLibrary or Runtime.load of a
+        // library path derived from untrusted data.
+        if ["load", "loadLibrary"].contains(name),
+           (ql.hasPrefix("system.") || ql.contains("runtime")),
+           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Arbitrary Code Loading", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) loads a native library from a path derived from untrusted data.",
+                 taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // Insecure deserialization via XStream.fromXML on untrusted XML input.
+        if name == "fromXML", args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "Insecure Deserialization", severity: .critical, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) deserializes untrusted XML data.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
+        }
     }
 
     /// Receiver for `new <Type>(<tainted path>)` Java file operations.
@@ -237,12 +326,24 @@ extension AstSecurityDetector {
         // data; the shell-command text can be any of the arguments (a shell
         // binary with a command string, or a single tainted executable name).
         if name == "ProcessBuilder",
-           args.count == 1,
            args.contains(where: { exprTainted($0, tainted: tainted) != nil && !isGuarded($0, guarded: guarded, category: "Command Injection") }) {
             emit(&findings, function, offset,
                  AstSinkRule(category: "Command Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
                  message: "ProcessBuilder constructs an OS command from untrusted data.",
                  taint: nil, reachable: reachable, crossFile: args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }))
+            return
+        }
+        // SSRF: opening a socket to a host derived from untrusted data.
+        // An explicit host allow-list in the file is respected like the other
+        // Java SSRF sinks.
+        if ["Socket", "InetSocketAddress"].contains(name), args.count >= 1,
+           exprTainted(args[0], tainted: tainted) != nil,
+           !source.uppercased().contains("ALLOWED_HOSTS") {
+            emit(&findings, function, offset,
+                 AstSinkRule(category: "SSRF", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "\(name) connects to a host derived from untrusted data; SSRF is possible.",
+                 taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
+            return
         }
     }
 }

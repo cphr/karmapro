@@ -1,6 +1,6 @@
 // by cipher.org.uk
 import Foundation
-
+ 
 /// A structural security detector that walks the parsed `CStmt`/`CExpr` AST
 /// (produced by `CAnalyzer` for C/C++ and `JAnalyzer` for Java) and reports
 /// sink calls whose dangerous argument is tainted.
@@ -637,10 +637,10 @@ struct AstSecurityDetector {
         // languages.
         checkCSinks(name: name, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable, calleeIsMember: isMemberCall(callee))
         if isJava {
-            checkJavaSinks(name: name, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            checkJavaSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         }
         if isCSharp {
-            checkCSharpSinks(name: name, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            checkCSharpSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         }
         return false
     }
