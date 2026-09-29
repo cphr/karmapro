@@ -12,6 +12,8 @@ final class ScanWindowController: NSWindowController {
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "No scan has been run yet.")
+    private let aiThinkingLabel = NSTextField(labelWithString: "(thinking)")
+    private let aiThinkingSpinner = NSProgressIndicator()
     private let progressBar = NSProgressIndicator()
     private let rescanButton = NSButton(title: "Rescan", target: nil, action: nil)
     private let ignoreButton = NSButton(title: "Ignore issue", target: nil, action: nil)
@@ -26,6 +28,15 @@ final class ScanWindowController: NSWindowController {
     /// cancelled. When the user closes the window mid-scan, this is flipped so the
     /// background scan stops and never touches a deallocated view.
     private var scanCancelled = false
+
+    /// True while the AI discovery pass may still emit stream deltas. Cleared
+    /// the instant the pass finishes so a late (thinking)/(answering) delta can
+    /// never re-show the indicator after the scan has completed.
+    private var aiPhaseActive = false
+
+    /// Whether the AI scan was requested by the user at the Security Scanner
+    /// button; kept so the Rescan action repeats the same choice.
+    private var wantsAI = false
 
     /// Line numbers the user has chosen to ignore (persisted in UserDefaults), keyed
     /// by the file path so the same finding stays hidden across relaunches.
@@ -67,8 +78,21 @@ final class ScanWindowController: NSWindowController {
 
         statusLabel.font = NSFont.systemFont(ofSize: 12)
         statusLabel.textColor = .secondaryLabelColor
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(statusLabel)
+
+        aiThinkingLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        aiThinkingLabel.textColor = .systemPurple
+        aiThinkingLabel.isHidden = true
+        aiThinkingLabel.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(aiThinkingLabel)
+
+        aiThinkingSpinner.style = .spinning
+        aiThinkingSpinner.controlSize = .small
+        aiThinkingSpinner.isHidden = true
+        aiThinkingSpinner.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(aiThinkingSpinner)
 
         rescanButton.bezelStyle = .rounded
         rescanButton.controlSize = .small
@@ -168,9 +192,15 @@ final class ScanWindowController: NSWindowController {
         content.addSubview(scrollView)
 
         NSLayoutConstraint.activate([
-            statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            statusLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: ignoreButton.leadingAnchor, constant: -8),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: aiThinkingLabel.leadingAnchor, constant: -8),
+
+            aiThinkingLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            aiThinkingLabel.trailingAnchor.constraint(equalTo: aiThinkingSpinner.leadingAnchor, constant: -4),
+
+            aiThinkingSpinner.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            aiThinkingSpinner.trailingAnchor.constraint(lessThanOrEqualTo: ignoreButton.leadingAnchor, constant: -10),
 
             ignoreButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             ignoreButton.trailingAnchor.constraint(equalTo: rescanButton.leadingAnchor, constant: -8),
@@ -190,16 +220,22 @@ final class ScanWindowController: NSWindowController {
     }
 
     /// Loads results for `folder`, showing the cached scan if this folder was
-    /// already scanned; otherwise performs a fresh scan.
-    func load(folder: URL) {
+    /// already scanned (and no AI scan was requested); otherwise performs a
+    /// fresh scan. `wantsAI` comes from the prompt shown when the Security
+    /// Scanner button is pressed.
+    func load(folder: URL, wantsAI: Bool) {
+        self.wantsAI = wantsAI
         scannedFolder = folder
-        rescanButton.isEnabled = true
+        rescanButton.isEnabled = false
 
-        if let cached = ScanWindowController.cachedFolder, cached.standardizedFileURL == folder.standardizedFileURL {
-            let cachedFindings = ScanWindowController.cachedFindings
+        if !wantsAI, let cached = ScanWindowController.cachedFolder, cached.standardizedFileURL == folder.standardizedFileURL {
+            aiPhaseActive = false
+            setAIThinking(false)
+            let cachedFindings = enforceNoScannerDuplicates(ScanWindowController.cachedFindings)
             findings = applyIgnoredFilter(cachedFindings)
             applySorting()
             tableView.reloadData()
+            rescanButton.isEnabled = true
             if cachedFindings.isEmpty {
                 statusLabel.stringValue = "Cached scan (no issues found) — Rescan to refresh."
             } else {
@@ -215,6 +251,22 @@ final class ScanWindowController: NSWindowController {
         let ignored = ignoredLines
         guard !ignored.isEmpty else { return input }
         return input.filter { !ignored.contains(ignoredKey(for: $0)) }
+    }
+
+    /// Hard guarantee for the results table: an AI finding is shown only if the
+    /// built-in scanner (AST/Heuristic) did NOT already report the same file on
+    /// the same line. Applied every time rows are assembled, including cached
+    /// scans, so duplicates can never reappear.
+    private func enforceNoScannerDuplicates(_ input: [ScanFinding]) -> [ScanFinding] {
+        let scannerOccupied = Set(input
+            .filter { $0.scanningSource != "AI" }
+            .map { AISecurityScanner.locationKey($0) })
+        return input.filter { finding in
+            if finding.scanningSource == "AI" {
+                return !scannerOccupied.contains(AISecurityScanner.locationKey(finding))
+            }
+            return true
+        }
     }
 
     /// Builds a stable key identifying a single finding across scans.
@@ -311,6 +363,8 @@ final class ScanWindowController: NSWindowController {
         progressBar.isHidden = false
         progressBar.startAnimation(nil)
         scanCancelled = false
+        aiPhaseActive = false
+        rescanButton.isEnabled = false
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = VulnerabilityScanner.scan(projectRoot: folder,
@@ -322,7 +376,9 @@ final class ScanWindowController: NSWindowController {
                         self.progressBar.isIndeterminate = false
                         self.progressBar.stopAnimation(nil)
                     }
-                    self.progressBar.doubleValue = fraction
+                    // The heuristic phase fills the whole bar when AI was not
+                    // requested, or the first 40% when an AI pass will follow.
+                    self.progressBar.doubleValue = fraction * (self.wantsAI ? 0.4 : 1.0)
                 }
             }, isCancelled: { [weak self] in
                 self?.scanCancelled == true
@@ -331,19 +387,153 @@ final class ScanWindowController: NSWindowController {
                 guard let self = self, !self.scanCancelled else { return }
                 ScanWindowController.cachedFolder = folder
                 ScanWindowController.cachedFindings = result
-                self.progressBar.doubleValue = 1
-                self.progressBar.isHidden = true
+                self.progressBar.doubleValue = self.wantsAI ? 0.4 : 1.0
+                self.progressBar.isHidden = !self.wantsAI
                 self.progressBar.stopAnimation(nil)
                 self.findings = self.applyIgnoredFilter(result)
                 self.applySorting()
                 self.tableView.reloadData()
-                if result.isEmpty {
-                    self.statusLabel.stringValue = "Scan complete: no issues found."
-                } else {
-                    self.statusLabel.stringValue = "Scan complete: \(result.count) potential issue\(result.count == 1 ? "" : "s") found."
+                self.updateStatus(heuristicCount: result.count, aiCount: 0)
+                guard self.wantsAI, !self.scanCancelled else {
+                    self.rescanButton.isEnabled = true
+                    return
                 }
+                self.runAIPhase(folder: folder, heuristic: result)
             }
         }
+    }
+
+    /// Runs the AI discovery pass on a background queue, scaling its progress
+    /// over the remaining 60% of the bar and merging any additional findings.
+    /// The user already authorised token consumption at the Security Scanner
+    /// button; the API-key check below is the only gate.
+    private func runAIPhase(folder: URL, heuristic: [ScanFinding]) {
+        let client = OpenRouterClient.shared
+        let providerName = client.provider.rawValue
+
+        guard !client.requiresAPIKey
+            || !client.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let missing = NSAlert()
+            missing.messageText = "AI scan unavailable"
+            missing.informativeText = "AI scan needs a model connected. Open the AI Assistant window, choose \(providerName), add your API key, and connect, then re-run the scan."
+            missing.alertStyle = .warning
+            missing.addButton(withTitle: "OK")
+            missing.runModal()
+            updateStatus(heuristicCount: heuristic.count, aiCount: 0, aiSkipped: true)
+            rescanButton.isEnabled = true
+            return
+        }
+
+        setStatusAIPhase()
+        progressBar.doubleValue = 0.4
+        progressBar.isHidden = false
+        progressBar.isIndeterminate = false
+        progressBar.stopAnimation(nil)
+        aiPhaseActive = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            AISecurityScanner.runAI(projectRoot: folder,
+                                    existingFindings: heuristic,
+                                    progress: { fraction in
+                DispatchQueue.main.async {
+                    guard let self = self, !self.scanCancelled else { return }
+                    // The app shows "AI phase: reviewing the code…" while the
+                    // model works; the bar fills the remaining 0.4 → 1.0.
+                    self.progressBar.doubleValue = 0.4 + 0.6 * min(fraction, 1)
+                }
+            },
+            isCancelled: { [weak self] in
+                self?.scanCancelled == true
+            },
+            completion: { result in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.aiPhaseActive = false
+                    self.setAIThinking(false)
+                    guard !self.scanCancelled else { return }
+                    // Safety net: never let an AI row appear where the built-in
+                    // scanner already reported the same file and line.
+                    let aiFindings = AISecurityScanner.dedupe(result.findings, against: heuristic)
+                    let merged = self.enforceNoScannerDuplicates(heuristic + aiFindings)
+                    ScanWindowController.cachedFindings = merged
+                    self.findings = self.applyIgnoredFilter(merged)
+                    self.applySorting()
+                    self.tableView.reloadData()
+                    self.progressBar.doubleValue = 1
+                    self.progressBar.isHidden = true
+                    self.progressBar.stopAnimation(nil)
+                    self.updateStatus(heuristicCount: heuristic.count, aiCount: aiFindings.count,
+                                      aiCancelled: result.cancelled,
+                                      aiIssues: result.errors)
+                    self.rescanButton.isEnabled = true
+                }
+            },
+            onPhase: { phase in
+                DispatchQueue.main.async {
+                    guard let self = self, self.aiPhaseActive, !self.scanCancelled else { return }
+                    self.setAIThinking(phase == .thinking)
+                }
+            })
+        }
+    }
+
+    /// Shows "AI phase: reviewing the code…" with "AI phase" in the purple
+    /// used by the Engine column and "reviewing the code…" in green (the user
+    /// authorised this step).
+    private func setStatusAIPhase() {
+        let purple = NSColor.systemPurple
+        let green = NSColor.systemGreen
+        let attributed = NSMutableAttributedString(
+            string: "AI phase: ",
+            attributes: [.foregroundColor: purple, .font: NSFont.boldSystemFont(ofSize: 12)])
+        attributed.append(NSAttributedString(
+            string: "reviewing the code…",
+            attributes: [.foregroundColor: green, .font: NSFont.systemFont(ofSize: 12)]))
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.attributedStringValue = attributed
+    }
+
+    /// Shows/hides the "(thinking)" indicator + spinner that tell the user the
+    /// model is still working (reasoning) as opposed to streaming an answer.
+    private func setAIThinking(_ thinking: Bool) {
+        if thinking {
+            aiThinkingLabel.isHidden = false
+            aiThinkingSpinner.isHidden = false
+            aiThinkingSpinner.startAnimation(nil)
+        } else {
+            aiThinkingLabel.isHidden = true
+            aiThinkingSpinner.isHidden = true
+            aiThinkingSpinner.stopAnimation(nil)
+        }
+    }
+
+    private func updateStatus(heuristicCount: Int,
+                              aiCount: Int,
+                              aiSkipped: Bool = false,
+                              aiCancelled: Bool = false,
+                              aiIssues: [String] = []) {
+        let plural = { (n: Int) in n == 1 ? "" : "s" }
+        if heuristicCount == 0 && aiCount == 0 {
+            if aiSkipped {
+                statusLabel.stringValue = "Scan complete: no issues found. (AI analysis skipped — no source files were reported.)"
+            } else {
+                statusLabel.stringValue = "Scan complete: no issues found."
+            }
+            return
+        }
+        var text = "Scan complete: \(heuristicCount + aiCount) potential issue\(plural(heuristicCount + aiCount)) found"
+        if aiCount > 0 {
+            text += " (\(aiCount) via AI)"
+        }
+        if aiSkipped {
+            text += " — AI analysis skipped"
+        } else if aiCancelled {
+            text += " — AI analysis cancelled"
+        }
+        if !aiIssues.isEmpty {
+            text += " (\(aiIssues.count) AI chunk\(plural(aiIssues.count)) skipped: \(aiIssues.prefix(3).joined(separator: "; ")))"
+        }
+        statusLabel.stringValue = text + "."
     }
 
     private func selectedFinding() -> ScanFinding? {
@@ -466,6 +656,10 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             if f.scanningSource == "AST" {
                 cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .bold)
                 cellView.textField?.textColor = .systemGreen
+            } else if f.scanningSource == "AI" {
+                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+                cellView.textField?.textColor = .systemPurple
+                cellView.textField?.toolTip = "Found by the AI assistant model during the AI deep scan phase."
             } else {
                 cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
                 cellView.textField?.textColor = .systemBlue

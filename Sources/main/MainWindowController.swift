@@ -1182,6 +1182,18 @@ extension MainWindowController: NSToolbarDelegate {
             return
         }
 
+        let client = OpenRouterClient.shared
+        let modelName = client.selectedModel
+        let providerName = client.provider.rawValue
+
+        let ask = NSAlert()
+        ask.messageText = "Also run an AI scan?"
+        ask.informativeText = "Run the built-in security scan first, then ask \(modelName) (\(providerName)) to audit the code for additional vulnerabilities.\n\nThis sends your project's source code to the AI model and consumes tokens / credits from your AI account. Results are cached locally, and issues the regular scanner already finds are not duplicated.\n\nInclude the AI scan?"
+        ask.alertStyle = .informational
+        ask.addButton(withTitle: "Yes, analyse with AI")
+        ask.addButton(withTitle: "Regular scan only")
+        let wantsAI = ask.runModal() == .alertFirstButtonReturn
+
         let controller: ScanWindowController
         if let existing = scanController {
             controller = existing
@@ -1196,7 +1208,7 @@ extension MainWindowController: NSToolbarDelegate {
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        controller.load(folder: folder)
+        controller.load(folder: folder, wantsAI: wantsAI)
     }
 
     @objc private func notesClicked() {
