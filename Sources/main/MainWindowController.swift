@@ -235,13 +235,18 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
 
             // Derive the two viewer indexes in memory (no further I/O or parsing).
             let definitionIndex = DefinitionIndex.build(sourceIndex: index)
-            let tracer = VariableFlowTracer(sourceIndex: index)
+            let trace = VariableFlowTracer(sourceIndex: index)
+            // Pre-build the project call graph in memory so Focus mode (and the
+            // first reachability request) resolves directly from the cache without
+            // blocking the UI on a first-use derivation.
+            let callGraph = ProjectCallGraph(sourceIndex: index)
 
             DispatchQueue.main.async { [weak self] in
                 guard let self = self, !cancellation.isCancelled else { return }
                 self.sourceViewer?.definitionIndex = definitionIndex
                 self.projectSourceIndexCache = index
-                self.variableFlowTracerCache = (root.standardizedFileURL, tracer)
+                self.variableFlowTracerCache = (root.standardizedFileURL, trace)
+                self.reachabilityGraphCache = (root.standardizedFileURL, callGraph)
                 self.endIndexProgress()
             }
         }
@@ -407,6 +412,49 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             controller.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             controller.askHowToFix(fileURL: fileURL, line: line, lineText: lineText)
+        }
+
+        // Focus mode: resolve the focused function's direct callers/callees from
+        // the project call graph, and let a chip click pivot the review to that
+        // function (possibly in another file) while staying focused.
+        viewer.tunnelResolver = { [weak self] fileURL, functionName in
+            guard let self = self,
+                  let root = self.projectRootURL else { return (callers: [], callees: []) }
+            let stdRoot = root.standardizedFileURL
+            let graph: ProjectCallGraph?
+            if let cached = self.reachabilityGraphCache, cached.root == stdRoot {
+                graph = cached.graph
+            } else if let pidx = self.projectSourceIndexCache, pidx.root == stdRoot {
+                let built = ProjectCallGraph(sourceIndex: pidx)
+                self.reachabilityGraphCache = (stdRoot, built)
+                graph = built
+            } else {
+                graph = nil
+            }
+            guard let g = graph else { return (callers: [], callees: []) }
+            let stdURL = fileURL.standardizedFileURL
+            let ref = g.byName[functionName]?.first(where: { $0.fileURL == stdURL })
+                ?? g.byName[functionName]?.first
+            let callers: [(URL, String)] = (g.callers[functionName] ?? []).map {
+                ($0.fileURL, $0.name)
+            }
+            var callees: [(URL, String)] = []
+            if let ref = ref {
+                for edge in g.callees[ref] ?? [] {
+                    for c in g.byName[edge.calleeName] ?? [] {
+                        callees.append((c.fileURL, c.name))
+                    }
+                }
+            }
+            return (callers: callers, callees: callees)
+        }
+        viewer.onTunnelPivot = { [weak self] url, functionName in
+            guard let self = self else { return }
+            self.flowPanel.clear()
+            self.sourceViewer?.display(fileAt: url)
+            self.updateWindowTitle(forFile: url)
+            self.recordHistory(url)
+            self.sourceViewer?.setFocusMode(functionName: functionName)
         }
     }
 

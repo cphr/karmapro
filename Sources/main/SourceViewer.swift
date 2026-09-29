@@ -84,6 +84,38 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     private var cachedFlowLineStarts: [Int] = []
     private var cachedFlowArrowsSource: String?
 
+    // MARK: - Focus mode
+
+    /// How the source is currently focused. `.none` shows everything normally;
+    /// `.focused` keeps the focused function body sharp, dims everything else,
+    /// and pops up caller/callee chip bars so the review can pivot to them.
+    private enum FocusMode { case none, focused }
+    private var focusMode: FocusMode = .none
+    /// Character range (in the current source) that stays sharp under focus mode.
+    /// Everything else is dimmed. Empty when focus is off.
+    private var focusSharpRange: NSRange = .init(location: 0, length: 0)
+
+    /// Floating chip bars shown while focused: callers (top) and callees (bottom).
+    private let tunnelBarTop = TunnelBar()
+    private let tunnelBarBottom = TunnelBar()
+    /// Height constraints for the tunnel bars; toggled between 0 (hidden) and the
+    /// bar's natural height (shown) so focus mode never leaves dead layout space.
+    private var tunnelBarTopHeight: NSLayoutConstraint?
+    private var tunnelBarBottomHeight: NSLayoutConstraint?
+    /// Resolved caller/callee lists for the currently focused function.
+    private var tunnelCallers: [(URL, String)] = []
+    private var tunnelCallees: [(URL, String)] = []
+
+    /// Given a file URL and function name, returns the function's direct callers
+    /// and callees (each as (fileURL, functionName)) from the project call graph.
+    /// Wired up by the owning controller; used by focus mode to populate the
+    /// chip bars.
+    var tunnelResolver: ((URL, String) -> (callers: [(URL, String)], callees: [(URL, String)]))?
+    /// Called when the user clicks a tunnel chip to pivot focus to another
+    /// function, possibly in another file. The owning controller then opens the
+    /// file and re-enters focus on that function.
+    var onTunnelPivot: ((URL, String) -> Void)?
+
     /// Compact clickable table at the top of the viewer listing the highlighted
     /// lines for the current file. Clicking a row scrolls the source to that line.
     private lazy var resultsViewController: HighlightedLinesViewController = {
@@ -206,6 +238,35 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         scrollView.rulersVisible = true
         topContainer.addSubview(scrollView)
 
+        // Tunnel-focus chip bars: floating above/below the source (callers/callees).
+        tunnelBarTop.translatesAutoresizingMaskIntoConstraints = false
+        tunnelBarBottom.translatesAutoresizingMaskIntoConstraints = false
+        tunnelBarTop.isHidden = true
+        tunnelBarBottom.isHidden = true
+        topContainer.addSubview(tunnelBarTop)
+        topContainer.addSubview(tunnelBarBottom)
+        tunnelBarTop.onPick = { [weak self] url, name in self?.onTunnelPivot?(url, name) }
+        tunnelBarBottom.onPick = { [weak self] url, name in self?.onTunnelPivot?(url, name) }
+        let topHeight = tunnelBarTop.heightAnchor.constraint(equalToConstant: 0)
+        let bottomHeight = tunnelBarBottom.heightAnchor.constraint(equalToConstant: 0)
+        tunnelBarTopHeight = topHeight
+        tunnelBarBottomHeight = bottomHeight
+        NSLayoutConstraint.activate([
+            tunnelBarTop.leadingAnchor.constraint(equalTo: topContainer.leadingAnchor, constant: 12),
+            tunnelBarTop.trailingAnchor.constraint(lessThanOrEqualTo: topContainer.trailingAnchor, constant: -12),
+            tunnelBarTop.topAnchor.constraint(equalTo: topContainer.topAnchor, constant: 8),
+            topHeight,
+            tunnelBarBottom.leadingAnchor.constraint(equalTo: topContainer.leadingAnchor, constant: 12),
+            tunnelBarBottom.trailingAnchor.constraint(lessThanOrEqualTo: topContainer.trailingAnchor, constant: -12),
+            tunnelBarBottom.bottomAnchor.constraint(equalTo: topContainer.bottomAnchor, constant: -8),
+            bottomHeight
+        ])
+
+        // Esc exits focus mode (text view first responder needs a way back).
+        textView.onEscapeKey = { [weak self] in
+            self?.clearFocusMode()
+        }
+
         // Clicking a line number lets the user attach a persistent note.
         ruler.onLineClick = { [weak self] line in
             self?.showNotePopover(line: line)
@@ -313,6 +374,9 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         textView.flowArrows = []
         textView.showFlowArrows = false
         textView.flowLineStarts = []
+        matchRanges = []
+        currentMatchIndex = -1
+        resetFocus()
         textView.needsDisplay = true
         emptyLabel.isHidden = false
         scrollView.isHidden = true
@@ -349,9 +413,12 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
 
             textView.textStorage?.beginEditing()
             textView.textStorage?.setAttributedString(result)
-            applyVulnerabilityHighlights()
             textView.textStorage?.endEditing()
-
+            // Focus mode and search are per-file; entering a new file resets both.
+            matchRanges = []
+            currentMatchIndex = -1
+            resetFocus()
+            refreshTextHighlights()
             textView.scrollToBeginningOfDocument(nil)
         } catch {
             presentError(url: url)
@@ -432,14 +499,9 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         highRiskLines = MLScanResultStore.shared.highRiskLines(forFile: url.path)
         resultsViewController.configure(lines: highRiskLines, source: currentSource)
         lineNumberRuler?.highRiskLines = highRiskLines
-        // Clear any existing background highlight in the whole document, then reapply.
-        textView.textStorage?.beginEditing()
-        let all = NSRange(location: 0, length: textView.textStorage?.length ?? 0)
-        if all.length > 0 {
-            textView.textStorage?.removeAttribute(.backgroundColor, range: all)
-        }
-        applyVulnerabilityHighlights()
-        textView.textStorage?.endEditing()
+        // Rebuild the whole background stack (vulnerability + search + focus dim)
+        // so the newly-read scan results don't mix with stale attributes.
+        refreshTextHighlights()
         lineNumberRuler?.needsDisplay = true
         textView.needsDisplay = true
     }
@@ -585,7 +647,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         let result = applyClickableLinks(to: attributed ?? NSAttributedString(string: source), forExtension: ext)
         textView.textStorage?.beginEditing()
         textView.textStorage?.setAttributedString(result)
-        applyVulnerabilityHighlights()
+        refreshTextHighlights()
         textView.textStorage?.endEditing()
     }
 
@@ -691,9 +753,6 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
 
     /// Builds the right-click context menu. When the click is on a C/C++ function name,
     /// offers a "Show Flow Diagram" action (the diagram is opened from the menu, not on click).
-    private var magnifyingGlass: CodeMagnifyingGlassView?
-    private var isMagnifyingEnabled = false
-    private var mouseTrackingMonitor: Any?
 
     func textView(_ view: NSTextView, menu: NSMenu, for event: NSEvent, at charIndex: Int) -> NSMenu? {
         let menu = NSMenu(title: "Source")
@@ -703,17 +762,37 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         copyItem.isEnabled = view.selectedRange.length > 0 || !view.string.isEmpty
         menu.addItem(copyItem)
         menu.addItem(NSMenuItem.separator())
-        
-        let lensTitle = isMagnifyingEnabled ? "Disable Magnifying Glass Lens" : "Enable Magnifying Glass Lens"
-        let lensItem = NSMenuItem(title: lensTitle, action: #selector(toggleMagnifyingGlass(_:)), keyEquivalent: "")
-        lensItem.target = self
-        menu.addItem(lensItem)
 
         let flowTitle = isFlowArrowsOn ? "Hide Flow Arrows on Code" : "Show Flow Arrows on Code"
         let flowItem = NSMenuItem(title: flowTitle, action: #selector(toggleFlowArrows(_:)), keyEquivalent: "")
         flowItem.target = self
         flowItem.state = isFlowArrowsOn ? .on : .off
         menu.addItem(flowItem)
+
+        // Focus mode: keeps the focused function sharp, dims everything else,
+        // and keeps its direct callers/callees one click away (chip bars) so the
+        // review can pivot to them.
+        if let functionName = functionName(at: charIndex) {
+            menu.addItem(NSMenuItem.separator())
+            let tunnelItem = NSMenuItem(
+                title: "Focus on '\(functionName)'",
+                action: #selector(focusOnFunction(_:)),
+                keyEquivalent: ""
+            )
+            tunnelItem.target = self
+            tunnelItem.representedObject = functionName
+            menu.addItem(tunnelItem)
+        }
+        if focusMode != .none {
+            menu.addItem(NSMenuItem.separator())
+            let exitItem = NSMenuItem(
+                title: "Exit Focus Mode",
+                action: #selector(exitFocus(_:)),
+                keyEquivalent: "\u{1b}"
+            )
+            exitItem.target = self
+            menu.addItem(exitItem)
+        }
 
         // Opens the per-function complexity chart; available at any position.
         menu.addItem(NSMenuItem.separator())
@@ -797,38 +876,116 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         return menu
     }
 
-    @objc private func toggleMagnifyingGlass(_ sender: NSMenuItem) {
-        isMagnifyingEnabled.toggle()
-        if isMagnifyingEnabled {
-            if magnifyingGlass == nil {
-                let glass = CodeMagnifyingGlassView(targetTextView: textView)
-                scrollView.contentView.addSubview(glass)
-                magnifyingGlass = glass
-            }
-            magnifyingGlass?.isHidden = false
-            
-            // Monitor mouse moves over the scrollview/textview
-            mouseTrackingMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] event in
-                self?.handleMouseMoved(event)
-                return event
-            }
-        } else {
-            magnifyingGlass?.isHidden = true
-            if let monitor = mouseTrackingMonitor {
-                NSEvent.removeMonitor(monitor)
-                mouseTrackingMonitor = nil
-            }
-        }
-    }
-
-    private func handleMouseMoved(_ event: NSEvent) {
-        guard isMagnifyingEnabled, let glass = magnifyingGlass else { return }
-        glass.updatePosition(withEvent: event)
-    }
-
     @objc private func toggleFlowArrows(_ sender: NSMenuItem) {
         isFlowArrowsOn.toggle()
         refreshFlowArrows()
+    }
+
+    // MARK: - Focus mode
+
+    @objc private func focusOnFunction(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        setFocusMode(functionName: name)
+    }
+
+    @objc private func exitFocus(_ sender: NSMenuItem) {
+        clearFocusMode()
+    }
+
+    /// Focuses the given function in the currently displayed file: the function
+    /// body stays sharp, everything else is dimmed, and the function's direct
+    /// callers/callees are one click away via the chip bars so the review can
+    /// pivot to them. Dimming is attribute-based so the vulnerability/search
+    /// highlights remain visible.
+    func setFocusMode(functionName: String) {
+        guard let source = currentSource,
+              let fileURL = currentFileURL else { return }
+        guard let range = bodyRange(for: functionName, source: source) else { return }
+        focusMode = .focused
+        focusSharpRange = range
+        refreshTextHighlights()
+
+        let callers: [(URL, String)] = tunnelResolver?(fileURL, functionName).callers ?? []
+        let callees: [(URL, String)] = tunnelResolver?(fileURL, functionName).callees ?? []
+        tunnelCallers = callers
+        tunnelCallees = callees
+        tunnelBarTop.configure(items: callers.map { ($0.0, $0.1) }, arrow: "", kind: "callers")
+        tunnelBarBottom.configure(items: callees.map { ($0.0, $0.1) }, arrow: "", kind: "callees")
+        showTunnelBar(tunnelBarTop, heightConstraint: tunnelBarTopHeight, shown: !callers.isEmpty)
+        showTunnelBar(tunnelBarBottom, heightConstraint: tunnelBarBottomHeight, shown: !callees.isEmpty)
+        view.window?.makeFirstResponder(textView)
+    }
+
+    /// Locates the full body range of `functionName` in `source`, so the focused
+    /// region spans signature + body (the whole readable unit), not just the name.
+    private func bodyRange(for functionName: String, source: String) -> NSRange? {
+        let ext = currentFileURL?.pathExtension ?? ""
+        let defs = diagramDefinitions(source: source, ext: ext)
+        guard let def = defs.first(where: { $0.name == functionName }) else { return nil }
+        let r = def.bodyRange
+        guard r.location != NSNotFound, r.length > 0 else { return nil }
+        return r
+    }
+
+    /// Disables focus mode: restores full brightness and hides the chip bars.
+    func clearFocusMode() {
+        guard focusMode != .none else { return }
+        focusMode = .none
+        focusSharpRange = .init(location: 0, length: 0)
+        tunnelBarTop.clear()
+        tunnelBarBottom.clear()
+        showTunnelBar(tunnelBarTop, heightConstraint: tunnelBarTopHeight, shown: false)
+        showTunnelBar(tunnelBarBottom, heightConstraint: tunnelBarBottomHeight, shown: false)
+        refreshTextHighlights()
+    }
+
+    /// Cleanup used when the file changes/disappears.
+    private func resetFocus() {
+        focusMode = .none
+        focusSharpRange = .init(location: 0, length: 0)
+        tunnelBarTop.clear()
+        tunnelBarBottom.clear()
+        tunnelBarTop.isHidden = true
+        tunnelBarBottom.isHidden = true
+        tunnelBarTopHeight?.constant = 0
+        tunnelBarBottomHeight?.constant = 0
+    }
+
+    private func showTunnelBar(_ bar: TunnelBar, heightConstraint: NSLayoutConstraint?, shown: Bool) {
+        bar.isHidden = !shown
+        heightConstraint?.constant = shown ? TunnelBar.barHeight : 0
+    }
+
+    /// Re-applies the full background-attribute stack: vulnerability highlights,
+    /// then the focus dim (when active), then search matches on top. Keeping this
+    /// in one place means focus can never permanently clobber the other
+    /// highlights, and active search matches stay visible even in dimmed areas.
+    private func refreshTextHighlights() {
+        guard let storage = textView.textStorage else { return }
+        storage.beginEditing()
+        let all = NSRange(location: 0, length: storage.length)
+        storage.removeAttribute(.backgroundColor, range: all)
+        applyVulnerabilityHighlights()
+        if focusMode != .none, focusSharpRange.length > 0 {
+            for r in complementRanges(of: focusSharpRange, totalLength: storage.length) {
+                let dim = NSColor(calibratedWhite: 0.0, alpha: 0.55)
+                storage.addAttribute(.backgroundColor, value: dim, range: r)
+            }
+        }
+        applyMatchHighlights()
+        storage.endEditing()
+        textView.needsDisplay = true
+    }
+
+    /// All ranges in [0, totalLength) not covered by `range`.
+    private func complementRanges(of range: NSRange, totalLength: Int) -> [NSRange] {
+        guard totalLength > 0 else { return [] }
+        var ranges: [NSRange] = []
+        let before = NSRange(location: 0, length: range.location)
+        if before.length > 0 { ranges.append(before) }
+        let after = NSRange(location: NSMaxRange(range), length: totalLength - NSMaxRange(range))
+        if after.location < totalLength, after.length > 0 { ranges.append(after) }
+        return ranges
     }
 
     /// Recomputes the flow arrows from the open file (when enabled) and pushes
@@ -1182,7 +1339,6 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
     }
 
     private func performFind(term: String) {
-        clearMatchHighlights()
         let ns = currentSource as NSString? ?? ""
         let fullRange = NSRange(location: 0, length: ns.length)
         var matches: [NSRange] = []
@@ -1198,7 +1354,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         }
         matchRanges = matches
         currentMatchIndex = matches.isEmpty ? -1 : 0
-        highlightMatches()
+        refreshTextHighlights()
         updateMatchCount()
         if currentMatchIndex >= 0 {
             jumpToMatch(at: currentMatchIndex)
@@ -1223,21 +1379,14 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         textView.scrollRangeToVisible(r)
     }
 
-    private func highlightMatches() {
+    /// Adds the search-match background to `matchRanges`. Called by
+    /// `refreshTextHighlights` so match highlighting composes with the
+    /// vulnerability highlights and the focus dim without clearing them.
+    fileprivate func applyMatchHighlights() {
         guard let storage = textView.textStorage else { return }
-        storage.beginEditing()
         for r in matchRanges {
             storage.addAttribute(.backgroundColor, value: searchIndicatorColor, range: r)
         }
-        storage.endEditing()
-    }
-
-    private func clearMatchHighlights() {
-        guard let storage = textView.textStorage,
-              let whole = storage.string as NSString? else { return }
-        storage.beginEditing()
-        storage.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: whole.length))
-        storage.endEditing()
     }
 
     private func updateMatchCount() {
@@ -1252,7 +1401,7 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         searchBar.stringValue = ""
         matchRanges = []
         currentMatchIndex = -1
-        clearMatchHighlights()
+        refreshTextHighlights()
         updateMatchCount()
         searchBar.isHidden = true
         matchCountLabel.isHidden = true
@@ -1568,6 +1717,94 @@ final class LineNumberRulerView: NSRulerView {
     }
 }
 
+/// Floating chip bar used by focus mode. One bar sits above the source
+/// (the focused function's direct callers) and one below (its direct callees).
+/// Each entry is a small button; clicking it fires `onPick` with the
+/// (fileURL, functionName) to pivot the focus to.
+private final class TunnelBar: NSView {
+    static let barHeight: CGFloat = 30
+
+    private let titleLabel = NSTextField(labelWithString: "")
+    private var chipButtons: [NSButton] = []
+    private var chipItems: [NSButton: (URL, String)] = [:]
+    /// Widest the chips have been laid out to; drives `intrinsicContentSize`.
+    private var laidOutWidth: CGFloat = 180
+    var onPick: ((URL, String) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.7).cgColor
+        setContentHuggingPriority(.required, for: .horizontal)
+
+        titleLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(titleLabel)
+
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(greaterThanOrEqualToConstant: TunnelBar.barHeight)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    /// (Re)populates the bar with a title and one chip per item. Lays the chips
+    /// out horizontally after the title.
+    func configure(items: [(URL, String)], arrow: String, kind: String) {
+        clear()
+        guard !items.isEmpty else { return }
+        titleLabel.stringValue = "\(kind):"
+
+        let titleWidth = (titleLabel.stringValue as NSString).size(withAttributes: [.font: titleLabel.font!]).width
+        var x = 10 + titleWidth + 10
+        let y: CGFloat = 4
+        let chipHeight: CGFloat = 22
+        for (url, name) in items {
+            let label = arrow.isEmpty ? name : "\(arrow) \(name)"
+            let chip = NSButton(title: label, target: self, action: #selector(chipClicked(_:)))
+            chip.bezelStyle = .rounded
+            chip.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            chip.isBordered = true
+            chip.toolTip = url.path
+            chipItems[chip] = (url, name)
+            chip.frame = NSRect(x: x, y: y, width: max(50, chip.intrinsicContentSize.width + 16), height: chipHeight)
+            addSubview(chip)
+            chipButtons.append(chip)
+            x = chip.frame.maxX + 4
+        }
+        laidOutWidth = max(180, x + 4)
+        invalidateIntrinsicContentSize()
+    }
+
+    func clear() {
+        for chip in chipButtons {
+            chipItems[chip] = nil
+            chip.removeFromSuperview()
+        }
+        chipButtons.removeAll()
+        titleLabel.stringValue = ""
+        invalidateIntrinsicContentSize()
+    }
+
+    @objc private func chipClicked(_ sender: NSButton) {
+        guard let pair = chipItems[sender] else { return }
+        onPick?(pair.0, pair.1)
+    }
+
+    /// Allows the bar to size its own width to its chips when used as an overlay.
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: laidOutWidth, height: TunnelBar.barHeight)
+    }
+}
+
 /// An NSTextView that lets the controller turn specific character ranges into
 /// clickable regions without using NSTextView's `.link` machinery (which slows
 /// scrolling on large documents). Mouse clicks over a registered function-name
@@ -1622,7 +1859,19 @@ final class ClickableTextView: NSTextView {
         case callSite
     }
 
+    /// Called when the user presses Esc while this text view has focus, letting
+    /// the controller exit focus mode.
+    var onEscapeKey: (() -> Void)?
+
     override var isFlipped: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { // Esc
+            onEscapeKey?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
