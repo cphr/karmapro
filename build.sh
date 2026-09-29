@@ -93,7 +93,6 @@ SOURCES=(
   Sources/graphs/FlowChartView.swift
   Sources/graphs/FlowPanelViewController.swift
   Sources/utils/FileSearchWindowController.swift
-  Sources/utils/CodeMagnifyingGlassView.swift
   Sources/main/HelpWindowController.swift
   Sources/utils/LicensingWindowController.swift
   Sources/main/SplashWindowController.swift
@@ -131,7 +130,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # the app works on older macOS (the default target is the *current* OS, which
 # would otherwise prevent the app from launching on anything older).
 MIN_MACOS="12.0"
-  
+
 echo "Compiling Karma Pro…"
 swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" -swift-version 5 -o "$BIN" "${SOURCES[@]}"
 
