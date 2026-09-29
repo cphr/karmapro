@@ -102,6 +102,7 @@ SOURCES=(
   Sources/AI/OpenRouterClient.swift
   Sources/AI/AIToolRunner.swift
   Sources/AI/AIWindowController.swift
+  Sources/AI/AISecurityScanner.swift
   Sources/tools/NotePopoverController.swift
   Sources/languages/ObjCAst.swift
   Sources/languages/ObjCParser.swift
