@@ -266,9 +266,17 @@ final class AISecurityScanner {
                      continuation: 0,
                      batchLabel: batchLabel,
                      onDone: {
-            if !collector.valid.isEmpty {
-                storeCachedFindings(collector.valid, for: batch, provider: provider, model: model)
-                appendValidated(findings: &state.findings, from: collector.valid,
+            // Resolve every finding to its real card BEFORE caching: the cache
+            // must remember which file a finding belongs to, because absolute
+            // line numbers alone match every file's first chunk (all files
+            // start at line 1) and would re-attribute cached findings to the
+            // wrong file on the next scan.
+            let resolved = collector.valid.compactMap {
+                resolveValidated($0, batch: batch, cardRanges: cardRanges)
+            }
+            if !resolved.isEmpty {
+                storeCachedFindings(resolved, for: batch, provider: provider, model: model)
+                appendValidated(findings: &state.findings, from: resolved,
                                 batch: batch, cardRanges: cardRanges)
             }
             state.processedCards += batch.count
@@ -475,6 +483,25 @@ final class AISecurityScanner {
         let crossFile: Bool
         let function: String
         let summary: String
+        /// Relative path of the card this finding was resolved to (nil while
+        /// still tied only to the model-reported file name). Persisted with the
+        /// cache so a cached finding is never re-attributed to a different file
+        /// that merely shares the same line numbers.
+        let resolvedPath: String?
+
+        init(card: Card, line: Int, category: String, severity: ScanFinding.Severity,
+             exploitability: ScanFinding.Severity, crossFile: Bool, function: String,
+             summary: String, resolvedPath: String? = nil) {
+            self.card = card
+            self.line = line
+            self.category = category
+            self.severity = severity
+            self.exploitability = exploitability
+            self.crossFile = crossFile
+            self.function = function
+            self.summary = summary
+            self.resolvedPath = resolvedPath
+        }
     }
 
     private struct ParseOutcome {
@@ -605,6 +632,24 @@ final class AISecurityScanner {
         }
     }
 
+    /// Marks a validated finding with the relative path of the card it truly
+    /// belongs to, so caching can persist a stable file identity. Unresolvable
+    /// findings (line outside every sent card) return nil.
+    private static func resolveValidated(_ v: ValidatedFinding,
+                                         batch: [Card],
+                                         cardRanges: [CardRange]) -> ValidatedFinding? {
+        guard let range = resolveRange(for: v, batch: batch, cardRanges: cardRanges) else { return nil }
+        return ValidatedFinding(card: v.card,
+                                line: v.line,
+                                category: v.category,
+                                severity: v.severity,
+                                exploitability: v.exploitability,
+                                crossFile: v.crossFile,
+                                function: v.function,
+                                summary: v.summary,
+                                resolvedPath: range.card.relativePath)
+    }
+
     /// Finds the card a validated finding refers to: constrained to cards of
     /// the current batch whose line span covers the reported line, preferring
     /// whichever also matches the file name the model supplied.
@@ -619,7 +664,7 @@ final class AISecurityScanner {
             })
         }
         let lineMatches = batchRanges.filter { v.line >= $0.card.startLine && v.line <= $0.endLine }
-        let hint = v.card.relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hint = (v.resolvedPath ?? v.card.relativePath).trimmingCharacters(in: .whitespacesAndNewlines)
         if !hint.isEmpty {
             let hintBase = URL(fileURLWithPath: hint).lastPathComponent
             if let direct = lineMatches.first(where: {
@@ -700,7 +745,8 @@ final class AISecurityScanner {
 
     private static func storeCachedFindings(_ valid: [ValidatedFinding], for batch: [Card], provider: String, model: String) {
         guard let url = cacheFileURL(batch: batch, provider: provider, model: model) else { return }
-        let entries = valid.map { ["line": $0.line, "category": $0.category, "severity": $0.severity.rawValue,
+        let entries = valid.map { ["line": $0.line, "file": $0.resolvedPath ?? $0.card.relativePath,
+                                   "category": $0.category, "severity": $0.severity.rawValue,
                                    "exploitability": $0.exploitability.rawValue, "cross_file": $0.crossFile,
                                    "function": $0.function, "summary": $0.summary] as [String: Any] }
         let payload = ["cards": batch.map(\.digest), "findings": entries] as [String: Any]
@@ -719,13 +765,18 @@ final class AISecurityScanner {
         guard cards == batch.map(\.digest),
               let entries = obj["findings"] as? [[String: Any]] else { return nil }
         let valid = entries.compactMap { entry -> ValidatedFinding? in
+            // The file is the only stable bridge to a real card (line numbers
+            // alone match many files). A cache entry without it comes from a
+            // pre-fix run and is discarded so the finding is re-requested.
+            guard let file = entry["file"] as? String, !file.isEmpty else { return nil }
             guard let line = entry["line"] as? Int,
                   let category = entry["category"] as? String,
                   let sevRaw = entry["severity"] as? Int,
                   let severity = ScanFinding.Severity(rawValue: sevRaw),
                   let summary = entry["summary"] as? String else { return nil }
             let expRaw = entry["exploitability"] as? Int
-            return ValidatedFinding(card: Card(fileURL: URL(fileURLWithPath: ""), relativePath: "",
+            return ValidatedFinding(card: Card(fileURL: URL(fileURLWithPath: file),
+                                               relativePath: file,
                                                startLine: line, numberedText: "", digest: ""),
                                     line: line, category: category, severity: severity,
                                     exploitability: expRaw.flatMap(ScanFinding.Severity.init) ?? severity,
@@ -733,6 +784,8 @@ final class AISecurityScanner {
                                     function: entry["function"] as? String ?? "",
                                     summary: summary)
         }
+        // Any missing file identity means this batch's cache is stale: refuse it.
+        guard valid.count == entries.count else { return nil }
         return valid
     }
 }
