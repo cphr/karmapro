@@ -1,4 +1,5 @@
 # Karma Pro: The Code Security Review tool
+<img width="719" height="526" alt="image" src="https://github.com/user-attachments/assets/709007a8-c63f-4d99-adaa-0d7dd3ef4949" />
 
 Karma Pro is an open source code review tool (written in Swift) that can assist code reviewers with a multitude of useful tools. Karma Pro is a macOS source-code security scanner (AST base and Heuristics) that statically analyses projects in multiple languages. It's backed by an ML classifier trained on real patches to catch subtle issues ([Karma Automated source code defect identification method
 ](https://cipher.org.uk/2026/02/08/Karma-Automated-source-code-defect-identification-method/)). Beyond scanning, it offers interactive call graphs and data-flow diagrams, debugger (a lightweight dynamic simulator experimental), a bug tracker, a private research wiki, notes, backups, and an AI assistant.
