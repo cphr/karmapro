@@ -123,6 +123,25 @@ SOURCES=(
   Sources/bayes/MLScanResultStore.swift
   Sources/bayes/HeatmapWindowController.swift
   Sources/utils/HighlightedLinesViewController.swift
+  Sources/pr/PRModels.swift
+  Sources/pr/ForgeSupport.swift
+  Sources/pr/ForgeAdapters.swift
+  Sources/pr/PRCredentialStore.swift
+  Sources/pr/GitRunner.swift
+  Sources/pr/DiffAwareClassifier.swift
+  Sources/pr/PRReviewSession.swift
+  Sources/pr/PRMonitor.swift
+  Sources/pr/PRNotifier.swift
+  Sources/pr/PRProgressPanel.swift
+  Sources/pr/PRLog.swift
+  Sources/pr/PRMarkdownReport.swift
+  Sources/pr/PRReviewCoordinator.swift
+  Sources/pr/PRMenuBarController.swift
+  Sources/pr/PRBannerView.swift
+  Sources/pr/PRDiffWindowController.swift
+  Sources/pr/PRReportWindowController.swift
+  Sources/pr/AccountsWindowController.swift
+  Sources/pr/MonitoredReposWindowController.swift
 )
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

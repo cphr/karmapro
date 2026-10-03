@@ -34,7 +34,7 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
 - **Vulnerability Categories**: Detects common exploitation vectors including Buffer Overflow, Format String vulnerabilities, Command Injection, SQL Injection, Path Traversal, Server-Side Request Forgery (SSRF), Insecure Deserialization, Weak Cryptography / Randomness, Hardcoded Secrets, Log Injection, XSS (HTML Injection), Race Conditions / TOCTOU, and (for Solidity) Reentrancy, tx.origin Authorization, Predictable Randomness, Unchecked External Call Return, Delegatecall to Untrusted Address, Selfdestruct to Arbitrary Address, pragma-hygiene issues etc.
 - **Mobile Security Checks**: Dedicated Android (Java) and iOS/Cocoa (Objective-C) rule sets cover platform-specific risk: WebView hardening (JavaScript bridges, file/universal access, arbitrary-loads ATS bypasses), trust-manager / hostname-verifier bypasses, raw SQL, clipboard and pasteboard leakage, UserDefaults and Keychain accessibility misconfiguration, deprecated UIWebView, JavaScript injection, notification/keyed-archiver misuse, deep-link / open-URL exposure, file-protection level, location tracking, SMS/mail composition, and privacy-sensitive contact access etc.
 - **Severity & Exploitability**: Findings are graded by severity (`Critical`, `High`, `Medium`, `Low`), exploitability scores, reachability (whether reachable from entry points), and precise source-to-sink taint paths.
-- **Engine Distinction**: Distinguishes findings detected structurally over the parsed Abstract Syntax Tree (**AST**) from heuristic pattern matches (**Heuristic**).
+- **Engine Distinction**: Distinguishes findings detected structurally over the parsed Abstract Syntax Tree (**AST**) from heuristic pattern matches (**Heuristic**). Note: if you also chose AI scan to be performed, you will also see AI results.
 
 ## 5. Bayesian Classifier, ML Trainer & Model Import/Export
 - **Bayesian Vulnerability Classifier**: A probabilistic machine-learning classifier that analyses token frequencies and log-odds to evaluate code snippets for vulnerability likelihood.
@@ -69,6 +69,44 @@ The **AI** toolbar button (right of the Bugs button) opens the AI Assistant wind
 ## 8. Private Research Wiki
 The **Wiki** toolbar button (next to Notes) opens a private research wiki shared across all projects. Write pages in a rich-text editor with a white background, hyperlink selected words instantly with the **Link…** button (or type `[[Page Name]]`), and click any link to open the page, creating it if it doesn't exist yet. Pages can be listed, searched, renamed and deleted, auto-save whenever their window closes, and the whole wiki can be backed up to a `.karmawiki` archive, optionally encrypted with a password and imported back later.
 
+## 9. Pull Request Monitoring & Review Scanning
+The **Karma Pro** menu bar icon can watch repositories on **GitHub**, **GitLab**, **Bitbucket** and **Gitea/Forgejo**, tell you when a pull request opens or changes, and check that pull request and scan it. Monitoring is off by default.
+**Adding a public repository**
+Public repositories don't need an account, token or login.
+- Open the **Karma Pro** menu bar icon and choose **Manage Repositories…**
+- Paste the repository URL into the **Repository** field. 
+- Leave **Local clone** empty to use a temporary workspace, or point it at an existing local clone.
+- Choose a **Scan depth** (see below).
+- Optionally list **base branches** to watch, comma-separated, e.g. `main, release`. Empty means every branch.
+- Click **Test Connection** to confirm the repository is reachable, then **Add Repository**.
+- Choose **Enable Monitoring…** from the menu bar icon.
+The repository appears in the list. Untick **Watching** to pause notifications without deleting it.
+**Adding a private repository**
+Private repositories need a **read-only token**. Karma Pro never approves, comments on or posts to a pull request, so read-only scope is enough. Tokens are stored in your macOS Keychain.
+**Accounts setup:**
+- Choose the **Provider**.
+- Set the **Host**, prefilled for you. Change it only for a self-hosted instance e.g. gitlab.example.com, or the host of an internal Gitea install. For Gitea/Forgejo this is the field that matters, since there is no single public host.
+- Enter any **Username**. This is only a label to help you tell accounts apart.
+- Paste the **Token** and click **Save Token**.
+**Then add the repository** as above, but tick **Private repository**. The status line names the account that will be used, e.g. *uses account "test" on github.com*.
+**Several accounts on one provider:** save more than one account per provider and choose per repository which one watches it, so two private repositories belonging to different accounts are monitored independently. The **Account** dropdown appears under the URL as soon as a private repository has more than one saved account that can reach it, listing only accounts whose provider *and* host match the URL, shown as test (github.com). The **Account** column in the repository list shows which account each private repository polls with.
+**What monitoring does**
+Karma Pro polls each watched repository every **15 minutes** and compares the result against the previous poll.
+- A pull request is announced when it **opens**, and again when it **changes** — including a **force-push**, recognised by head commit rather than by title, so a rewritten pull request is not silently missed.
+- At most **5** pull requests are announced per poll, the rest are carried to the next.
+- A pull request you **Ignore** is not announced again until it is force-pushed to new commits.
+- **Alert style** is **Off**, **Notification**, or **Notification + Sound**.
+- With **Off**, polling stops and the menu bar icon fades, so you can see that nothing is being watched.
+**Notification actions.** **Review** checks the pull request out and scans it, it is the *only* action, so dismissing a notification or letting it time out never starts a review. **Not Now** dismisses it and leaves it reviewable later. **Ignore** stops alerting until the pull request is force-pushed. 
+**Reviewing a pull request**
+Choosing **Review**, from a notification, or from the banner on a repository you are watching, prepares a workspace and scans it if you choose to do so.
+- **Scan**: base and head are both scanned and the findings compared, so the report shows what this pull request **introduced** rather than what the project already contained. Findings that shift line number because of edits elsewhere in the diff are matched to their original instead of reported as new.
+- **Diff**: changed files open side by side, base against head, with findings shown against them.
+- **Report**: **Report** produces a saveable Markdown document with the pull request's author, branches, head commit, link, files changed and last updated time, plus the findings the scan introduced/
+**Scan depth** is chosen per repository when you add it:
+- **Changed files only** Only the files this pull request adds or modifies — fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing. |
+- **Full project** The whole project at the head commit, slower and larger. When the change touches shared code and you need cross-file taint analysis and reachability to work normally.
+**Closing a review**: **Close Review** ends the session, clears the file tree and every pane, and removes the on-disk checkouts. Checkouts and findings are cached between reviews for speed; **Manage Repositories** shows the cache size and has **Clear Cache**, which is refused while a review is open, when you are not reviewing however you clear the local cache.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
 
 **Brought to you by cipher.org.uk**

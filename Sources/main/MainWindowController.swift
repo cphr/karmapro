@@ -41,6 +41,28 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     var projectRootURL: URL?
     private var selectedLanguage: Language?
     private var bugBadgeView: BugBadgeView?
+
+    // MARK: - Pull request review
+
+    /// Non-nil while a pull request checkout is open. When set, the file tree is
+    /// filtered to the PR's changed files and the window shows a PR banner, so
+    /// there is never any doubt that the tree on screen is not the whole repo.
+    private var pullRequestSession: PRReviewSession?
+    private var pullRequestBanner: PRBannerView?
+    private var pullRequestDiffWindow: PRDiffWindowController?
+    private var pullRequestReportWindow: PRReportWindowController?
+    /// Owns the vertical layout of the window body: the review banner row (only
+    /// while a review is open) above the split view.
+    ///
+    /// This exists so the banner cannot overlap anything. Two earlier attempts
+    /// added the banner as a sibling of the split view inside the content view
+    /// and moved the split view down by swapping its top constraint, once
+    /// searching the wrong constraint list and once with a reversed
+    /// first/second item. Both looked right and both shipped an overlap. A
+    /// stack view cannot overlap its arranged subviews -- it partitions one
+    /// axis between them -- so the banner takes a row of its own and the panes
+    /// take what is left, with no constraint to swap and nothing to restore.
+    private var contentStack: NSStackView!
     /// Chronological list of files opened in the source viewer. The currently
     /// shown file is `fileHistory[historyIndex]`; entries after it form the
     /// forward stack that is dropped whenever a brand-new file is opened.
@@ -294,14 +316,36 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         viewer.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
 
         guard let content = window?.contentView else { return }
-        content.addSubview(splitView)
-        splitView.translatesAutoresizingMaskIntoConstraints = false
+        // The stack fills the content view and never changes. The split view is
+        // its only arranged subview to begin with; the banner is inserted ahead
+        // of it when a review starts and taken back out when the review ends, so
+        // the panes are given their full height back by the stack simply having
+        // one fewer row.
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .fill
+        // No gap between the banner row and the panes. The default spacing of 8
+        // left a strip of background between them, which reads as the banner
+        // floating over the window rather than being part of it.
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            splitView.topAnchor.constraint(equalTo: content.topAnchor),
-            splitView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor)
         ])
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        // Membership first, constraints second: a constraint between a view and
+        // its container is only valid once the view is in that hierarchy, and
+        // activating it beforehand throws.
+        stack.addArrangedSubview(splitView)
+        // A leading-aligned stack sizes each row from its own constraints, so
+        // the split view is told how wide to be explicitly.
+        splitView.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        contentStack = stack
         // Set both dividers so the middle (source) keeps a healthy width.
         DispatchQueue.main.async { [weak self] in
             guard let sv = self?.splitView, sv.subviews.count >= 3 else { return }
@@ -458,6 +502,297 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         }
     }
 
+    // MARK: - Pull request review
+
+    /// Opens a prepared pull request checkout in the normal main window.
+    ///
+    /// The PR is presented as a folder like any other: the same tree, viewer and
+    /// scanners, with two additions — the tree is filtered to the files the PR
+    /// added or modified, and a banner plus a toolbar button make the review
+    /// state and its report impossible to miss.
+    func openPullRequestReview(_ session: PRReviewSession) {
+        pullRequestSession?.tearDown()
+        pullRequestSession = session
+
+        projectRootURL = session.workspace
+        window?.representedURL = session.workspace
+
+        // Reset the per-project caches: they describe the previous project and
+        // would otherwise be reused for the PR's code.
+        resetHistory()
+        variableFlowCancellation?.cancel()
+        variableFlowCancellation = nil
+        variableFlowTracerCache = nil
+        variableFlowController = nil
+        simulationController = nil
+        reachabilityCancellation?.cancel()
+        reachabilityCancellation = nil
+        reachabilityGraphCache = nil
+        reachabilityController = nil
+        complexityController = nil
+
+        fileTreeViewController.load(directory: session.workspace)
+        fileTreeViewController.changeBadges = badgeMap(for: session)
+        fileTreeViewController.setPullRequestFilter(paths: session.reviewablePaths)
+
+        buildProjectSourceIndex(for: session.workspace)
+        sourceViewer?.clear()
+        updateWindowTitle(forFile: nil)
+        showPullRequestBannerFor(session: session)
+        window?.title = session.title
+    }
+
+    /// Opens the per-file diff window for the current review.
+    ///
+    /// One window is reused for the session, so switching pull requests replaces
+    /// its contents rather than stacking windows.
+    func showPullRequestChanges(session: PRReviewSession) {
+        if pullRequestDiffWindow == nil {
+            let controller = PRDiffWindowController()
+            // Opening a file from the changes window shows it in the source
+            // viewer, which is where the scanner's findings for it live.
+            controller.onOpenFile = { [weak self] url in
+                self?.flowPanel.clear()
+                self?.sourceViewer?.display(fileAt: url)
+                self?.updateWindowTitle(forFile: url)
+                self?.recordHistory(url)
+            }
+            pullRequestDiffWindow = controller
+        }
+        guard let controller = pullRequestDiffWindow else { return }
+        controller.load(files: session.changedFiles, repoRoot: session.workspace)
+        NSApp.activate(ignoringOtherApps: true)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func showPullRequestBannerFor(session: PRReviewSession) {
+        // A second review in a row must not leave the first banner's row behind.
+        removeBanner()
+        guard let content = window?.contentView else { return }
+        let banner = PRBannerView()
+        banner.configure(title: session.context.title,
+                         subtitle: session.badgeText,
+                         detail: session.context.repo.webURL)
+        // Show All is only offered while the tree is actually pruned, and
+        // mirrors its own state so it can never read as a dead control.
+        banner.setShowAllAvailable(true)
+        fileTreeViewController.onFilterModeChanged = { [weak self] showingAll in
+            self?.pullRequestBanner?.setShowAllAvailable(!showingAll)
+        }
+        banner.onShowAll = { [weak self] in
+            guard let self = self else { return }
+            let showingAll = self.fileTreeViewController.isShowingChangedFilesOnly
+            self.fileTreeViewController.setShowingAllFiles(showingAll)
+            banner.setShowAllAvailable(!showingAll)
+        }
+        // The changes window is the answer to "what did this actually change":
+        // every added and removed line, with the ones worth a careful read
+        // marked, so a security judgement is not being asked for blind.
+        banner.onShowChanges = { [weak self] in
+            self?.showPullRequestChanges(session: session)
+        }
+        banner.onReview = { [weak self] in
+            self?.runPullRequestScan(session: session)
+        }
+        banner.onShowReport = { [weak self] in
+            self?.showPullRequestReport(session: session)
+        }
+        banner.onClose = { [weak self] in
+            self?.leavePullRequestReview(removeCheckout: true)
+        }
+        pullRequestBanner = banner
+        placeBanner(banner, in: content)
+    }
+
+    /// Puts the banner in a row of its own above the panes.
+    ///
+    /// The row is inserted into the stack rather than layered over the content
+    /// view, so it is laid out above the panes instead of on top of them. The
+    /// split view is never re-constrained: the stack divides the available
+    /// height between the banner's fixed row and whatever the panes keep.
+    func placeBanner(_ banner: PRBannerView, in content: NSView) {
+        guard let stack = contentStack else { return }
+        pullRequestBanner = banner
+        banner.translatesAutoresizingMaskIntoConstraints = false
+        // Membership first, constraints second. A width constraint between the
+        // banner and the stack is only valid once the banner is in that
+        // hierarchy; activating it first throws from inside the layout engine.
+        // Index 0, so the banner is the top row and the panes stay below it.
+        stack.insertArrangedSubview(banner, at: 0)
+        NSLayoutConstraint.activate([
+            banner.heightAnchor.constraint(equalToConstant: PRBannerView.height),
+            banner.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+        stack.layoutSubtreeIfNeeded()
+    }
+
+    /// Takes the banner out and gives the panes their full height back.
+    func removeBanner() {
+        guard let banner = pullRequestBanner else { return }
+        if let stack = contentStack, banner.superview === stack {
+            stack.removeArrangedSubview(banner)
+        }
+        banner.removeFromSuperview()
+        pullRequestBanner = nil
+        contentStack?.layoutSubtreeIfNeeded()
+    }
+
+
+    /// Leaves PR review and returns the window to an ordinary folder view.
+    func leavePullRequestReview(removeCheckout: Bool) {
+        let session = pullRequestSession
+        pullRequestSession = nil
+
+        // Removes the banner and gives the panes their full height back, so they
+        // return to exactly the geometry they had before the review rather than
+        // inheriting a gap where the banner used to be.
+        removeBanner()
+        fileTreeViewController.changeBadges = [:]
+        window?.title = "Karma Pro"
+
+        // Everything below clears the window to "no project open".
+        //
+        // The tree used to be left standing, which looked like a bug even before
+        // the checkout was deleted: its nodes pointed into the session's
+        // temporary workspace, so any file clicked after closing the review
+        // produced "Could not read file:" in red. It also left the PR filter
+        // active, so a folder opened afterwards came up filtered to paths that
+        // no longer existed.
+        fileTreeViewController.clear()
+        flowPanel.clear()
+        sourceViewer?.clear()
+        projectRootURL = nil
+        // The index is built from the review's workspace, so it is stale the
+        // moment the review ends; every lookup checks its root, but dropping it
+        // stops a later folder scan briefly using the deleted one.
+        sourceIndexCancellation?.cancel()
+        sourceIndexCancellation = nil
+        projectSourceIndexCache = nil
+        variableFlowTracerCache = nil
+        sourceViewer?.definitionIndex = nil
+        resetHistory()
+        endIndexProgress()
+        updateWindowTitle(forFile: nil)
+
+        session?.cancelScan()
+        // Tell the coordinator before the checkout goes, so the repository
+        // dialog stops reporting an open review immediately. Without this the
+        // cache was still refused after the review had been closed, because
+        // `hasActiveReview` was never told the session had ended.
+        if let session = session {
+            PRReviewCoordinator.shared.didCloseSession(session)
+        }
+        if removeCheckout {
+            session?.tearDown()
+        }
+    }
+
+    /// Scans the PR head and the base, then classifies. The scan window shows the
+    /// merged result with an "In PR?" column.
+    private func runPullRequestScan(session: PRReviewSession) {
+        guard let scanController = pullRequestScanController() else { return }
+        let scope = promptForAIPullRequestScan()
+
+        scanController.prSession = session
+        scanController.showWindow(nil)
+        scanController.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        scanController.loadPullRequestReview(session,
+                                             wantsAI: scope != .none,
+                                             wantsAIBase: scope == .both)
+    }
+
+    /// The AI question is restated for a PR because the cost profile differs:
+    /// the base commit is scanned locally either way, so enabling AI adds one
+    /// pass over the PR, not two.
+    /// How far the AI pass should reach. The three options are ordered by cost,
+    /// cheapest-but-still-useful first is deliberately not the default: the
+    /// default is the single head pass, with the two-sided option as the
+    /// explicit "spend more to be certain" choice.
+    private enum AIPullRequestScope {
+        case none
+        case headOnly
+        case both
+    }
+
+    private func promptForAIPullRequestScan() -> AIPullRequestScope {
+        let client = OpenRouterClient.shared
+        let ask = NSAlert()
+        ask.messageText = "Run an AI scan on this pull request?"
+        ask.informativeText = """
+            The built-in scan always runs on both the pull request and its base commit, so new problems can be \
+            told apart from inherited ones.
+
+            An AI pass reviews the changed code with \(client.selectedModel) (\(client.provider.rawValue)). This \
+            sends that code to your provider and consumes tokens unless you use a local model.
+
+            Reviewing the base commit as well doubles the AI cost, and is only worth it when you want inherited \
+            code judged by the same detector that judged the new code.
+
+            How much should the AI review?
+            """
+        ask.alertStyle = .informational
+        ask.addButton(withTitle: "Pull request only (1 pass)")
+        ask.addButton(withTitle: "Pull request and base (2 passes)")
+        ask.addButton(withTitle: "Regular scan only")
+        switch ask.runModal() {
+        case .alertFirstButtonReturn: return .headOnly
+        case .alertSecondButtonReturn: return .both
+        default: return .none
+        }
+    }
+
+    private func pullRequestScanController() -> ScanWindowController? {
+        if let existing = scanController { return existing }
+        let controller = ScanWindowController()
+        controller.onOpenResult = { [weak self] url, line in
+            self?.showFile(at: url, line: line)
+        }
+        scanController = controller
+        return controller
+    }
+
+    /// Generates the Markdown report and offers Copy or Save.
+    private func showPullRequestReport(session: PRReviewSession) {
+        let report = PRMarkdownReport.generate(session: session,
+                                               includePreExisting: true,
+                                               includeFixed: true)
+        // Retained, not created as a temporary. PRReportWindowController's
+        // buttons hold their target unowned, so letting the controller go when
+        // showWindow returned left "Save As…" with no receiver and the click did
+        // nothing. One window is reused so a second report replaces the first
+        // rather than stacking windows.
+        if pullRequestReportWindow == nil {
+            pullRequestReportWindow = PRReportWindowController()
+        }
+        pullRequestReportWindow?.showReport(markdown: report,
+                                            suggestedName: reportFileName(session))
+    }
+
+    private func reportFileName(_ session: PRReviewSession) -> String {
+        let slug = session.context.pr.title
+            .lowercased()
+            .map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        let collapsed = String(String(slug).prefix(40))
+        return "PR-\(session.context.pr.number)-\(collapsed.isEmpty ? "review" : collapsed).md"
+    }
+
+    /// A/M badge per file name, keyed the way the tree looks nodes up.
+    private func badgeMap(for session: PRReviewSession) -> [String: String] {
+        var badges: [String: String] = [:]
+        for file in session.checkout.reviewableFiles {
+            badges[URL(fileURLWithPath: file.path).lastPathComponent] = file.kind.badge
+        }
+        return badges
+    }
+
+    /// The Markdown report is reachable from the review banner, so it no longer
+    /// needs a toolbar item. The button used to sit to the right of the AI
+    /// assistant's item, which pushed the most-used control off the end of a
+    /// narrow window, and NSToolbar has no item-removal API below macOS 15 so
+    /// it could not be taken back out again once shown.
+
     func promptForDirectory() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -471,6 +806,9 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
                 self?.showDirectoryRequiredAlert()
                 return
             }
+            // Leaving PR review first, because it clears the project root: done
+            // afterwards it would wipe the folder just opened.
+            self?.leavePullRequestReview(removeCheckout: true)
             self?.fileTreeViewController.load(directory: url)
             self?.projectRootURL = url
             self?.window?.representedURL = url

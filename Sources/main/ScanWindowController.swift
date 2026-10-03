@@ -20,6 +20,17 @@ final class ScanWindowController: NSWindowController {
 
     private var findings: [ScanFinding] = []
     private var scannedFolder: URL?
+
+    // MARK: - Pull request review mode
+
+    /// Set while the window is reviewing a pull request. Nil for an ordinary
+    /// project scan, which keeps every existing code path unchanged.
+    var prSession: PRReviewSession?
+    /// Classification for the current results, keyed the same way as the
+    /// "ignore" set so both survive the same row assembly.
+    private var prAwareness: [String: DiffAwareness] = [:]
+    private var prReviewColumn: NSTableColumn?
+    private var prBanner: PRBannerView?
     /// The project-wide source cache to reuse for walking and reading during a
     /// scan, when the app already loaded it for the same folder. Kept weak-like
     /// by the caller (already retained by the main controller for its lifetime).
@@ -37,6 +48,7 @@ final class ScanWindowController: NSWindowController {
     /// Whether the AI scan was requested by the user at the Security Scanner
     /// button; kept so the Rescan action repeats the same choice.
     private var wantsAI = false
+    private var wantsAIBase = false
 
     /// Line numbers the user has chosen to ignore (persisted in UserDefaults), keyed
     /// by the file path so the same finding stays hidden across relaunches.
@@ -166,6 +178,13 @@ final class ScanWindowController: NSWindowController {
         msgColumn.width = 300
         msgColumn.resizingMask = .autoresizingMask
 
+        // Added only while a pull request review is open, so a normal project
+        // scan keeps exactly the columns it has always had.
+        let prColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("inpr"))
+        prColumn.title = "In PR?"
+        prColumn.width = 90
+        prColumn.sortDescriptorPrototype = NSSortDescriptor(key: "inpr", ascending: true)
+
         tableView.addTableColumn(expColumn)
         tableView.addTableColumn(sevColumn)
         tableView.addTableColumn(catColumn)
@@ -174,6 +193,12 @@ final class ScanWindowController: NSWindowController {
         tableView.addTableColumn(lineColumn)
         tableView.addTableColumn(srcColumn)
         tableView.addTableColumn(cfColumn)
+        // Added in its final position and toggled with `isHidden`: NSTableView
+        // exposes no insert/reorder API, and hiding preserves both the column's
+        // place and its width between PR reviews.
+        prColumn.isHidden = true
+        prReviewColumn = prColumn
+        tableView.addTableColumn(prColumn)
         tableView.addTableColumn(msgColumn)
 
         tableView.usesAlternatingRowBackgroundColors = true
@@ -224,6 +249,9 @@ final class ScanWindowController: NSWindowController {
     /// fresh scan. `wantsAI` comes from the prompt shown when the Security
     /// Scanner button is pressed.
     func load(folder: URL, wantsAI: Bool) {
+        // Scanning a plain folder ends any pull-request review: the "In PR?"
+        // column and its classifications describe a different question.
+        if prSession != nil { clearPullRequestReview() }
         self.wantsAI = wantsAI
         scannedFolder = folder
         rescanButton.isEnabled = false
@@ -244,6 +272,96 @@ final class ScanWindowController: NSWindowController {
         } else {
             performScan(folder: folder)
         }
+    }
+
+    // MARK: - Pull request review mode
+
+    /// Reviews a pull request instead of a plain folder: scans both the PR and its
+    /// base, then shows every finding with an "In PR?" column so the user can
+    /// see at a glance which problems this change is responsible for.
+    func loadPullRequestReview(_ session: PRReviewSession, wantsAI: Bool, wantsAIBase: Bool = false) {
+        prSession = session
+        self.wantsAI = wantsAI
+        self.wantsAIBase = wantsAIBase
+        showPRColumn(true)
+        window?.title = "Karma Pro \u{2014} \(session.title)"
+        // The static folder cache must not be reused: a normal scan of the same
+        // workspace would overwrite the classified results with plain ones.
+        scannedFolder = nil
+        rescanButton.isEnabled = false
+
+        statusLabel.stringValue = "Reviewing \(session.context.pr.number)\u{2026}"
+        progressBar.isIndeterminate = true
+        progressBar.isHidden = false
+        progressBar.startAnimation(nil)
+
+        session.scan(wantsAI: wantsAI, wantsAIBase: wantsAIBase, progress: { [weak self] message in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.statusLabel.stringValue = message
+            }
+        }, completion: { [weak self] completed in
+            guard let self = self else { return }
+            self.progressBar.stopAnimation(nil)
+            self.progressBar.isHidden = true
+            self.rescanButton.isEnabled = completed
+            guard completed else {
+                self.statusLabel.stringValue = "Review cancelled."
+                return
+            }
+            // Same post-processing a project scan gets, so the two tables are
+            // presented identically: the same duplicate guard, the same sort,
+            // and rows coloured by the same per-column rules. The "In PR?"
+            // column is the only difference a pull-request scan adds.
+            let merged = self.enforceNoScannerDuplicates(session.findings.map(\.finding))
+            self.findings = self.applyIgnoredFilter(merged)
+            self.applySorting()
+            self.rebuildAwareness()
+            self.tableView.reloadData()
+            self.updatePRStatus()
+        })
+    }
+
+    private func rescanPullRequest(session: PRReviewSession) {
+        session.cancelScan()
+        loadPullRequestReview(session, wantsAI: wantsAI)
+    }
+
+    private func showPRColumn(_ visible: Bool) {
+        prReviewColumn?.isHidden = !visible
+    }
+
+    private func rebuildAwareness() {
+        guard let session = prSession else {
+            prAwareness.removeAll()
+            return
+        }
+        prAwareness = Dictionary(session.findings.map {
+            ($0.finding.fileURL.path + "#" + String($0.finding.line), $0.awareness)
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func awareness(for finding: ScanFinding) -> DiffAwareness? {
+        prAwareness[finding.fileURL.path + "#" + String(finding.line)]
+    }
+
+    private func updatePRStatus() {
+        guard let session = prSession else { return }
+        let all = session.findings
+        let introduced = DiffAwareClassifier.introduced(all).count
+        let contextual = DiffAwareClassifier.contextual(all).count
+        let preExisting = DiffAwareClassifier.preExisting(all).count
+        let fixed = DiffAwareClassifier.fixed(all).count
+        statusLabel.stringValue = "PR #\(session.context.pr.number): \(introduced) new \u{00B7} \(contextual) touched \u{00B7} "
+            + "\(preExisting) pre-existing \u{00B7} \(fixed) fixed"
+    }
+
+    /// Removes pull-request mode and returns to an ordinary project scan.
+    func clearPullRequestReview() {
+        prSession?.cancelScan()
+        prSession = nil
+        prAwareness.removeAll()
+        showPRColumn(false)
     }
 
     /// Removes findings the user has ignored, based on persisted (file, line) keys.
@@ -348,6 +466,13 @@ final class ScanWindowController: NSWindowController {
     }
 
     @objc private func rescanClicked(_ sender: Any?) {
+        // A pull-request review re-runs the paired head+base scan; a project
+        // scan re-runs the single pass. Keeping them distinct means Rescan
+        // always means "answer the same question again".
+        if let session = prSession {
+            rescanPullRequest(session: session)
+            return
+        }
         guard let folder = scannedFolder else { return }
         performScan(folder: folder)
     }
@@ -674,6 +799,32 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             } else {
                 cellView.textField?.toolTip = "Taint is local to this file or from a built-in source."
             }
+        case "inpr":
+            // Only rendered while a PR review is open; the column is not
+            // installed for a normal project scan.
+            switch awareness(for: f) {
+            case .some(.introduced):
+                cellView.textField?.stringValue = "New"
+                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+                cellView.textField?.textColor = .systemRed
+                cellView.textField?.toolTip = "Introduced by this pull request."
+            case .some(.contextual):
+                cellView.textField?.stringValue = "Touched"
+                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+                cellView.textField?.textColor = .systemOrange
+                cellView.textField?.toolTip = "In a file this PR modifies, but not on changed lines and not present at base."
+            case .some(.preExisting):
+                cellView.textField?.stringValue = "Pre-existing"
+                cellView.textField?.textColor = .secondaryLabelColor
+                cellView.textField?.toolTip = "Already present before this pull request."
+            case .some(.fixed):
+                cellView.textField?.stringValue = "Fixed"
+                cellView.textField?.textColor = .systemGreen
+                cellView.textField?.toolTip = "Present at the base commit and gone from this pull request."
+            case .none:
+                cellView.textField?.stringValue = ""
+            }
+            cellView.textField?.alignment = .center
         case "msg":
             var parts: [String] = []
             if let path = f.taintPath, !path.isEmpty { parts.append("flow: \(path)") }
