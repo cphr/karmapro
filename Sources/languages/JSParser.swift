@@ -372,8 +372,15 @@ public final class JSParser {
                 i += 1
                 continue
             }
-            if t.text == "}" {
-                if !scopes.isEmpty { scopes.removeLast() }
+            if t.text == "}" || t.text == ")" || t.text == "]" {
+                // Pop only the scope this closer actually opened. Matching on
+                // `closer` matters for ')' / ']': an '(' scope was otherwise
+                // left on the stack until some later '}' popped it in place of
+                // its own '{'. That left the enclosing class/object scope
+                // hidden behind a stale brace scope, so every method after the
+                // first in a class body failed the `.klass`/`.object` gate in
+                // `parseMethodCall` and went undetected.
+                if let last = scopes.last, last.closer == t.text { scopes.removeLast() }
                 i += 1
                 continue
             }
@@ -718,7 +725,9 @@ public final class JSParser {
             isGenerator = true
             startIdx -= 1
         }
-        if startIdx > 0, tokens[startIdx - 1].kind == .identifier, tokens[startIdx - 1].text == "async" {
+        if startIdx > 0,
+           tokens[startIdx - 1].kind == .identifier || tokens[startIdx - 1].kind == .keyword,
+           tokens[startIdx - 1].text == "async" {
             isAsync = true
             startIdx -= 1
         }

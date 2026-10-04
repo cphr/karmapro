@@ -450,6 +450,13 @@ private final class Builder {
             switch t.text {
             case "if": return parseIf()
             case "while": return parseLoop("while")
+            case "do":
+                // C-family `do BODY while (COND);`. Guarded by lookahead because
+                // `do` is also a Ruby block keyword (`each do |x| … end`) and
+                // heads a Swift `do`-`catch`; neither has a trailing `while`,
+                // so both fall through to a plain statement as before.
+                if isDoWhile(at: idx) { return parseDoWhile() }
+                return parsePlain()
             case "for":
                 // Check for for...of / for...in
                 if let nextIdx = peekNextNonWhitespace(idx + 1), nextIdx < tokens.count {
@@ -666,6 +673,80 @@ private final class Builder {
         let join = make(.join)
         connect(dec, join, branch: "F")
         return (dec, join)
+    }
+
+    /// Side-effect-free check for `do BODY while (COND);` starting at the `do`
+    /// token `from`. Scans past the body and reports whether a `while` follows,
+    /// so the caller can fall back to `parsePlain()` for Ruby's `do … end`
+    /// blocks and Swift's `do … catch` without having emitted any nodes or
+    /// counted any decisions for the abandoned attempt.
+    private func isDoWhile(at from: Int) -> Bool {
+        var i = from + 1 // 'do'
+        guard i < tokens.count else { return false }
+        while i < tokens.count, newlineTerminators, tokens[i].kind == .symbol, tokens[i].text == "\n" { i += 1 }
+        guard i < tokens.count else { return false }
+
+        if tokens[i].kind == .symbol, tokens[i].text == "{" {
+            // Block body: run to its matching '}'.
+            var depth = 0
+            while i < tokens.count {
+                let t = tokens[i]
+                if t.kind == .symbol {
+                    if t.text == "{" { depth += 1 }
+                    else if t.text == "}" {
+                        depth -= 1
+                        if depth == 0 { i += 1; break }
+                    }
+                }
+                i += 1
+            }
+        } else {
+            // Single-statement body: run to the first ';' at depth 0.
+            var depth = 0
+            while i < tokens.count {
+                let t = tokens[i]
+                if t.kind == .symbol {
+                    if t.text == "{" || t.text == "(" || t.text == "[" { depth += 1 }
+                    else if t.text == "}" || t.text == ")" || t.text == "]" {
+                        if depth == 0 { return false }
+                        depth -= 1
+                    } else if t.text == ";" && depth == 0 { break }
+                }
+                i += 1
+            }
+        }
+        while i < tokens.count, newlineTerminators, tokens[i].kind == .symbol, tokens[i].text == "\n" { i += 1 }
+        return i < tokens.count && tokens[i].kind == .identifier && tokens[i].text == "while"
+    }
+
+    /// C-family `do BODY while (COND);`. Unlike `parseLoop`, the body runs
+    /// *before* the condition is evaluated, so the decision node follows the
+    /// body, the back edge runs from the body's exit into that decision, and
+    /// the fragment enters at the body rather than at the decision.
+    private func parseDoWhile() -> Fragment {
+        idx += 1 // 'do'
+        if newlineTerminators { skipNewlines() }
+        guard let bodyF = parseStatement() else {
+            let n = make(.block("do"))
+            return (n, n)
+        }
+
+        if idx < tokens.count, tokens[idx].kind == .identifier, tokens[idx].text == "while" {
+            idx += 1 // 'while'
+        }
+        let whileIdx = idx
+        let cond = eatCondition()
+        if idx < tokens.count, tokens[idx].kind == .symbol, tokens[idx].text == ";" { idx += 1 }
+
+        decisionCount += 1
+        decisionCount += logicalOpsCount(in: cond)
+        let dec = make(.decision("do while \(cond)"), at: locAt(whileIdx))
+
+        connect(bodyF.exit, dec, back: true)   // body loops back through the test
+        connect(dec, bodyF.entry, branch: "T")
+        let join = make(.join)
+        connect(dec, join, branch: "F")
+        return (bodyF.entry, join)
     }
 
     private func parseSwitch() -> Fragment {
