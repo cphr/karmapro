@@ -12,3 +12,4 @@ The Karma Pro menu bar icon can watch repositories on GitHub, GitLab, Bitbucket 
 To build Karma Pro download the repo and build it with `./build.sh` (at least Xcode 14+ / Swift 5.7). Download the self-signed release [here](https://github.com/cphr/karmapro/releases/latest/download/Karma.pro.dmg)
 
 Karma Pro post at [Cipher](https://www.cipher.org.uk) here [https://cipher.org.uk/2026/09/19/Karma-Pro-The-Code-Security-Review-tool/](https://cipher.org.uk/2026/09/19/Karma-Pro-The-Code-Security-Review-tool/)
+[ReviewCode.org](https://ReviewCode.org) is Karma Pro's dedicated website about the latest updates.
