@@ -40,6 +40,11 @@ enum DiffAwareClassifier {
         let baseByLocation = baseKeyedByLocation(baseFindings, root: root)
 
         var headKeysSeen = Set<String>()
+        // Keyed by symbol rather than line, so a finding that merely moved when
+        // the PR edited above it is still recognised as surviving. Without this
+        // the exact-line fixed rule below reports it as both pre-existing (from
+        // the head pass) and fixed (from the base pass).
+        var headSurvivors = Set<String>()
         var results: [DiffAwareFinding] = []
         results.reserveCapacity(headFindings.count)
 
@@ -47,6 +52,8 @@ enum DiffAwareClassifier {
             let path = repoRelativePath(finding.fileURL, root: root)
             let key = locationKey(path: path, line: finding.line, function: finding.function)
             headKeysSeen.insert(key)
+            headSurvivors.insert(survivorKey(path: path, function: finding.function,
+                                              category: finding.category))
 
             guard let changed = changedByPath[path] else {
                 // Untouched file: inherited by definition. This is the branch
@@ -95,6 +102,17 @@ enum DiffAwareClassifier {
             guard !headKeysSeen.contains(key) else { continue }
             guard let changed = changedByPath[path] else { continue }
             guard changed.kind != .added else { continue }
+            // The line moved but the same problem is still reported at head: the
+            // PR shifted the code, it did not fix it. Reinstating an identical
+            // finding elsewhere in the file is exactly what this looks like, and
+            // the exact-line check above cannot tell the two apart. Matching on
+            // symbol and category keeps a genuine fix claimable -- removing an
+            // NPD while a leak survives in the same function still counts --
+            // while giving up the claim whenever the finding is merely displaced.
+            let survives = headSurvivors.contains(survivorKey(path: path,
+                                                              function: finding.function,
+                                                              category: finding.category))
+            guard !survives else { continue }
             results.append(DiffAwareFinding(finding: finding, awareness: .fixed))
         }
 
@@ -166,6 +184,13 @@ enum DiffAwareClassifier {
     /// lines above them.
     static func symbolKey(path: String, function: String) -> String {
         "\(path.lowercased())#\(function.lowercased())"
+    }
+
+    /// Key for deciding whether a base finding still exists at head after a line
+    /// shift: symbol plus vulnerability type, so the same category of problem in
+    /// the same function is matched while a different problem there is not.
+    private static func survivorKey(path: String, function: String, category: String) -> String {
+        "\(path.lowercased())#\(function.lowercased())#\(category.lowercased())"
     }
 
     private static func baseKeyedByLocation(_ findings: [ScanFinding],

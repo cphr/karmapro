@@ -773,7 +773,20 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             cellView.textField?.stringValue = f.fileURL.lastPathComponent
             cellView.textField?.toolTip = f.fileURL.path
         case "line":
-            cellView.textField?.stringValue = "\(f.line)"
+            // A "Fixed" row is a finding from the base scan, so its line number
+            // is a base-revision coordinate and will not land on the same code in
+            // the file on disk. Marking it stops a reader from jumping to line N
+            // of the checked-out head file and concluding the function name is
+            // wrong when the two revisions simply number differently.
+            if awareness(for: f) == .fixed {
+                cellView.textField?.stringValue = "\(f.line) (base)"
+                cellView.textField?.toolTip = "Line \(f.line) of the base revision, not of the current file."
+                cellView.textField?.textColor = .secondaryLabelColor
+            } else {
+                cellView.textField?.stringValue = "\(f.line)"
+                cellView.textField?.toolTip = nil
+                cellView.textField?.textColor = .labelColor
+            }
             cellView.textField?.alignment = .right
         case "src":
             cellView.textField?.stringValue = f.scanningSource
@@ -820,7 +833,7 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             case .some(.fixed):
                 cellView.textField?.stringValue = "Fixed"
                 cellView.textField?.textColor = .systemGreen
-                cellView.textField?.toolTip = "Present at the base commit and gone from this pull request."
+                cellView.textField?.toolTip = "Present at the base commit and gone from this pull request. The line number shown is the base revision's."
             case .none:
                 cellView.textField?.stringValue = ""
             }

@@ -264,6 +264,7 @@ enum GitRunner {
         // Diff before checkout so a changed-files-only review can prune the
         // tree before any blob is written to disk.
         progress?("Listing the changed files", 0.7)
+        pinBaseToMergeBase(baseName: baseName, headName: headName, cwd: localPath, auth: auth)
         let changed = try changedFiles(baseRef: baseName, headRef: headName, cwd: localPath, auth: auth)
 
         progress?("Checking out the changed files", 0.85)
@@ -326,6 +327,7 @@ enum GitRunner {
                                progress: progress)
 
         progress?("Listing the changed files", 0.85)
+        pinBaseToMergeBase(baseName: baseName, headName: headName, cwd: workspace, auth: auth)
         let changed = try changedFiles(baseRef: baseName, headRef: headName, cwd: workspace, auth: auth)
 
         if depth == .changedOnly {
@@ -389,6 +391,30 @@ enum GitRunner {
 
     private static func refExists(_ ref: String, cwd: URL) -> Bool {
         (try? run(["rev-parse", "--verify", "--quiet", ref], cwd: cwd)) != nil
+    }
+
+    /// Re-points `baseName` at the merge base of base and head instead of
+    /// leaving it on the base branch's current tip.
+    ///
+    /// `changedFiles` already diffs three-dot, so the patch itself correctly
+    /// ignores commits that landed on the base branch after this pull request
+    /// branched off. Everything that reads the base *revision* did not: the
+    /// worktree scanned as "base", and the base/head finding comparison in
+    /// `DiffAwareClassifier`. Both used the branch tip, so once the branch moved
+    /// on they described a revision the author never saw. Line numbers shift, so
+    /// findings that merely moved were reported as ones this PR had "fixed" --
+    /// for ruby-ruby #19188 that turned 2 real hunks into 23 claimed fixes.
+    ///
+    /// Anchoring base at the merge base keeps both sides in the coordinates the
+    /// pull request was actually written against. Best effort: if the merge base
+    /// cannot be computed (unrelated histories, a fetch that landed without one)
+    /// the existing ref is left alone rather than failing the review.
+    private static func pinBaseToMergeBase(baseName: String, headName: String,
+                                          cwd: URL, auth: GitAuth?) {
+        guard let out = try? run(["merge-base", baseName, headName], cwd: cwd, auth: auth) else { return }
+        let sha = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sha.count >= 7, sha.allSatisfy({ $0.isHexDigit }) else { return }
+        _ = try? run(["update-ref", baseName, sha], cwd: cwd, auth: auth)
     }
 
     /// Keeps exactly the given repository-relative paths and prunes the rest.
