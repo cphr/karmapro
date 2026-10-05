@@ -3,12 +3,10 @@
 ![Karma Pro Splash](HelpSplash.jpg)
 
 Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerability classification, and security auditing application. Karma Pro provides deep architectural inspection, multi-language support, interactive flowcharts, and security tracking.
-
 ## 1. Getting Started & Project Navigation
 - **Opening Files & Workspaces**: Use **File > Open...** project directory onto the Karma Pro window to load it into the sidebar file tree.
 - **Language Filtering**: Karma Pro supports 14 primary languages: **C, C++, Java, C#, Go, Kotlin, Ruby, Python, PHP, Cocoa (Objective-C), Rust, Solidity, Javascript and Swift**, plus an **All Languages** option. Use the language dropdown in the toolbar to isolate files by language.
 - **File Search**: Use the built-in file search window (**Edit > Find in Files...**) to quickly query filenames and navigate across large codebases.
-
 ## 2. Source Viewer, Syntax Highlighting & Code Navigation
 - **Syntax Highlighting**: Custom tokenisers and highlighters provide distinct color schemes for keywords, strings, comments, and identifiers across all supported languages.
 - **Clickable Functions**: Function names defined in source files are automatically underlined and linked. Clicking a function name jumps directly to its definition and instantly opens its transitive same-file call graph and dataflow in the bottom pane.
@@ -19,14 +17,12 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
   - **Backtrace Analyser…**: opens the **Backtrace Analyser**. Paste a crash/stack trace (from the debugger, a log, or a file such as `stacktrace.txt`) and click **Analyse** Karma Pro parses the frames and renders a clickable left-to-right **call-stack diagram**. Frames are resolved relative to the currently open project — click a frame to open its source line. Frames that cannot be resolved are shown in red (the trace must originate from the open project).
   - **(AI) How to fix it**: sends the line under the cursor, together with the surrounding project context, to the **AI Assistant** and asks for guidance on fixing the issue on that line (for example, how to remediate a vulnerability flagged by the scanner). Requires the AI Assistant to be connected to OpenRouter with an API key, or Ollama (see section 7).
   - **Simulate <function> in the Debugger** experimental: shown when you right-click a function/method name. Opens the **Karma Pro Debugger**, a lightweight dynamic simulator that steps through the selected function line by line. Right-click a function and choose this item to begin, the window opens scoped to just that function, with the current line highlighted. Use **Step Over**, **Step Into**, **Step Back** and **Reset** at the top of the window to control execution, or **Play** to run automatically. The debugger follows calls into functions defined elsewhere in the open project, switching the source view  to the callee and returning when the call completes. Parameters shown are editable values you can change before stepping. The simulation is approximate and may not cover every language construct.
-
 ## 3. Diagrams: Control Flow & Data Flow
 - **Control Flow Diagrams**: Visualizes cyclomatic complexity, conditional branches (`if`/`else`), and loops (`while`/`for`) as an interactive flowchart (`FlowChartView`).
 - **Dataflow Analysis**: Traces variable assignments, function parameter taint propagation, and inter-procedural call graphs within the same file to reveal how untrusted input reaches critical sinks.
 - **Find external entries**: scans the whole project and lists every place where the application receives input from outside, remote-facing receive APIs such as HTTP request parameters, deep links, push payloads, web/client responses, and blockchain transaction input, plus local sources like environment variables and command-line arguments, files. Results are grouped by category and tagged by locality (Remote, Local). Selecting an entry plots its data-flow diagram: an origin box for the locality, then the entry point and the functions the received value flows through. Rows show project-relative paths and clicking a graph node jumps to the exact source line in the source viewer.
 - **Show reachability of 'function'** right-click opens a diagram of the function's or method's position in the currently project. It walks the full caller list, every function that calls it, each of those callers' own callers, and so on, all the way up to the top, where a box shows where that it ends: Remote, Local or if no entry point reaches it at all, an amber topmost box confirming the end of the walk. 
 - **Complexity distribution** window you see a scatter plot where every source file's functions are laid out left-to-right in source order (X axis) with their cyclomatic complexity measured on the Y axis. Each function is a colour-coded point labelled with its complexity number. Hover any point to see its file, function name, line and complexity, or click it to jump straight to that function in the source viewer. Note in large projects it can be a bit slow to plot.
-
 ## 4. Security Scanning & Vulnerability Analysis
 - **Multi-Language Security Scanner**: Karma Pro parses source code using robust tokenizers, AST parsers, and inter-procedural data-flow analysis, performing precise taint tracking rather than simple regex matching.
 - **Supported Languages**: The security analyser covers 13 primary programming languages with deep AST integration: **C, C++, Objective-C (Cocoa), Java, C#, Go, Kotlin, Ruby, Python, PHP, Rust, Solidity, and Swift**.
@@ -35,7 +31,6 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
 - **Mobile Security Checks**: Dedicated Android (Java) and iOS/Cocoa (Objective-C) rule sets cover platform-specific risk: WebView hardening (JavaScript bridges, file/universal access, arbitrary-loads ATS bypasses), trust-manager / hostname-verifier bypasses, raw SQL, clipboard and pasteboard leakage, UserDefaults and Keychain accessibility misconfiguration, deprecated UIWebView, JavaScript injection, notification/keyed-archiver misuse, deep-link / open-URL exposure, file-protection level, location tracking, SMS/mail composition, and privacy-sensitive contact access etc.
 - **Severity & Exploitability**: Findings are graded by severity (`Critical`, `High`, `Medium`, `Low`), exploitability scores, reachability (whether reachable from entry points), and precise source-to-sink taint paths.
 - **Engine Distinction**: Distinguishes findings detected structurally over the parsed Abstract Syntax Tree (**AST**) from heuristic pattern matches (**Heuristic**). Note: if you also chose AI scan to be performed, you will also see AI results.
-
 ## 5. Bayesian Classifier, ML Trainer & Model Import/Export
 - **Bayesian Vulnerability Classifier**: A probabilistic machine-learning classifier that analyses token frequencies and log-odds to evaluate code snippets for vulnerability likelihood.
 - **How the ML classifier works**: Karma Pro's ML classification follows the *[Karma* method](https://cipher.org.uk/2026/02/08/Karma-Automated-source-code-defect-identification-method/) an automated, source-code defect identification technique, a **Bayes classifier** is trained on empirical data so it can point to "interesting pieces" of code in any language. The training data comes from **software patches** (.patch/.diff files): in a patch, lines marked `-` are the removed (defective) lines and lines marked `+` are the added (correcting) lines. The classifier's training phase builds a model of prior probabilities, e.g. how often a given token/keyword appears in defective lines versus safe ones.
@@ -45,18 +40,14 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
   - **Export Model**: Save your trained Bayesian classifier weights and token distributions to a local Karma Pro file to share across teams or back up.
   - **Import Model**: Load previously exported Bayesian model JSON files into Karma Pro to instantly apply pretrained classification logic.
 - **ML Scan**: Run probabilistic scans across project files to discover hidden risks alongside confirmed findings. The ML pass is *complementary* to the ruleset/AST scanner: it surfaces probabilistic candidate defects (and can catch language-agnostic "interesting" numbers, variables and functions) that hard-coded rules may miss, while the deterministic scanner provides confirmed, taint-verified findings.
-
 ## 6. Security Bugs Tracker Tool
 The **Security bugs tracker** is a built-in vulnerability tracking tool that helps you organise and work through discovered vulnerabilities.
-
 - **Create & manage reports**: Add, view, edit, and delete bug reports with a title, severity, exploitability, status, description, package name, and version.
 - **Use preset templates**: common vulnerability titles (SQLi, XSS, RCE, crypto, memory, mobile, cloud, business logic etc) with ready-made descriptions or write your own.
 - **Search**: Filter bugs by title, description, severity, status, package, or ID.
 - **Triage**: Color-coded severity and exploitability in the list and details, statuses track.
 - **Backup & import**: Export all reports to a .karmapro JSON backup (optionally password-protected) and import them back.
-
 Reports persist locally (survive app restarts) and live in the Karma Pro application support directory.
-
 ## 7. AI Assistant 
 The **AI** toolbar button (right of the Bugs button) opens the AI Assistant window, which connects Karma Pro to [Ollama](https://ollama.com/) or to [OpenRouter](https://openrouter.ai) so you can query large language models about the currently open project:
 - **Connect**: Paste your OpenRouter API key (from `openrouter.ai/keys`) into the key field and click **Connect**. The key is saved on your machine and remembered across launches.
@@ -65,10 +56,8 @@ The **AI** toolbar button (right of the Bugs button) opens the AI Assistant wind
 - **Prompt Templates Dropdown**: Ships with built-in templates. Selecting an entry pastes its text into the prompt editor at the cursor position.
 - **Managing Templates**: Use **Add…** to create a new template (a title for the dropdown plus prompt text), **Edit…** to modify the selected template (built-in ones included), and **Remove** to delete it. All template changes are stored per-user and survive relaunches.
 - **Import / Export Prompts**: **Export…** saves every stored prompt template (built-in and custom) to a file you can back up or share. **Import…** adds prompts from such a file entries that are already stored.
-
 ## 8. Private Research Wiki
 The **Wiki** toolbar button (next to Notes) opens a private research wiki shared across all projects. Write pages in a rich-text editor with a white background, hyperlink selected words instantly with the **Link…** button (or type `[[Page Name]]`), and click any link to open the page, creating it if it doesn't exist yet. Pages can be listed, searched, renamed and deleted, auto-save whenever their window closes, and the whole wiki can be backed up to a `.karmawiki` archive, optionally encrypted with a password and imported back later.
-
 ## 9. Pull Request Monitoring & Review Scanning
 The **Karma Pro** menu bar icon can watch repositories on **GitHub**, **GitLab**, **Bitbucket** and **Gitea/Forgejo**, tell you when a pull request opens or changes, and check that pull request and scan it. Monitoring is off by default.
 **Adding a public repository**
@@ -104,9 +93,9 @@ Choosing **Review**, from a notification, or from the banner on a repository you
 - **Diff**: changed files open side by side, base against head, with findings shown against them.
 - **Report**: **Report** produces a saveable Markdown document with the pull request's author, branches, head commit, link, files changed and last updated time, plus the findings the scan introduced/
 **Scan depth** is chosen per repository when you add it:
-- **Changed files only** Only the files this pull request adds or modifies — fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing. |
+- **Changed files only** Only the files this pull request adds or modifies, fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing. |
 - **Full project** The whole project at the head commit, slower and larger. When the change touches shared code and you need cross-file taint analysis and reachability to work normally.
 **Closing a review**: **Close Review** ends the session, clears the file tree and every pane, and removes the on-disk checkouts. Checkouts and findings are cached between reviews for speed; **Manage Repositories** shows the cache size and has **Clear Cache**, which is refused while a review is open, when you are not reviewing however you clear the local cache.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
-**https://reviewcode.org**
+**ReviewCode.org** is Karma Pro's dedicated website
 **Brought to you by cipher.org.uk**
