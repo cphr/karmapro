@@ -69,6 +69,24 @@ final class AIWindowController: NSWindowController {
     /// keeps the display updating in smooth, even steps.
     private var streamRenderDirty = false
     private var streamRenderTick: DispatchWorkItem?
+    /// Rendered transcript entries. Append-only, so a cached rendering stays
+    /// valid until the entry count changes.
+    private var transcriptCache: NSAttributedString?
+    private var transcriptCacheRevision = -1
+    /// Source and rendering of the immutable head of the in-flight answer:
+    /// every block up to the last blank line outside a code fence.
+    private var settledSource = ""
+    private var settledCache: NSAttributedString?
+    /// What the text storage is known to start with. Characters before
+    /// `installedPrefixLength` are already on screen and final, so a streaming
+    /// update writes only past that point and their layout is never touched.
+    private var installedPrefixLength = 0
+    private var installedSettledSource = ""
+    private var installedTranscriptRevision = -1
+    /// Whether the "Thinking…" overlay is currently up, so its animation is
+    /// only started or stopped on a real transition. Starts unset so the first
+    /// refresh always applies, including the one that hides it at setup.
+    private var thinkingOverlayVisible: Bool?
     /// Agent state: conversation history for tool-calling rounds. Persists
     /// across prompts in this session — follow-up prompts and Continue keep
     /// the full context; "New Chat" clears it.
@@ -873,6 +891,7 @@ final class AIWindowController: NSWindowController {
         cancelRequested = false
         usedFallback = false
         responseTextView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+        invalidateStreamLayout()
         refreshThinkingIndicator()
         updateControlButtons()
         setStatus("New conversation — the previous context was cleared.", color: .secondaryLabelColor)
@@ -888,6 +907,7 @@ final class AIWindowController: NSWindowController {
                             ["role": "user", "content": content]]
             transcript = [.turnMarker(marker)]
             responseTextView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+            invalidateStreamLayout()
         } else {
             if let first = conversation.first, first["role"] as? String == "system" {
                 conversation[0]["content"] = Self.systemPrompt(projectRoot: projectRootURL)
@@ -1052,7 +1072,7 @@ final class AIWindowController: NSWindowController {
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
                     self.transcript.append(.tool(name: tc.name, args: tc.arguments, output: String(output.prefix(4000))))
-                    self.renderStreamingResponse()
+                    self.scheduleStreamingRender()
                 }
                 group.leave()
             }
@@ -1193,50 +1213,190 @@ final class AIWindowController: NSWindowController {
     /// prompt markers, tool activity, thinking, markdown answers) and the
     /// in-flight reasoning + partial answer stream below them.
     func renderStreamingResponse() {
-        let combined = NSMutableAttributedString()
         let mono = Self.terminalBaseFont(size: 11)
-        for entry in transcript {
-            switch entry {
-            case .turnMarker(let text):
-                let oneLine = text.replacingOccurrences(of: "\n", with: " ")
-                let label = oneLine.count > 100 ? String(oneLine.prefix(100)) + "…" : oneLine
-                combined.append(NSAttributedString(string: "> \(label)\n", attributes: [
-                    .font: mono, .foregroundColor: terminalDim
-                ]))
-            case .tool(let name, let args, let output):
-                combined.append(NSAttributedString(string: Self.toolDisplayLabel(name: name, args: args) + "\n", attributes: [
-                    .font: mono, .foregroundColor: terminalAccent
-                ]))
-                let out = Self.toolDisplayOutput(output)
-                combined.append(NSAttributedString(string: "  \(out)\n\n", attributes: [
-                    .font: mono, .foregroundColor: terminalDim
-                ]))
-            case .answer(let text):
-                combined.append(attributedMarkdownResponse(text))
-                combined.append(NSAttributedString(string: "\n", attributes: [
-                    .font: mono, .foregroundColor: terminalForeground
-                ]))
+
+        // Transcript entries are append-only, so reuse their rendering unless
+        // a turn marker, tool result or answer was added.
+        if transcriptCacheRevision != transcript.count {
+            let built = NSMutableAttributedString()
+            for entry in transcript {
+                switch entry {
+                case .turnMarker(let text):
+                    let oneLine = text.replacingOccurrences(of: "\n", with: " ")
+                    let label = oneLine.count > 100 ? String(oneLine.prefix(100)) + "…" : oneLine
+                    built.append(NSAttributedString(string: "> \(label)\n", attributes: [
+                        .font: mono, .foregroundColor: terminalDim
+                    ]))
+                case .tool(let name, let args, let output):
+                    built.append(NSAttributedString(string: Self.toolDisplayLabel(name: name, args: args) + "\n", attributes: [
+                        .font: mono, .foregroundColor: terminalAccent
+                    ]))
+                    let out = Self.toolDisplayOutput(output)
+                    built.append(NSAttributedString(string: "  \(out)\n\n", attributes: [
+                        .font: mono, .foregroundColor: terminalDim
+                    ]))
+                case .answer(let text):
+                    built.append(attributedMarkdownResponse(text))
+                    built.append(NSAttributedString(string: "\n", attributes: [
+                        .font: mono, .foregroundColor: terminalForeground
+                    ]))
+                }
             }
+            transcriptCache = built
+            transcriptCacheRevision = transcript.count
         }
-        if !streamAccumulated.isEmpty {
-            combined.append(attributedMarkdownResponse(streamAccumulated))
+
+        // Freeze the blocks of the in-flight answer that can no longer change
+        // and re-parse only the block still being written. Without this the
+        // same source text is re-parsed from scratch on every tick, and a
+        // half-typed `**bold**` or code fence flips between literal and styled
+        // as it completes, which reflows the lines above and makes the pane
+        // jump around.
+        let split = Self.splitSettledStream(streamAccumulated)
+        if split.settled != settledSource {
+            settledSource = split.settled
+            settledCache = split.settled.isEmpty ? nil : attributedMarkdownResponse(split.settled)
+        }
+
+        let prefix = NSMutableAttributedString()
+        if let transcriptCache { prefix.append(transcriptCache) }
+        if let settledCache { prefix.append(settledCache) }
+
+        let tail = NSMutableAttributedString()
+        if !split.live.isEmpty {
+            tail.append(attributedMarkdownResponse(split.live))
         }
         // Blinking-cursor style block while the model is still writing.
         if requestInFlight {
-            combined.append(NSAttributedString(string: "▍", attributes: [
+            tail.append(NSAttributedString(string: "▍", attributes: [
                 .font: mono,
                 .foregroundColor: terminalAccent
             ]))
         }
-        responseTextView.textStorage?.setAttributedString(combined)
-        responseTextView.scrollToEndOfDocument(nil)
+
+        applyStreamUpdate(prefix: prefix, tail: tail)
         refreshThinkingIndicator()
+    }
+
+    /// Splits streamed markdown into the part that has settled and the block
+    /// still being written. A block ends at a blank line, but only outside a
+    /// fenced code block: an unclosed fence still changes how everything after
+    /// it is styled, so nothing behind one is treated as settled.
+    static func splitSettledStream(_ text: String) -> (settled: String, live: String) {
+        guard !text.isEmpty else { return ("", "") }
+        let lines = text.components(separatedBy: "\n")
+        // Count fences the way `attributedMarkdownResponse` does, so both
+        // halves style identically when rendered apart.
+        var fenceCount = 0
+        var boundary = -1
+        for (index, line) in lines.enumerated() {
+            fenceCount += line.components(separatedBy: "```").count - 1
+            if fenceCount % 2 == 0, line.trimmingCharacters(in: .whitespaces).isEmpty {
+                boundary = index
+            }
+        }
+        guard boundary >= 0 else { return ("", text) }
+        var settled = lines[0...boundary].joined(separator: "\n")
+        if boundary + 1 < lines.count { settled += "\n" }
+        let live = boundary + 1 < lines.count
+            ? lines[(boundary + 1)...].joined(separator: "\n")
+            : ""
+        return (settled, live)
+    }
+
+    /// Writes a streaming update into the response pane.
+    ///
+    /// While tokens arrive this replaces only the text after the frozen prefix
+    /// instead of the whole document. The prefix keeps its exact characters,
+    /// attributes and indices, so the layout manager never invalidates it and
+    /// the text already on screen cannot shift. The scroll position is only
+    /// followed when the user was already at the bottom, so scrolling up to
+    /// read earlier output is no longer fought by the stream.
+    private func applyStreamUpdate(prefix: NSAttributedString, tail: NSAttributedString) {
+        guard let storage = responseTextView.textStorage else { return }
+        let wasPinned = responsePanePinnedToBottom()
+        let savedOrigin = responseTextView.visibleRect.origin
+
+        let tailOnly = installedTranscriptRevision == transcript.count
+            && settledSource.hasPrefix(installedSettledSource)
+            && storage.length >= installedPrefixLength
+            && prefix.length >= installedPrefixLength
+
+        storage.beginEditing()
+        if tailOnly {
+            let patch = NSMutableAttributedString(attributedString: prefix.attributedSubstring(
+                from: NSRange(location: installedPrefixLength,
+                              length: prefix.length - installedPrefixLength)))
+            patch.append(tail)
+            storage.replaceCharacters(
+                in: NSRange(location: installedPrefixLength,
+                            length: storage.length - installedPrefixLength),
+                with: patch)
+        } else {
+            let whole = NSMutableAttributedString(attributedString: prefix)
+            whole.append(tail)
+            storage.setAttributedString(whole)
+        }
+        storage.endEditing()
+
+        installedPrefixLength = prefix.length
+        installedSettledSource = settledSource
+        installedTranscriptRevision = transcript.count
+
+        if wasPinned {
+            responseTextView.scrollRangeToVisible(NSRange(location: storage.length, length: 0))
+        } else if !tailOnly {
+            // A full rebuild resets the scroll origin to the top; put the user
+            // back where they were reading.
+            restoreScrollOrigin(savedOrigin)
+        }
+    }
+
+    /// True when the pane is scrolled to the bottom, within a few points.
+    ///
+    /// The document height has to come from the layout manager's used rect.
+    /// `NSTextContainer.size.height` is not it: for a vertically resizable
+    /// text view whose container tracks the view width, AppKit leaves it at a
+    /// 10,000,000 sentinel, which would make this test false in every state
+    /// and silently stop the pane from ever following the stream.
+    private func responsePanePinnedToBottom() -> Bool {
+        guard let container = responseTextView.textContainer,
+              let layoutManager = responseTextView.layoutManager else { return true }
+        layoutManager.ensureLayout(for: container)
+        let documentHeight = layoutManager.usedRect(for: container).height
+            + responseTextView.textContainerInset.height * 2
+        return documentHeight - responseTextView.visibleRect.maxY <= 6
+    }
+
+    private func restoreScrollOrigin(_ origin: NSPoint) {
+        guard let layoutManager = responseTextView.layoutManager,
+              let container = responseTextView.textContainer else { return }
+        layoutManager.ensureLayout(for: container)
+        let documentHeight = layoutManager.usedRect(for: container).height
+            + responseTextView.textContainerInset.height * 2
+        let visibleHeight = responseTextView.visibleRect.height
+        let maxY = max(0, documentHeight - visibleHeight)
+        responseTextView.scroll(NSPoint(x: origin.x, y: min(max(0, origin.y), maxY)))
+    }
+
+    /// Drops every cached rendering, forcing the next render to rebuild the
+    /// pane. Needed when the transcript is replaced rather than appended to.
+    private func invalidateStreamLayout() {
+        transcriptCache = nil
+        transcriptCacheRevision = -1
+        settledSource = ""
+        settledCache = nil
+        installedPrefixLength = 0
+        installedSettledSource = ""
+        installedTranscriptRevision = -1
     }
 
     /// Shows the rotating "Thinking…" indicator overlaid on the response pane
     /// while the model is reasoning; hides it once the answer streams in.
     private func refreshThinkingIndicator() {
         let show = modelIsThinking && requestInFlight
+        guard show != thinkingOverlayVisible else { return }
+        thinkingOverlayVisible = show
         thinkingSpinner.isHidden = !show
         thinkingLabel.isHidden = !show
         if show {
