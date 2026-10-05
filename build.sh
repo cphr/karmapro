@@ -147,6 +147,9 @@ SOURCES=(
   Sources/pr/MonitoredReposWindowController.swift
 )
 
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Minimum macOS the built app will run on. Keep it as low as the code allows so
@@ -154,8 +157,30 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # would otherwise prevent the app from launching on anything older).
 MIN_MACOS="12.0"
 
-echo "Compiling Karma Pro…"
-swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" -swift-version 5 -o "$BIN" "${SOURCES[@]}"
+# Architectures to build. Both slices are compiled and then combined into one
+# universal binary, so the app runs natively on Intel Macs and on Apple Silicon
+# without needing Rosetta.
+# Pass --intel-only to skip the arm64 slice while iterating on an Intel Mac.
+ARCHS=("x86_64" "arm64")
+case "${1:-}" in
+  --intel-only) ARCHS=("x86_64") ;;
+  "") ;;
+  *)
+    echo "Unknown option: $1 (expected no arguments, or --intel-only)" >&2
+    exit 2
+    ;;
+esac
+
+echo "Compiling Karma Pro (${ARCHS[*]})…"
+SLICES=()
+for ARCH in "${ARCHS[@]}"; do
+  SLICE="$BUILD_DIR/$ARCH"
+  echo "  - $ARCH"
+  swiftc -O -target "${ARCH}-apple-macos${MIN_MACOS}" -swift-version 5 -o "$SLICE" "${SOURCES[@]}"
+  SLICES+=("$SLICE")
+done
+lipo -create "${SLICES[@]}" -output "$BIN"
+echo "Built binary: $(lipo -archs "$BIN")"
 
 echo "Copying Info.plist and icon…"
 # Always copy the Info.plist and icon from the source resources dir into the bundle,
