@@ -93,7 +93,7 @@ Choosing **Review**, from a notification, or from the banner on a repository you
 - **Diff**: changed files open side by side, base against head, with findings shown against them.
 - **Report**: **Report** produces a saveable Markdown document with the pull request's author, branches, head commit, link, files changed and last updated time, plus the findings the scan introduced/
 **Scan depth** is chosen per repository when you add it:
-- **Changed files only** Only the files this pull request adds or modifies, fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing. |
+- **Changed files only** Only the files this pull request adds or modifies, fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing.
 - **Full project** The whole project at the head commit, slower and larger. When the change touches shared code and you need cross-file taint analysis and reachability to work normally.
 **Closing a review**: **Close Review** ends the session, clears the file tree and every pane, and removes the on-disk checkouts. Checkouts and findings are cached between reviews for speed; **Manage Repositories** shows the cache size and has **Clear Cache**, which is refused while a review is open, when you are not reviewing however you clear the local cache.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
