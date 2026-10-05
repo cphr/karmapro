@@ -128,6 +128,24 @@ private final class SplashView: NSView {
             xRadius: 4, yRadius: 4).fill()
         site.draw(at: siteOrigin, withAttributes: footerAttrs)
         credit.draw(at: creditOrigin, withAttributes: footerAttrs)
+
+        // --- Version, bottom-right ---
+        // Read from the bundle rather than hardcoded, so it can never disagree
+        // with what actually shipped.
+        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            let text = "Version \(version)" as NSString
+            let size = text.size(withAttributes: footerAttrs)
+            let origin = NSPoint(x: bounds.width - 10 - size.width, y: 8)
+            // Its own pill: the scrim at the top of the splash does not reach
+            // the bottom, so without one the text would be unreadable over
+            // whatever part of the background image sits behind it.
+            NSColor.black.withAlphaComponent(0.55).setFill()
+            NSBezierPath(roundedRect:
+                NSRect(x: origin.x - 5, y: origin.y - 3,
+                       width: size.width + 10, height: size.height + 6),
+                xRadius: 4, yRadius: 4).fill()
+            text.draw(at: origin, withAttributes: footerAttrs)
+        }
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }

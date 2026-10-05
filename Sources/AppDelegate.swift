@@ -22,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // callback so the menu-bar item exists for the whole session.
         installPullRequestSupport()
 
+        // Starts the daily update gate. Nothing is requested until the user has
+        // opted in, so a fresh install contacts GitHub for nothing.
+        updateTarget.install()
+
         // Show the "Karma Pro" splash for 3 seconds before revealing the main window.
         let splash = SplashWindowController()
         splashController = splash

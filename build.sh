@@ -12,6 +12,9 @@ SOURCES=(
   Sources/main/MainWindowController.swift
   Sources/main/FileTreeViewController.swift
   Sources/main/SourceViewer.swift
+  Sources/main/VersionComparator.swift
+  Sources/main/UpdateSettings.swift
+  Sources/main/UpdateChecker.swift
   Sources/utils/TypeResolver.swift
   Sources/languages/JSFunctionParser.swift
   Sources/languages/JSParser.swift
