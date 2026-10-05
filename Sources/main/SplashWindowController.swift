@@ -110,16 +110,24 @@ private final class SplashView: NSView {
             .font: NSFont.systemFont(ofSize: 10, weight: .regular),
             .foregroundColor: NSColor.white.withAlphaComponent(0.7)
         ]
-        let footer = "brought to you by cipher.org.uk" as NSString
-        let fsz = footer.size(withAttributes: footerAttrs)
-        let footerOrigin = NSPoint(x: 10, y: 8)
+        // The address of the site the credit belongs to, stacked above the
+        // credit itself rather than replacing it.
+        let site = "https://reviewcode.org" as NSString
+        let credit = "brought to you by cipher.org.uk" as NSString
+        let ssz = site.size(withAttributes: footerAttrs)
+        let csz = credit.size(withAttributes: footerAttrs)
+        let creditOrigin = NSPoint(x: 10, y: 8)
+        let siteOrigin = NSPoint(x: 10, y: creditOrigin.y + csz.height + 2)
         // Black underlay pill so the credit stays legible on any background.
+        let pillBottom = creditOrigin.y - 3
+        let pillTop = siteOrigin.y + ssz.height + 3
         NSColor.black.withAlphaComponent(0.55).setFill()
         NSBezierPath(roundedRect:
-            NSRect(x: footerOrigin.x - 5, y: footerOrigin.y - 3,
-                   width: fsz.width + 10, height: fsz.height + 6),
+            NSRect(x: creditOrigin.x - 5, y: pillBottom,
+                   width: max(ssz.width, csz.width) + 10, height: pillTop - pillBottom),
             xRadius: 4, yRadius: 4).fill()
-        footer.draw(at: footerOrigin, withAttributes: footerAttrs)
+        site.draw(at: siteOrigin, withAttributes: footerAttrs)
+        credit.draw(at: creditOrigin, withAttributes: footerAttrs)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }

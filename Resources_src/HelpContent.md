@@ -108,5 +108,5 @@ Choosing **Review**, from a notification, or from the banner on a repository you
 - **Full project** The whole project at the head commit, slower and larger. When the change touches shared code and you need cross-file taint analysis and reachability to work normally.
 **Closing a review**: **Close Review** ends the session, clears the file tree and every pane, and removes the on-disk checkouts. Checkouts and findings are cached between reviews for speed; **Manage Repositories** shows the cache size and has **Clear Cache**, which is refused while a review is open, when you are not reviewing however you clear the local cache.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
-
+**https://reviewcode.org**
 **Brought to you by cipher.org.uk**
