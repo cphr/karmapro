@@ -60,9 +60,13 @@ public final class CCFunctionParser {
             if ch == 0x2F && next == 0x2A { // /*
                 i = skipBlockComment(i); continue
             }
-            // skip preprocessor / #include etc (rest of line)
-            if ch == 0x23 { // #
-                i = skipToLineEnd(i); continue
+            // Skip a preprocessor directive and any lines it continues onto.
+            // Only when '#' opens the line: a '#' mid-line is macro
+            // stringification (`prefix ": " #ndtype`), and treating it as a
+            // directive discards the rest of that line, swallowing the closing
+            // ')' and leaving parenDepth permanently off by one.
+            if ch == 0x23, isDirectiveStart(i) { // #
+                i = skipPreprocessor(i); continue
             }
             // skip string literals (and Java text blocks / char literals)
             if ch == 0x22 || ch == 0x27 { // " '
@@ -194,7 +198,7 @@ public final class CCFunctionParser {
             if isWhitespace(ch) { i += 1; continue }
             if ch == 0x2F && next == 0x2F { i = skipToLineEnd(i); continue }
             if ch == 0x2F && next == 0x2A { i = skipBlockComment(i); continue }
-            if ch == 0x23 { i = skipToLineEnd(i); continue }
+            if ch == 0x23, isDirectiveStart(i) { i = skipPreprocessor(i); continue }
             if ch == 0x22 || ch == 0x27 { i = skipString(i, quote: ch); continue }
 
             // `@interface` — treat the '@' + keyword together. Detect the keyword but
@@ -335,6 +339,36 @@ public final class CCFunctionParser {
         var j = i + 1
         while j < length && isWhitespace(ns.character(at: j)) { j += 1 }
         return j < length && ns.character(at: j) == 0x28
+    }
+
+    /// True when the '#' at `i` is the first non-blank character on its line,
+    /// i.e. a real directive rather than a macro stringification operator.
+    private func isDirectiveStart(_ i: Int) -> Bool {
+        var j = i
+        while j > 0 {
+            let ch = ns.character(at: j - 1)
+            if ch == 0x0A { return true }
+            if !isWhitespace(ch) { return false }
+            j -= 1
+        }
+        return true
+    }
+
+    /// Skips a directive plus every line it continues onto via a trailing
+    /// backslash. Skipping only the first line would count the braces and
+    /// parens of a multi-line macro body as real code — `#define M() do { \`
+    /// leaves its matching `}` on a line the parser still walks — which
+    /// drives brace depth negative and breaks definition detection for the
+    /// rest of the file.
+    private func skipPreprocessor(_ i: Int) -> Int {
+        var j = skipToLineEnd(i)
+        while j > i, j < length, ns.character(at: j - 1) == 0x5C {
+            var k = j
+            while k < length, isWhitespace(ns.character(at: k)) { k += 1 }
+            if k == j { break }
+            j = skipToLineEnd(k)
+        }
+        return j
     }
 
     private func skipToLineEnd(_ i: Int) -> Int {
