@@ -1087,34 +1087,49 @@ struct CFamilyWalkDetector {
 
     private enum ExtremeKind: Equatable { case max, min }
 
-    private struct ExtraState {
+    private struct ExtraState: Equatable {
         var nullVars = Set<String>()
+        /// Field names holding NULL, keyed by the plain base variable they were
+        /// stored through: `n->next = NULL` records `next` under `n`.
+        var nullFields: [String: Set<String>] = [:]
         var extremeMax = Set<String>()
         var extremeMin = Set<String>()
 
         mutating func clear(_ name: String) {
             nullVars.remove(name)
+            // Reassigning the base replaces the object, so what was known
+            // about its fields no longer applies.
+            nullFields.removeValue(forKey: name)
             extremeMax.remove(name)
             extremeMin.remove(name)
         }
     }
 
-    /// Source-ordered pass emitting, per function:
-    ///  - **Null Pointer Dereference**: dereferencing a variable last assigned
-    ///    `NULL`/`0` (`*p`, `p[i]`, `p->field`) — the classic
-    ///    `int *ptr = NULL; printf("%d", *ptr);`.
-    ///  - **Integer Overflow**: arithmetic on a value assigned from an extreme
-    ///    constant (`max_int = INT_MAX; max_int + 1`).
+    /// Path-sensitive pass emitting, per function:
+    ///  - **Null Pointer Dereference**: dereferencing a variable that is NULL
+    ///    on at least one path reaching the dereference (`*p`, `p[i]`,
+    ///    `p->field`) — the classic `int *ptr = NULL; printf("%d", *ptr);`.
+    ///  - **Integer Overflow**: arithmetic on a value that is extreme-constant
+    ///    on at least one such path (`max_int = INT_MAX; max_int + 1`).
     ///  - **Return of Local Variable Address**: returning a stack-local array
     ///    (`char localString[] = ...; return localString;`) or `&local`.
+    ///
+    /// Control flow is followed rather than assumed: branches fork the state,
+    /// arms that `return`/`break`/`continue` do not contribute to the join at
+    /// their target, and the surviving paths are unioned so a value that is
+    /// NULL anywhere is tracked after the join.
     private func extraSafetyFindings(fn: CFunctionDef, reached: Bool) -> [CFamilyWalkFinding] {
         var state = ExtraState()
         var findings: [CFamilyWalkFinding] = []
         let localArrays = stackArrayNames(of: fn)
         let localNames = declaredNames(in: fn.body)
-        extraWalk(fn.body, fn: fn, reached: reached, state: &state, findings: &findings,
-                  localArrays: localArrays, localNames: localNames)
-        return findings
+        var exits = FlowExits()
+        _ = extraWalk(fn.body, fn: fn, reached: reached, state: &state, findings: &findings,
+                      localArrays: localArrays, localNames: localNames, exits: &exits)
+        // Loop bodies are walked a second time to cover their back edge, which
+        // can re-emit something the first pass already reported.
+        var seen = Set<String>()
+        return findings.filter { seen.insert("\($0.offset)|\($0.category)").inserted }
     }
 
     /// Names declared as stack-local arrays (`char buf[10]`, `int a[] = {...}`,
@@ -1143,19 +1158,60 @@ struct CFamilyWalkDetector {
         return out
     }
 
+    /// Where control goes after a statement. The three non-fall-through
+    /// outcomes matter because they join at different points: `break` leaves an
+    /// enclosing switch/loop, `continue` feeds the loop's back edge, and
+    /// `return`/`goto` reach neither.
+    private enum FlowOutcome: Equatable {
+        case fellThrough
+        case broke
+        case continued
+        case returned
+    }
+
+    /// States captured while walking nested constructs, drained by whichever
+    /// switch or loop encloses the `break`/`continue` that produced them.
+    private struct FlowExits {
+        var breaks: [ExtraState] = []
+        var continues: [ExtraState] = []
+    }
+
+    private static func union(_ a: ExtraState, _ b: ExtraState) -> ExtraState {
+        var r = a
+        r.nullVars.formUnion(b.nullVars)
+        r.extremeMax.formUnion(b.extremeMax)
+        r.extremeMin.formUnion(b.extremeMin)
+        for (base, fields) in b.nullFields { r.nullFields[base, default: []].formUnion(fields) }
+        return r
+    }
+
+    private static func union(_ states: [ExtraState]) -> ExtraState? {
+        guard var acc = states.first else { return nil }
+        for s in states.dropFirst() { acc = union(acc, s) }
+        return acc
+    }
+
+    /// Returns how control leaves `stmt`. In addition to the return value,
+    /// `exits` accumulates the states carried by `break`/`continue` so the
+    /// enclosing construct can join them where they actually land.
     private func extraWalk(_ stmt: CStmt, fn: CFunctionDef, reached: Bool,
                            state: inout ExtraState, findings: inout [CFamilyWalkFinding],
-                           localArrays: Set<String>, localNames: Set<String>) {
+                           localArrays: Set<String>, localNames: Set<String>,
+                           exits: inout FlowExits) -> FlowOutcome {
         switch stmt {
         case .block(let arr):
             for s in arr {
-                extraWalk(s, fn: fn, reached: reached, state: &state, findings: &findings,
-                          localArrays: localArrays, localNames: localNames)
+                let outcome = extraWalk(s, fn: fn, reached: reached, state: &state,
+                                        findings: &findings, localArrays: localArrays,
+                                        localNames: localNames, exits: &exits)
+                if outcome != .fellThrough { return outcome }
             }
+            return .fellThrough
         case .expr(let e):
             detectNullDerefs(in: e, fn: fn, reached: reached, state: state, findings: &findings)
             detectConstantOverflow(in: e, fn: fn, reached: reached, state: state, findings: &findings)
             updateState(from: e, state: &state)
+            return .fellThrough
         case .declaration(let d):
             if case .variable(_, let name, let initExpr) = d.kind {
                 if let initExpr = initExpr {
@@ -1166,52 +1222,120 @@ struct CFamilyWalkDetector {
                     updateState(rhs: initExpr, for: name, state: &state)
                 }
             }
+            return .fellThrough
         case .ifStmt(let cond, let thenBranch, let elseBranch, _):
             detectNullDerefs(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             detectConstantOverflow(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             updateState(from: cond, state: &state)
-            extraWalk(thenBranch, fn: fn, reached: reached, state: &state, findings: &findings,
-                      localArrays: localArrays, localNames: localNames)
-            if let elseBranch = elseBranch {
-                extraWalk(elseBranch, fn: fn, reached: reached, state: &state, findings: &findings,
-                          localArrays: localArrays, localNames: localNames)
+            // Each arm starts from the state at the branch, refined by what the
+            // condition proves for that arm, and contributes to the join only
+            // if control actually falls out the bottom of the arm.
+            let entry = state
+            var thenState = entry
+            refineNullState(cond, whenTrue: true, state: &thenState)
+            let thenOutcome = extraWalk(thenBranch, fn: fn, reached: reached, state: &thenState,
+                                        findings: &findings, localArrays: localArrays,
+                                        localNames: localNames, exits: &exits)
+            var elseState = entry
+            refineNullState(cond, whenTrue: false, state: &elseState)
+            let elseOutcome = elseBranch.map {
+                extraWalk($0, fn: fn, reached: reached, state: &elseState, findings: &findings,
+                          localArrays: localArrays, localNames: localNames, exits: &exits)
+            } ?? .fellThrough
+            var falling: [ExtraState] = []
+            if thenOutcome == .fellThrough { falling.append(thenState) }
+            if elseOutcome == .fellThrough { falling.append(elseState) }
+            if let joined = Self.union(falling) {
+                state = joined
+                return .fellThrough
             }
+            return [thenOutcome, elseOutcome].first(where: { $0 != .fellThrough }) ?? .returned
         case .whileStmt(let cond, let body, _):
             detectNullDerefs(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             detectConstantOverflow(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             updateState(from: cond, state: &state)
-            extraWalk(body, fn: fn, reached: reached, state: &state, findings: &findings,
-                      localArrays: localArrays, localNames: localNames)
+            let loopEntry = state
+            var local = FlowExits()
+            let bodyExit = walkLoopBody(cond: cond, body: body, entry: loopEntry, fn: fn,
+                                        reached: reached, findings: &findings,
+                                        localArrays: localArrays, localNames: localNames,
+                                        exits: &local)
+            // The loop may run zero times, so the state at the top joins back in.
+            state = Self.union([loopEntry].compactMap { $0 } + [bodyExit].compactMap { $0 }
+                               + local.breaks) ?? loopEntry
+            return .fellThrough
         case .doWhileStmt(let body, let cond, _):
-            extraWalk(body, fn: fn, reached: reached, state: &state, findings: &findings,
-                      localArrays: localArrays, localNames: localNames)
-            detectNullDerefs(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
-            detectConstantOverflow(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
-            updateState(from: cond, state: &state)
+            let loopEntry = state
+            var local = FlowExits()
+            // The condition has not been evaluated on the first pass, so no
+            // refinement narrows the entry state for the body.
+            var after = walkLoopBody(cond: nil, body: body, entry: loopEntry, fn: fn,
+                                     reached: reached, findings: &findings,
+                                     localArrays: localArrays, localNames: localNames,
+                                     exits: &local) ?? loopEntry
+            detectNullDerefs(in: cond, fn: fn, reached: reached, state: after, findings: &findings)
+            detectConstantOverflow(in: cond, fn: fn, reached: reached, state: after, findings: &findings)
+            updateState(from: cond, state: &after)
+            state = Self.union([after] + local.breaks) ?? after
+            return .fellThrough
         case .forStmt(let initS, let cond, let incr, let body, _):
             if let initS = initS {
-                extraWalk(initS, fn: fn, reached: reached, state: &state, findings: &findings,
-                          localArrays: localArrays, localNames: localNames)
+                let outcome = extraWalk(initS, fn: fn, reached: reached, state: &state,
+                                        findings: &findings, localArrays: localArrays,
+                                        localNames: localNames, exits: &exits)
+                if outcome != .fellThrough { return outcome }
             }
             if let cond = cond {
                 detectNullDerefs(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
                 detectConstantOverflow(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
                 updateState(from: cond, state: &state)
             }
-            extraWalk(body, fn: fn, reached: reached, state: &state, findings: &findings,
-                      localArrays: localArrays, localNames: localNames)
-            if let incr = incr {
-                detectNullDerefs(in: incr, fn: fn, reached: reached, state: state, findings: &findings)
-                detectConstantOverflow(in: incr, fn: fn, reached: reached, state: state, findings: &findings)
-                updateState(from: incr, state: &state)
+            let loopEntry = state
+            var local = FlowExits()
+            var bodyExit = walkLoopBody(cond: cond, body: body, entry: loopEntry, fn: fn,
+                                        reached: reached, findings: &findings,
+                                        localArrays: localArrays, localNames: localNames,
+                                        exits: &local)
+            // The increment runs on the back edge, before the next condition test.
+            if let incr = incr, var s = bodyExit {
+                detectNullDerefs(in: incr, fn: fn, reached: reached, state: s, findings: &findings)
+                detectConstantOverflow(in: incr, fn: fn, reached: reached, state: s, findings: &findings)
+                updateState(from: incr, state: &s)
+                bodyExit = s
             }
+            state = Self.union([loopEntry].compactMap { $0 } + [bodyExit].compactMap { $0 }
+                               + local.breaks) ?? loopEntry
+            return .fellThrough
         case .switchStmt(_, let cases, _):
+            // Every arm starts from the state at the switch rather than from
+            // wherever the previous arm happened to end, and the states that
+            // survive to the statement after the switch are unioned together.
+            let entry = state
+            var local = FlowExits()
+            var arms: [ExtraState] = []
+            let hasDefault = cases.contains(where: { $0.isDefault })
             for c in cases {
+                let breaksBefore = local.breaks.count
+                var armState = entry
+                var armOutcome = FlowOutcome.fellThrough
                 for s in c.body {
-                    extraWalk(s, fn: fn, reached: reached, state: &state, findings: &findings,
-                              localArrays: localArrays, localNames: localNames)
+                    armOutcome = extraWalk(s, fn: fn, reached: reached, state: &armState,
+                                           findings: &findings, localArrays: localArrays,
+                                           localNames: localNames, exits: &local)
+                    if armOutcome != .fellThrough { break }
                 }
+                // A `break` already recorded its state; only a fall-through
+                // arm still carries one that has not been captured.
+                if armOutcome == .fellThrough { arms.append(armState) }
+                arms.append(contentsOf: local.breaks.dropFirst(breaksBefore))
+                local.breaks.removeSubrange(breaksBefore...)
             }
+            if !hasDefault { arms.append(entry) }
+            state = Self.union(arms) ?? entry
+            // `continue` inside a switch still belongs to the enclosing loop.
+            exits.continues.append(contentsOf: local.continues)
+            return .fellThrough
+
         case .returnStmt(let e, let off):
             if let e = e {
                 detectNullDerefs(in: e, fn: fn, reached: reached, state: state, findings: &findings)
@@ -1224,21 +1348,121 @@ struct CFamilyWalkDetector {
                                                        taintPath: nil, reachable: reached))
                 }
             }
+            return .returned
+        case .breakStmt:
+            exits.breaks.append(state)
+            return .broke
+        case .continueStmt:
+            exits.continues.append(state)
+            return .continued
+        case .gotoStmt:
+            return .returned
         case .labeledStmt(_, let s, _):
-            extraWalk(s, fn: fn, reached: reached, state: &state, findings: &findings,
-                      localArrays: localArrays, localNames: localNames)
+            return extraWalk(s, fn: fn, reached: reached, state: &state, findings: &findings,
+                             localArrays: localArrays, localNames: localNames, exits: &exits)
+        default:
+            return .fellThrough
+        }
+    }
+
+    /// Walks a loop body, then walks it again from the back-edge join when the
+    /// first pass taught the loop-top state anything new, so dereferences only
+    /// reachable from the second iteration onward are still seen. Returns the
+    /// state after the last pass (nil when the body left the loop outright).
+    private func walkLoopBody(cond: CExpr?, body: CStmt, entry: ExtraState,
+                              fn: CFunctionDef, reached: Bool,
+                              findings: inout [CFamilyWalkFinding],
+                              localArrays: Set<String>, localNames: Set<String>,
+                              exits: inout FlowExits) -> ExtraState? {
+        var bodyState = entry
+        if let cond = cond { refineNullState(cond, whenTrue: true, state: &bodyState) }
+        let outcome = extraWalk(body, fn: fn, reached: reached, state: &bodyState,
+                                findings: &findings, localArrays: localArrays,
+                                localNames: localNames, exits: &exits)
+        guard outcome == .fellThrough || outcome == .continued else { return nil }
+        var top = Self.union([entry, bodyState] + exits.continues) ?? entry
+        if let cond = cond { refineNullState(cond, whenTrue: true, state: &top) }
+        exits.continues.removeAll()
+        if top != entry {
+            var second = top
+            let secondOutcome = extraWalk(body, fn: fn, reached: reached, state: &second,
+                                          findings: &findings, localArrays: localArrays,
+                                          localNames: localNames, exits: &exits)
+            if secondOutcome == .fellThrough || secondOutcome == .continued { bodyState = second }
+            exits.continues.removeAll()
+        }
+        return bodyState
+    }
+
+    /// Narrows the tracked nullness of pointers using a branch condition.
+    ///
+    /// Deliberately **one-directional**: it only ever proves a pointer is
+    /// *not* NULL (removing it from `nullVars`). Proving the opposite — that a
+    /// branch establishes NULL — would need the other arm to be proven
+    /// unreachable before the join, which this pass does not track; folding
+    /// such an assumption into the union afterwards would report dereferences
+    /// on paths that are actually guarded (e.g. `if (p == NULL) exit(1);`).
+    private func refineNullState(_ cond: CExpr, whenTrue: Bool, state: inout ExtraState) {
+        switch unwrap(cond) {
+        case .binary(let op, let lhs, let rhs, _):
+            switch op {
+            case "==":
+                if !whenTrue { proveNonNull(lhs, other: rhs, state: &state)
+                               proveNonNull(rhs, other: lhs, state: &state) }
+            case "!=":
+                if whenTrue { proveNonNull(lhs, other: rhs, state: &state)
+                              proveNonNull(rhs, other: lhs, state: &state) }
+            case "&&":
+                // Both conjuncts hold only when the whole condition is true.
+                if whenTrue {
+                    refineNullState(lhs, whenTrue: true, state: &state)
+                    refineNullState(rhs, whenTrue: true, state: &state)
+                }
+            case "||":
+                // Both disjuncts fail only when the whole condition is false.
+                if !whenTrue {
+                    refineNullState(lhs, whenTrue: false, state: &state)
+                    refineNullState(rhs, whenTrue: false, state: &state)
+                }
+            default:
+                break
+            }
+        case .unary(let op, let operand, _):
+            if op == "!" { refineNullState(operand, whenTrue: !whenTrue, state: &state) }
+        case .identifier(let name, _):
+            // `if (p)` / `while (p)` — a true test rules NULL out.
+            if whenTrue && !name.isEmpty && name != "NULL" { state.nullVars.remove(name) }
         default:
             break
         }
     }
 
+    private func proveNonNull(_ expr: CExpr, other: CExpr, state: inout ExtraState) {
+        guard isNullConstant(other), let name = simpleIdentifier(expr), !name.isEmpty else { return }
+        state.nullVars.remove(name)
+    }
+
     /// Throws away the value a variable had and applies its new value's
     /// classification to the tracking state (NULL / extreme-constant / other).
     private func updateState(from e: CExpr, state: inout ExtraState) {
-        if case .assign(_, let lhs, let rhs, _) = e {
-            if let name = simpleIdentifier(lhs) {
-                updateState(rhs: rhs, for: name, state: &state)
-            }
+        guard case .assign(_, let lhs, let rhs, _) = e else { return }
+        switch unwrap(lhs) {
+        case .identifier(let name, _):
+            updateState(rhs: rhs, for: name, state: &state)
+        case .member(let base, let field, _, _):
+            // `n->next = NULL` nulls the field, not `n`. Collapsing this to
+            // the base (as read-side flow does) would mark the whole object
+            // NULL and report unrelated members of it.
+            guard case .identifier(let owner, _) = unwrap(base), !owner.isEmpty else { break }
+            var fields = state.nullFields[owner] ?? []
+            fields.remove(field)
+            if isNullConstant(rhs) { fields.insert(field) }
+            if fields.isEmpty { state.nullFields.removeValue(forKey: owner) }
+            else { state.nullFields[owner] = fields }
+        default:
+            // `buf[i] = 0` and `*p = 0` store through the pointer; they say
+            // nothing about the pointer's own value.
+            break
         }
     }
 
@@ -1290,7 +1514,7 @@ struct CFamilyWalkDetector {
                                   state: ExtraState, findings: inout [CFamilyWalkFinding]) {
         switch e {
         case .unary(let op, let operand, let off):
-            if op == "*", derefBaseName(operand, state: state) != nil {
+            if op == "*", holdsNull(operand, state: state) {
                 findings.append(CFamilyWalkFinding(function: fn.name, offset: off,
                                                    category: "Null Pointer Dereference",
                                                    severity: .high,
@@ -1299,7 +1523,7 @@ struct CFamilyWalkDetector {
             }
             detectNullDerefs(in: operand, fn: fn, reached: reached, state: state, findings: &findings)
         case .index(let base, let idx, let off):
-            if derefBaseName(base, state: state) != nil {
+            if holdsNull(base, state: state) {
                 findings.append(CFamilyWalkFinding(function: fn.name, offset: off,
                                                    category: "Null Pointer Dereference",
                                                    severity: .high,
@@ -1309,7 +1533,7 @@ struct CFamilyWalkDetector {
             detectNullDerefs(in: base, fn: fn, reached: reached, state: state, findings: &findings)
             detectNullDerefs(in: idx, fn: fn, reached: reached, state: state, findings: &findings)
         case .member(let base, _, let isPtr, let off):
-            if isPtr, derefBaseName(base, state: state) != nil {
+            if isPtr, holdsNull(base, state: state) {
                 findings.append(CFamilyWalkFinding(function: fn.name, offset: off,
                                                    category: "Null Pointer Dereference",
                                                    severity: .high,
@@ -1350,10 +1574,18 @@ struct CFamilyWalkDetector {
         }
     }
 
-    /// The variable name being dereferenced, when it currently holds NULL.
-    private func derefBaseName(_ e: CExpr, state: ExtraState) -> String? {
-        guard case .identifier(let n, _) = unwrap(e), state.nullVars.contains(n) else { return nil }
-        return n
+    /// True when the expression is known to hold NULL on some path reaching
+    /// this point: either a tracked variable or a tracked `base->field`.
+    private func holdsNull(_ e: CExpr, state: ExtraState) -> Bool {
+        switch unwrap(e) {
+        case .identifier(let n, _):
+            return state.nullVars.contains(n)
+        case .member(let base, let field, _, _):
+            guard case .identifier(let owner, _) = unwrap(base) else { return false }
+            return state.nullFields[owner]?.contains(field) == true
+        default:
+            return false
+        }
     }
 
     /// Constant integer-overflow detection: `+`/`-`/`*` involving an operand

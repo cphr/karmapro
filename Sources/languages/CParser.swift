@@ -120,9 +120,26 @@ public final class CParser {
         let aggregate = isKeyword("struct") || isKeyword("union") || isKeyword("class") || isKeyword("enum")
         if aggregate && !isKeyword("enum") {
             let kw = current.text
+            let aggregateStart = pos
             advance()
             let name = current.kind == .identifier ? current.text : ""
             if current.kind == .identifier { advance() }
+            // `struct foo *bar(void) { ... }` is a function definition whose
+            // return type happens to start with a struct tag, not a struct
+            // declaration. Handled here because this branch claims the leading
+            // `struct`; without the probe the body is eaten by
+            // consumeDeclarators as an initializer and every top-level
+            // declaration up to the next ';' is swallowed with it.
+            if !isPunct("{") && !isPunct(";") {
+                restore(aggregateStart)
+                if let fn = tryParseFunction(allowBody: true), fn.isDefinition {
+                    funcs.append(fn)
+                    return
+                }
+                restore(aggregateStart)
+                advance()
+                if current.kind == .identifier { advance() }
+            }
             structs.append(CStructDef(name: name + (kw == "union" ? " (union)" : ""), offset: tokens[pos - 1].offset))
             if isPunct("{") { skipBalanced() }
             // possibly followed by variable declarators before ';'
