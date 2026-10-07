@@ -15,6 +15,7 @@ SOURCES=(
   Sources/main/VersionComparator.swift
   Sources/main/UpdateSettings.swift
   Sources/main/UpdateChecker.swift
+  Sources/main/UpdateMenuTarget.swift
   Sources/utils/TypeResolver.swift
   Sources/languages/JSFunctionParser.swift
   Sources/languages/JSParser.swift
