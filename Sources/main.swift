@@ -66,6 +66,35 @@ final class LicensingMenuTarget: NSObject {
 
 let licensingTarget = LicensingMenuTarget()
 
+final class PackagesMenuTarget: NSObject {
+    private var packageScanController: PackageScanWindowController?
+
+    @objc func scanProjectPackages(_ sender: Any?) {
+        guard let rootURL = (NSApp.delegate as? AppDelegate)?.currentProjectRootURL else {
+            let alert = NSAlert()
+            alert.messageText = "No Project Folder Open"
+            alert.informativeText = "Open a project folder first so its dependency manifests and lockfiles can be detected, then run the package scan again."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        let controller = PackageScanWindowController(projectRoot: rootURL)
+        controller.onOpenResult = { [weak appDelegate = NSApp.delegate as? AppDelegate] url, line in
+            appDelegate?.mainWindowController?.showFile(at: url, line: line)
+        }
+        controller.onAskAI = { [weak appDelegate = NSApp.delegate as? AppDelegate] question in
+            appDelegate?.mainWindowController?.askAI(question)
+        }
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        packageScanController = controller
+    }
+}
+
+let packagesTarget = PackagesMenuTarget()
+
 func makeMainMenu() -> NSMenu {
     let mainMenu = NSMenu()
 
@@ -117,6 +146,16 @@ func makeMainMenu() -> NSMenu {
     scanLicensesItem.target = licensingTarget
     licensingMenu.addItem(scanLicensesItem)
     licensingMenuItem.submenu = licensingMenu
+
+    let packagesMenuItem = NSMenuItem()
+    mainMenu.addItem(packagesMenuItem)
+    let packagesMenu = NSMenu(title: "Packages")
+    let scanPackagesItem = NSMenuItem(title: "Scan project's packages",
+                                      action: #selector(PackagesMenuTarget.scanProjectPackages(_:)),
+                                      keyEquivalent: "p")
+    scanPackagesItem.target = packagesTarget
+    packagesMenu.addItem(scanPackagesItem)
+    packagesMenuItem.submenu = packagesMenu
 
     let helpMenuItem = NSMenuItem()
     mainMenu.addItem(helpMenuItem)

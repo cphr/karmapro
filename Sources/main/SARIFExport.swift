@@ -91,6 +91,7 @@ enum SARIFExport {
             "crossFile": finding.crossFile ? "true" : "false"
         ]
         if let taint = finding.taint, !taint.isEmpty { props["taint"] = taint }
+        if let packageName = finding.packageName { props["package"] = packageName }
         return props
     }
 

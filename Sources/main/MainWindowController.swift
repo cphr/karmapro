@@ -1404,7 +1404,7 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     /// Loads a file in the source viewer and scrolls to the given 1-based line.
-    private func showFile(at url: URL, line: Int) {
+    func showFile(at url: URL, line: Int) {
         flowPanel.clear()
         sourceViewer?.display(fileAt: url)
         sourceViewer?.scrollToLine(line)
@@ -1622,6 +1622,16 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     @objc private func aiClicked() {
+        showAIAssistant(prompt: nil)
+    }
+
+    /// Opens the AI assistant and immediately submits a ready-made question
+    /// from another window (used by the package scan's right-click menu).
+    func askAI(_ question: String) {
+        showAIAssistant(prompt: question)
+    }
+
+    private func showAIAssistant(prompt: String?) {
         guard let folder = projectRootURL else {
             let alert = NSAlert()
             alert.messageText = "No Project Selected"
@@ -1648,6 +1658,9 @@ extension MainWindowController: NSToolbarDelegate {
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if let prompt = prompt {
+            controller.ask(prompt)
+        }
     }
 
     private func openBugVault() {

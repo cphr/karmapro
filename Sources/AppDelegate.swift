@@ -5,8 +5,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
     private var splashController: SplashWindowController?
 
+    var mainWindowController: MainWindowController? {
+        return windowController ?? (NSApp.keyWindow?.windowController as? MainWindowController)
+    }
+
     var currentProjectRootURL: URL? {
-        return windowController?.projectRootURL ?? (NSApp.keyWindow?.windowController as? MainWindowController)?.projectRootURL
+        return mainWindowController?.projectRootURL
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

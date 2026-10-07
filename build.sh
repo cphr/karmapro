@@ -121,6 +121,11 @@ SOURCES=(
   Sources/tools/WikiStore.swift
   Sources/tools/WikiEditorWindowController.swift
   Sources/tools/WikiWindowController.swift
+  Sources/tools/PackageDetector.swift
+  Sources/tools/PackageLockParsers.swift
+  Sources/tools/PackageManifestParsers.swift
+  Sources/tools/OSVClient.swift
+  Sources/tools/PackageScanWindowController.swift
   Sources/bayes/BayesianClassifier.swift
   Sources/bayes/BayesianModelStore.swift
   Sources/bayes/MLTrainingWindowController.swift

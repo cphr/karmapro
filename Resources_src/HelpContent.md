@@ -96,6 +96,12 @@ Choosing **Review**, from a notification, or from the banner on a repository you
 - **Changed files only** Only the files this pull request adds or modifies, fastest and smallest. Large repositories or a first look. Cross-file analysis cannot follow taint into files it never fetched, so some findings are missing.
 - **Full project** The whole project at the head commit, slower and larger. When the change touches shared code and you need cross-file taint analysis and reachability to work normally.
 **Closing a review**: **Close Review** ends the session, clears the file tree and every pane, and removes the on-disk checkouts. Checkouts and findings are cached between reviews for speed; **Manage Repositories** shows the cache size and has **Clear Cache**, which is refused while a review is open, when you are not reviewing however you clear the local cache.
+## 10. Scan Project's Packages
+The **Packages > Scan project's packages** menu checks the project's own dependencies for known vulnerabilities. A project folder must be open, otherwise the scan does not start.
+- **Auto-detection**: manifests and lockfiles are found automatically npm/yarn/pnpm, PyPI, Cargo, Go, RubyGems, Composer, Maven/Gradle, NuGet and Swift Package Manager. Unsupported projects are reported as such.
+- **Scan**: click **Scan** to query every resolved package version against **api.osv.dev**. Results are listed by severity with the package, file and line.
+- **Results**: click a row to open the packages file at the line, **Ignore issue** hides a finding and **Export Scan** saves the shown findings as a SARIF report.
+- **(AI) Is it vulnerable?**: right-click a finding to send the question to the AI Assistant, using whiever model is currently selected.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
 **ReviewCode.org** is Karma Pro's dedicated website
 **Brought to you by cipher.org.uk**

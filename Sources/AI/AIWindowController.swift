@@ -861,6 +861,14 @@ final class AIWindowController: NSWindowController {
         sendClicked(nil)
     }
 
+    /// Fills the prompt editor with an arbitrary ready-made question and
+    /// immediately triggers the same send flow as the Send button (sending to
+    /// whichever model is currently selected).
+    func ask(_ question: String) {
+        promptTextView.string = question
+        sendClicked(nil)
+    }
+
     /// Resumes the interrupted task: the whole conversation — including the
     /// model's partial answer and any tool results — is sent back with an
     /// instruction to continue exactly where it stopped.
