@@ -1,5 +1,6 @@
 // by cipher.org.uk
 import AppKit
+import UniformTypeIdentifiers
 
 /// Displays the results of a project vulnerability scan in a table. Each row
 /// is a finding (file, line, function, category, severity); single/double
@@ -17,8 +18,14 @@ final class ScanWindowController: NSWindowController {
     private let progressBar = NSProgressIndicator()
     private let rescanButton = NSButton(title: "Rescan", target: nil, action: nil)
     private let ignoreButton = NSButton(title: "Ignore issue", target: nil, action: nil)
+    private let exportButton = NSButton(title: "Export Scan", target: nil, action: nil)
 
-    private var findings: [ScanFinding] = []
+    private var findings: [ScanFinding] = [] {
+        // Export is available exactly when the table has rows to export, so
+        // every assignment that changes what is shown updates it here rather
+        // than at each of the handful of assignment sites.
+        didSet { exportButton.isEnabled = !findings.isEmpty }
+    }
     private var scannedFolder: URL?
 
     // MARK: - Pull request review mode
@@ -122,6 +129,19 @@ final class ScanWindowController: NSWindowController {
         ignoreButton.toolTip = "Hide this finding (persisted across sessions)"
         ignoreButton.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(ignoreButton)
+
+        exportButton.bezelStyle = .rounded
+        exportButton.controlSize = .small
+        exportButton.isEnabled = false
+        // Orange bezel with the normal dark title, so the button reads as a
+        // call to action without the label losing contrast on the fill.
+        exportButton.bezelColor = .systemOrange
+        exportButton.contentTintColor = .labelColor
+        exportButton.target = self
+        exportButton.action = #selector(exportClicked(_:))
+        exportButton.toolTip = "Save the results shown in the table as a SARIF file"
+        exportButton.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(exportButton)
 
         progressBar.style = .bar
         progressBar.isIndeterminate = false
@@ -228,7 +248,10 @@ final class ScanWindowController: NSWindowController {
             aiThinkingSpinner.trailingAnchor.constraint(lessThanOrEqualTo: ignoreButton.leadingAnchor, constant: -10),
 
             ignoreButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            ignoreButton.trailingAnchor.constraint(equalTo: rescanButton.leadingAnchor, constant: -8),
+            ignoreButton.trailingAnchor.constraint(equalTo: exportButton.leadingAnchor, constant: -8),
+
+            exportButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            exportButton.trailingAnchor.constraint(equalTo: rescanButton.leadingAnchor, constant: -8),
 
             rescanButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             rescanButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
@@ -463,6 +486,29 @@ final class ScanWindowController: NSWindowController {
         findings = applyIgnoredFilter(findings)
         tableView.reloadData()
         ignoreButton.isEnabled = selectedFinding() != nil
+    }
+
+    /// Saves the rows currently shown in the table as a SARIF 2.1.0 file.
+    @objc private func exportClicked(_ sender: Any?) {
+        guard !findings.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Scan"
+        panel.nameFieldStringValue = "KarmaPro-scan.sarif.json"
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.message = "Exports the \(findings.count) finding\(findings.count == 1 ? "" : "s") "
+            + "shown in the table, with absolute file paths."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try SARIFExport.data(from: findings).write(to: url, options: .atomic)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Export Failed"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     @objc private func rescanClicked(_ sender: Any?) {
