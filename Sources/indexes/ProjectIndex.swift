@@ -59,6 +59,12 @@ struct ProjectIndex {
     /// library sink of the same name — unqualified name lookup prefers the
     /// user declaration.
     let globalDefinedFunctions: Set<String>
+    /// Functions whose C body clamps a tainted size to a fixed cap before
+    /// returning it (`if (n > CAP) { n = CAP; } return n;`). The return value
+    /// is bounded by a literal capacity no matter what a caller passes, so a
+    /// downstream allocation/copy by it is not the unbounded overflow the
+    /// taint heuristic assumes. Registered under full and short names.
+    let globalClampedReturnFns: Set<String>
 
     /// All source APIs across all languages, used for the cross-file
     /// taint-returning fixpoint.
@@ -102,6 +108,7 @@ struct ProjectIndex {
         let globalSanitizers = classifySanitizers(astFns: globalAST)
         let globalConstantFormats = extractGlobalStringConstants(files: files, readSource: readSource)
         let globalDefinedFunctions = projectFunctionNames(astFns: globalAST, files: files, readSource: readSource)
+        let globalClampedReturnFns = clampedReturnFunctions(astFns: globalAST)
         let globalParamSeeds = mergeParamTaintSeeds(analyses: analyses)
 
         return ProjectIndex(fileAnalyses: analyses,
@@ -114,7 +121,110 @@ struct ProjectIndex {
                             globalSanitizers: globalSanitizers,
                             globalParamTaintSeeds: globalParamSeeds,
                             globalConstantFormats: globalConstantFormats,
-                            globalDefinedFunctions: globalDefinedFunctions)
+                            globalDefinedFunctions: globalDefinedFunctions,
+                            globalClampedReturnFns: globalClampedReturnFns)
+    }
+
+    /// True when a C expression denotes a fixed capacity: a literal, a
+    /// `sizeof` operand, or arithmetic over either (e.g. `0x400`,
+    /// `sizeof(fifo) - 1`, `(sizeof(fifo)) / 2`).
+    private static func isCapExpr(_ e: CExpr) -> Bool {
+        switch e {
+        case .integerLiteral, .floatLiteral, .charLiteral, .stringLiteral:
+            return true
+        case .sizeOf:
+            return true  // `.sizeOf(expr, typeName, _)`
+        case .binary(_, let l, let r, _):
+            return isCapExpr(l) || isCapExpr(r)
+        case .unary(_, let o, _), .paren(let o, _), .cast(expr: let o, _):
+            return isCapExpr(o)
+        case .comma(let l, let r, _):
+            return isCapExpr(l) || isCapExpr(r)
+        case .ternary(cond: _, thenExpr: let t, elseExpr: let f, _):
+            return isCapExpr(t) || isCapExpr(f)
+        default:
+            return false
+        }
+    }
+
+    /// True when an if-branch (or its block) assigns `v` to a fixed cap,
+    /// possibly lowered: `v = CAP`, `v = CAP - k`, `v = sizeof(x) - k`.
+    private static func exprAssignsCap(_ v: String, in stmt: CStmt) -> Bool {
+        if case .expr(let e) = stmt {
+            if case .assign(_, let lhs, let rhs, _) = e {
+                if case .identifier(let n, _) = lhs, n == v, isCapExpr(rhs) { return true }
+            }
+        }
+        if case .block(let ss) = stmt {
+            for s in ss {
+                if exprAssignsCap(v, in: s) { return true }
+            }
+        }
+        return false
+    }
+
+    /// Flattens a statement into the statement list it contains (blocks and
+    /// if/while branches expand to their bodies; leaves pass through).
+    private static func flatten(_ s: CStmt) -> [CStmt] {
+        switch s {
+        case .block(let ss): return ss
+        case .ifStmt(_, let t, let e?, _): return flatten(t) + flatten(e)
+        case .ifStmt(_, let t, nil, _): return flatten(t)
+        case .whileStmt(_, let b, _), .doWhileStmt(let b, _, _), .forStmt(_, _, _, let b, _), .labeledStmt(_, let b, _):
+            return flatten(b)
+        case .switchStmt(_, let cs, _):
+            return cs.flatMap { $0.body }
+        default:
+            return [s]
+        }
+    }
+
+    /// Names of C functions whose body clamps a caller-supplied size to a fixed
+    /// cap and then returns that (possibly lowered) value:
+    /// `if (n > FIXED) { n = FIXED; } return n;`. Callers of these functions get
+    /// an upper-bounded value, so allocations/copies sized by the return are not
+    /// unbounded — the taint heuristic must not flag them. Registered under both
+    /// the full name and the last `::` component.
+    static func clampedReturnFunctions(astFns: [String: CFunctionDef]) -> Set<String> {
+        var out = Set<String>()
+        for (name, def) in astFns where def.isDefinition {
+            let stmts = flatten(def.body)
+            var fixedCapped = Set<String>()
+            var clampsReturn = false
+            func walk(_ ss: [CStmt], depth: Int) {
+                guard depth < 24, !clampsReturn else { return }
+                for s in ss {
+                    switch s {
+                    case .ifStmt(cond: let c, thenBranch: let t, elseBranch: let e, _):
+                        if case .binary(let op, let lhs, let rhs, _) = c,
+                           (op == ">" || op == ">="),
+                           case .identifier(let v, _) = lhs,
+                           isCapExpr(rhs),
+                           exprAssignsCap(v, in: t) {
+                            fixedCapped.insert(v)
+                        }
+                        walk(flatten(t), depth: depth + 1)
+                        if let e = e { walk(flatten(e), depth: depth + 1) }
+                    case .returnStmt(let e?, _):
+                        if case .identifier(let v, _) = e, fixedCapped.contains(v) {
+                            clampsReturn = true
+                        }
+                    case .block(let inner):
+                        walk(inner, depth: depth + 1)
+                    default:
+                        walk(flatten(s), depth: depth + 1)
+                    }
+                }
+            }
+            walk(stmts, depth: 0)
+            if clampsReturn {
+                out.insert(name)
+                if let short = name.split(separator: ":").last, String(short) != name {
+                    out.insert(String(short))
+                }
+            }
+        }
+        return out
     }
 
     /// Finds Python URL validators that parse a URL and enforce a fixed host
