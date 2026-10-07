@@ -41,6 +41,9 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     var projectRootURL: URL?
     private var selectedLanguage: Language?
     private var bugBadgeView: BugBadgeView?
+    /// Set once the user has confirmed the quit alert in `windowShouldClose`,
+    /// so AppKit's own close during termination never sees the alert again.
+    private var isQuitting = false
 
     // MARK: - Pull request review
 
@@ -170,6 +173,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         window.minSize = NSSize(width: 1280, height: 640)
         window.center()
         self.init(window: window)
+        window.delegate = self
         configureToolbar()
         configureContent()
     }
@@ -1078,9 +1082,30 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         if response == .alertFirstButtonReturn {
             promptForDirectory()
         } else if response == .alertSecondButtonReturn {
+            isQuitting = true
             NSApp.terminate(nil)
         }
         // Otherwise (Cancel) do nothing and keep the app alive.
+    }
+}
+
+extension MainWindowController: NSWindowDelegate {
+    /// Closing the main window means quitting the app, so the close is only
+    /// carried out after an explicit confirmation; cancelling leaves the
+    /// window (and everything in it) exactly as it was.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if isQuitting { return true }
+        let alert = NSAlert()
+        alert.messageText = "Are you sure you want to quit?"
+        alert.informativeText = "Closing the Karma Pro window will quit the app."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        isQuitting = true
+        NSApp.terminate(nil)
+        return true
     }
 }
 
