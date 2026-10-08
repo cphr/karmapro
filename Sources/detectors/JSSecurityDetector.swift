@@ -127,6 +127,17 @@ struct JSSecurityDetector {
     private let localSanitizerReturning: Set<String>
     private let localValidatedReturning: Set<String>
 
+    /// Node.js modules whose method calls are genuine fs/child_process sinks.
+    private static let nodeSinkReceivers: Set<String> =
+        ["fs", "fsp", "cp", "child_process", "promises"]
+
+    /// Constructors whose `.prototype` writes are shared-state pollution; any
+    /// other `obj.prototype =` is a class defining its own prototype.
+    private static let sharedProtoBases: Set<String> =
+        ["object", "array", "string", "number", "boolean", "function", "regexp",
+         "date", "error", "map", "set", "weakmap", "weakset", "symbol", "bigint",
+         "promise", "reflect", "math", "window", "global", "globalthis", "self"]
+
     init(source: String, defs: [JSDef], tokens: [CAstToken]? = nil,
          reachableNames: Set<String> = [],
          taintReturning: Set<String> = [],
@@ -630,6 +641,9 @@ struct JSSecurityDetector {
         let calleeReceiver = name.components(separatedBy: ".").dropLast().last?.lowercased() ?? ""
         let isApiFetchReceiver = calleeReceiver.isEmpty
             || ["window", "global", "globalThis", "self"].contains(calleeReceiver)
+        // Node-only sinks: a member call on any other receiver (`Z.exec`,
+        // jQuery's `X.access`) is RegExp/DOM/library code, not the Node API.
+        let isNodeSinkCall = calleeReceiver.isEmpty || Self.nodeSinkReceivers.contains(calleeReceiver)
         let reachable = isReachable(def)
 
         // Bind callback parameters as tainted when the callee is a source or
@@ -682,7 +696,7 @@ struct JSSecurityDetector {
                                         severity: .medium, reachable: reachable,
                                         message: "\(leaf) with a string argument compiles it as code.",
                                         taint: nil))
-            } else if argVals.first?.tainted == true {
+            } else if isStringSyntaxArg(args.first), argVals.first?.tainted == true {
                 // Concatenated string timer: `setTimeout("tick('" + id + "')", …)`.
                 findings.append(finding(def: def, offset: offset, category: "Timer String Injection",
                                         severity: .medium, reachable: reachable,
@@ -741,14 +755,14 @@ struct JSSecurityDetector {
                 }
             }
         case "exec", "execSync":
-            if argVals.first?.tainted == true {
+            if isNodeSinkCall, argVals.first?.tainted == true {
                 findings.append(finding(def: def, offset: offset, category: "Command Injection",
                                         severity: .critical, reachable: reachable,
                                         message: "child_process.\(leaf) runs a shell; tainted input enables RCE.",
                                         taint: taintPath(argVals.first) ?? "child_process.\(leaf)"))
             }
         case "spawn", "spawnSync", "execFile", "execFileSync":
-            if argVals.first?.tainted == true {
+            if isNodeSinkCall, argVals.first?.tainted == true {
                 findings.append(finding(def: def, offset: offset, category: "Command Injection",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted argument to child_process.\(leaf).",
@@ -756,7 +770,7 @@ struct JSSecurityDetector {
             }
         case "readFile", "readFileSync", "unlink", "unlinkSync", "createReadStream",
              "createWriteStream", "writeFile", "writeFileSync", "access", "stat":
-            if argVals.first?.tainted == true {
+            if isNodeSinkCall, argVals.first?.tainted == true {
                 findings.append(finding(def: def, offset: offset, category: "Path Traversal",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted path in fs.\(leaf) allows arbitrary file access.",
@@ -1162,7 +1176,7 @@ struct JSSecurityDetector {
         }
         guard isMemberOrIndex else { return }
         let targetText = assignmentTargetText(target)
-        // The effective last segment: member name, or bracket-literal key.
+        // Effective last segment: member name, or bracket-literal key.
         var tail: String
         switch target {
         case .member(_, let name, _):
@@ -1179,13 +1193,29 @@ struct JSSecurityDetector {
             tail = ""
         }
 
+        // `X.prototype = w` is only shared-state pollution when X is a shared
+        // built-in or a `constructor` chain; jQuery/Sizzle assigning their own
+        // prototypes (`ra.prototype = filters`) is normal library setup.
+        var baseName = ""
+        switch target {
+        case .member(let base, _, _):
+            baseName = base.dottedName.isEmpty ? assignmentTargetText(base) : base.dottedName
+        case .index(let base, _, _):
+            baseName = base.dottedName.isEmpty ? assignmentTargetText(base) : base.dottedName
+        default:
+            break
+        }
+        let sharedProtoWrite = tail == "prototype"
+            && (Self.sharedProtoBases.contains(baseName.lowercased())
+                || baseName.lowercased().contains("constructor"))
+
         if ["innerHTML", "outerHTML", "insertAdjacentHTML"].contains(tail), valueTaint.tainted {
             findings.append(finding(def: def, offset: value.offset, category: "XSS (\(tail))",
                                     severity: .high, reachable: reachable,
                                     message: "Assignment of tainted data to \(targetText) can inject markup or script.",
                                     taint: "\(taintPath(valueTaint) ?? "?") → \(targetText)"))
         }
-        if targetText.contains("__proto__") || targetText.contains("constructor.prototype") || tail == "prototype" {
+        if targetText.contains("__proto__") || targetText.contains("constructor.prototype") || sharedProtoWrite {
             findings.append(finding(def: def, offset: value.offset, category: "Prototype Pollution",
                                     severity: .high, reachable: reachable,
                                     message: "Write to \(targetText) can pollute shared object state.",
@@ -1336,6 +1366,22 @@ struct JSSecurityDetector {
             || lower.hasPrefix("ctx.") || lower.hasPrefix("event.")
         guard isBag, let tail = lower.components(separatedBy: ".").last else { return false }
         return ["query", "body", "params", "cookies", "headers", "session", "dataset"].contains(tail)
+    }
+
+    /// String-valued expression used as code: literal, template, or a `+`
+    /// chain with a string operand. A bare identifier/function is a callback,
+    /// not compiled code.
+    private func isStringSyntaxArg(_ e: JSExpr?) -> Bool {
+        switch e {
+        case .literal(let text, _):
+            return text.hasPrefix("\"") || text.hasPrefix("'")
+        case .template:
+            return true
+        case .binary("+", let l, let r, _):
+            return isStringSyntaxArg(l) || isStringSyntaxArg(r)
+        default:
+            return false
+        }
     }
 
     private func bodyTokens(of def: JSDef) -> [CAstToken] {
