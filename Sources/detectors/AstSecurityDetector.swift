@@ -1,6 +1,6 @@
 // by cipher.org.uk
 import Foundation
- 
+
 /// A structural security detector that walks the parsed `CStmt`/`CExpr` AST
 /// (produced by `CAnalyzer` for C/C++ and `JAnalyzer` for Java) and reports
 /// sink calls whose dangerous argument is tainted.
@@ -492,10 +492,12 @@ struct AstSecurityDetector {
         switch e {
         case .call(let callee, let args, let offset):
             let matched = handleCall(callee: callee, args: args, offset: offset, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
-            // Java builder accumulation: `StringBuilder.append(tainted)` (and
-            // chainable mutators on it) sink taint into the builder variable, so
-            // a later `builder.toString()` reaching a sink is flagged.
-            if isJava, callName(callee) == "append", let recv = identifierReceiver(callee),
+            // Java builder/collection accumulation: `StringBuilder.append(tainted)`
+            // (and chainable mutators) and `List.add(tainted)` sink taint into the
+            // builder/collection variable, so a later `builder.toString()` at a sink,
+            // or a `new ProcessBuilder(list)` built from the collection, is flagged.
+            if isJava, let chain = callName(callee), chain == "append" || chain == "add",
+               let recv = identifierReceiver(callee),
                args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
                 tainted.insert(recv)
                 if args.contains(where: { exprCrossFile($0, crossTainted: crossTainted) }) {
@@ -1620,6 +1622,16 @@ struct AstSecurityDetector {
             if scriptSeedIdentifiers, isSeedFn(n) { return n }
             return nil
         case .call(let callee, let args, _):
+            // Cross-file registered sanitizers (validators/path sanitizers
+            // classified by ProjectIndex) strip taint from their return value —
+            // before the seed lookup, because such a validator also classifies
+            // as taint-returning (it returns its argument) and must read as clean.
+            if let m = callName(callee), sanitizingFunctions[m] != nil {
+                return nil
+            }
+            if let q = callQualifiedName(callee), sanitizingFunctions[q] != nil {
+                return nil
+            }
             // A call that returns tainted data (from a source API or a function
             // that transitively returns tainted data, including defined in
             // another file) taints the whole call expression.
@@ -1648,14 +1660,6 @@ struct AstSecurityDetector {
                                                    "WebUtility.HtmlEncode", "Server.HtmlEncode",
                                                    "HttpUtility.HtmlAttributeEncode",
                                                    "System.Text.Encodings.Web.HtmlEncoder.Encode"].contains(q) {
-                return nil
-            }
-            // Cross-file registered sanitizers (validators/path sanitizers
-            // classified by ProjectIndex) strip taint from their return value.
-            if let m = callName(callee), sanitizingFunctions[m] != nil {
-                return nil
-            }
-            if let q = callQualifiedName(callee), sanitizingFunctions[q] != nil {
                 return nil
             }
             for a in args {
@@ -1742,7 +1746,7 @@ struct AstSecurityDetector {
 
     func isWeakAlgorithm(_ s: String) -> Bool {
         let low = s.lowercased()
-        if low == "md5" || low == "sha1" || low == "md5-sha1" || low == "des" || low == "desede" || low == "rc2" || low == "rc4" { return true }
+        if low == "md2" || low == "md4" || low == "md5" || low == "sha1" || low == "md5-sha1" || low == "des" || low == "desede" || low == "rc2" || low == "rc4" { return true }
         if low.hasPrefix("aes/ecb") || low.contains("/ecb/") { return true }
         return false
     }

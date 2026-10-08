@@ -547,10 +547,10 @@ struct ProjectIndex {
                 case .block(let arr):
                     for s in arr { walk(s) }
                 case .ifStmt(let cond, let thenBranch, let elseBranch, _):
-                    if isConstantZeroExit(thenBranch), condReferences(cond, names: derived) {
+                    if (isConstantZeroExit(thenBranch) || containsThrowExpr(thenBranch)), condReferences(cond, names: derived) {
                         inputRejects += 1
                     }
-                    if let eb = elseBranch, isConstantZeroExit(eb), condReferences(cond, names: derived) {
+                    if let eb = elseBranch, (isConstantZeroExit(eb) || containsThrowExpr(eb)), condReferences(cond, names: derived) {
                         inputRejects += 1
                     }
                     if condHasContainmentCheck(cond) { hasContainmentCheck = true }
@@ -572,6 +572,7 @@ struct ProjectIndex {
                     break
                 }
             }
+walk(fn.body)
             walk(fn.body)
 
             if isJavaStringReturn, inputRejects > 0, hasNonNullReturn {
@@ -749,6 +750,32 @@ struct ProjectIndex {
 
     private static func condReferences(_ cond: CExpr, names: Set<String>) -> Bool {
         references(cond, names: names)
+    }
+
+    /// True when the statement contains a Java `throw` statement anywhere. The
+    /// C parser folds the `throw` keyword into `.expr(.identifier("throw"))` (a
+    /// sibling statement of the following `new …(...)`), so a throw-reject
+    /// branch (`if (bad) throw …;`) is recognized without requiring source.
+    private static func containsThrowExpr(_ stmt: CStmt) -> Bool {
+        switch stmt {
+        case .expr(let e):
+            if case .identifier(let n, _) = e, n == "throw" { return true }
+            return false
+        case .block(let arr):
+            return arr.contains(where: { containsThrowExpr($0) })
+        case .ifStmt(_, let t, let eb, _):
+            return containsThrowExpr(t) || (eb.map { containsThrowExpr($0) } ?? false)
+        case .whileStmt(_, let b, _), .doWhileStmt(let b, _, _):
+            return containsThrowExpr(b)
+        case .forStmt(_, _, _, let b, _):
+            return containsThrowExpr(b)
+        case .switchStmt(_, let cases, _):
+            return cases.contains { c in c.body.contains(where: { containsThrowExpr($0) }) }
+        case .labeledStmt(_, let s, _):
+            return containsThrowExpr(s)
+        default:
+            return false
+        }
     }
 
     /// True when a statement is an unconditional `return` of a falsy constant

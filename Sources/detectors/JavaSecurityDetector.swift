@@ -3,7 +3,7 @@
 // Extracted from AstSecurityDetector.swift / VulnerabilityScanner.swift to
 // keep per-language vulnerability detection modular. Shared wire-up stays in
 // AstSecurityDetector.swift · VulnerabilityScanner.swift (dispatch lines only).
- 
+
 import Foundation
 
 extension AstSecurityDetector {
@@ -38,6 +38,41 @@ extension AstSecurityDetector {
         if bodyHasCanonicalPathValidation(fn.body) {
             findings.removeAll { $0.category == "Path Traversal" }
         }
+    }
+
+    /// Lowercased source text of the statement containing `offset`, built from
+    /// the *token* stream so comments (which often mention a scan keyword, e.g.
+    /// a note about `ALLOWED_HOSTS`) can neither suppress a sink nor leak an
+    /// unrelated token into the window. Bounded by the nearest `;`, `{`, or `}`
+    /// token on either side; string-literal tokens keep their quoted text.
+    func statementText(_ offset: Int) -> String {
+        let tokens = CTokenizer(source: source).tokenize()
+        guard !tokens.isEmpty else { return "" }
+        let bounds: Set<String> = [";", "{", "}"]
+        var lo = 0
+        for (i, t) in tokens.enumerated() where t.offset <= offset { lo = i + 1 }
+        var bs = lo
+        while bs > 0, !bounds.contains(tokens[bs - 1].text) { bs -= 1 }
+        var fe = lo
+        while fe < tokens.count, !bounds.contains(tokens[fe].text) { fe += 1 }
+        guard fe > bs else { return "" }
+        return tokens[bs..<fe].map { $0.text }.joined().lowercased()
+    }
+
+    /// First segment of a dotted call path as written (`engine` for
+    /// `engine.process`, `u` for `u.openConnection`).
+    func firstSegment(_ name: String) -> String {
+        name.split(separator: ".").first.map(String.init) ?? name
+    }
+
+    /// True when `varName` is declared with a server-side template type name
+    /// (`TemplateEngine engine, ...`, `Template t`, `ThymeleafTemplate view`).
+    /// The optional prefix + suffix consume adjacent type-name characters.
+    func javaVarHasTemplateType(_ varName: String, source: String) -> Bool {
+        let pattern = #"\b(?:[A-Za-z_$][A-Za-z0-9_$]*)?(?:Template|Thymeleaf|Freemarker)[A-Za-z0-9_$]*\s+"# + NSRegularExpression.escapedPattern(for: varName) + #"(?=[,)={;])"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return false }
+        let ns = source as NSString
+        return re.firstMatch(in: source, range: NSRange(location: 0, length: ns.length)) != nil
     }
 
     /// True when the function performs the canonical-path containment pattern:
@@ -152,10 +187,7 @@ extension AstSecurityDetector {
         // characters (\ * ( ) NUL) is the standard mitigation.
         if ["search", "searchByName"].contains(name), args.count >= 2,
            exprTainted(args[1], tainted: tainted) != nil {
-            let nsSource = source as NSString
-            let lo = max(0, args[1].offset - 1200)
-            let hi = min(nsSource.length, args[1].offset + 400)
-            let near = nsSource.substring(with: NSRange(location: lo, length: hi - lo)).lowercased()
+            let near = self.statementText(args[1].offset)
             if !near.contains("escapeforldap") && !near.contains("\\5c") && !near.contains("\\2a") {
                 emit(&findings, function, offset,
                      rule("LDAP Injection", .high),
@@ -202,17 +234,29 @@ extension AstSecurityDetector {
         // RestTemplate / WebClient outbound requests with a tainted URL.
         if ["getForObject", "getForEntity", "postForObject", "exchange", "get uri", "retrieve"].contains(name),
            args.count >= 1, exprTainted(args[0], tainted: tainted) != nil,
-           !source.uppercased().contains("ALLOWED_HOSTS") {
+           !self.statementText(args[0].offset).contains("allowed_hosts") {
             emit(&findings, function, offset,
                  rule("SSRF", .high),
                  message: "\(name) fetches an attacker-controlled URL; SSRF is possible.",
                  taint: exprTainted(args[0], tainted: tainted), reachable: reachable, crossFile: exprCrossFile(args[0], crossTainted: crossTainted))
             return
         }
+        // URL member HTTP calls: `url.openConnection()`/`openStream()` connect
+        // to the URL the receiver variable was built from. A receiver seeded
+        // from tainted input (`URL u = new URL(target)`) is the SSRF vector.
+        if ["openConnection", "openStream"].contains(name),
+           let recv = qualified.split(separator: ".").first.map(String.init),
+           tainted.contains(recv) {
+            emit(&findings, function, offset,
+                 rule("SSRF", .high),
+                 message: "\(name) opens a connection to a URL built from untrusted data; SSRF is possible.",
+                 taint: nil, reachable: reachable, crossFile: args.first.map { exprCrossFile($0, crossTainted: crossTainted) } ?? false)
+            return
+        }
         // Path Traversal: file/stream constructors opened from a tainted path. The
         // callee is a member chain (e.g. `Files.newInputStream(path)`), so we check
         // the trailing identifier of each sink name.
-        if Self.javaFilePathSinks.contains(name) || Self.javaFilePathSinks.contains(lastSeg(name)) {
+        if Self.javaFilePathSinks.contains(qualified) || Self.javaFilePathSinks.contains(name) || Self.javaFilePathSinks.contains(lastSeg(name)) {
             for a in args where exprTainted(a, tainted: tainted) != nil && !isGuarded(a, guarded: guarded, category: "Path Traversal") {
                 emit(&findings, function, offset,
                      AstSinkRule(category: "Path Traversal", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
@@ -245,7 +289,7 @@ extension AstSecurityDetector {
         // `Pattern.quote(...)` (and friends) neutralize the pattern and are skipped.
         if name == "compile", ql.hasPrefix("pattern."), args.count >= 1,
            exprTainted(args[0], tainted: tainted) != nil {
-            let near = self.nearSource(args[0].offset)
+            let near = self.statementText(args[0].offset)
             if !near.contains("pattern.quote") && !near.contains(".quote(") {
                 emit(&findings, function, offset,
                      AstSinkRule(category: "ReDoS", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
@@ -269,8 +313,8 @@ extension AstSecurityDetector {
         if ["write", "print", "println"].contains(name),
            (ql.contains("getwriter") || ql.hasPrefix("out.")),
            args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
-            let near = self.nearSource(offset)
-            if !near.contains("escape") && !near.contains("encode") {
+            let near = self.statementText(offset)
+            if !near.contains("escape") && !near.contains("encode") && !near.contains("esc(") {
                 emit(&findings, function, offset,
                      AstSinkRule(category: "XSS (HTML Injection)", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
                      message: "\(name) writes attacker-controlled data into an HTTP response without encoding.",
@@ -279,10 +323,14 @@ extension AstSecurityDetector {
             }
         }
         // Server-side template injection: TemplateEngine/Template render/process
-        // driven by tainted names/models.
+        // driven by a tainted *template name* (the first argument); the model/
+        // context arguments are attacker data by design and are not the
+        // injection point. Receiver types include `TemplateEngine`, `Template`,
+        // `ThymeleafTemplate`, etc.
         if ["process", "render"].contains(name),
-           (ql.contains("template") || ql.contains("thymeleaf") || ql.contains("freemarker")),
-           args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+           (ql.contains("template") || ql.contains("thymeleaf") || ql.contains("freemarker")
+            || self.javaVarHasTemplateType(firstSegment(qualified), source: source)),
+           let firstArg = args.first, exprTainted(firstArg, tainted: tainted) != nil {
             emit(&findings, function, offset,
                  AstSinkRule(category: "Template Injection", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
                  message: "\(name) renders a server-side template using untrusted data; template injection is possible.",
@@ -338,7 +386,7 @@ extension AstSecurityDetector {
         // Java SSRF sinks.
         if ["Socket", "InetSocketAddress"].contains(name), args.count >= 1,
            exprTainted(args[0], tainted: tainted) != nil,
-           !source.uppercased().contains("ALLOWED_HOSTS") {
+           !self.statementText(args[0].offset).contains("allowed_hosts") {
             emit(&findings, function, offset,
                  AstSinkRule(category: "SSRF", severity: .high, vulnArgIndex: nil, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
                  message: "\(name) connects to a host derived from untrusted data; SSRF is possible.",

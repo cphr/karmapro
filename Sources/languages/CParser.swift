@@ -1208,7 +1208,8 @@ public final class CParser {
         let off = current.offset
         advance()
         // array form new[]
-        if isPunct("[") { skipSquareBalanced() }
+        var arrayForm = false
+        if isPunct("[") { skipSquareBalanced(); arrayForm = true }
         var typeName = ""
         while current.kind == .identifier || isOp("::") || current.kind == .keyword {
             if isOp("::") { typeName += "::"; advance(); continue }
@@ -1218,6 +1219,8 @@ public final class CParser {
             advance()
             break
         }
+        // Java puts the bracket after the type name: `new String[] {...}`.
+        if isPunct("[") { skipSquareBalanced(); arrayForm = true }
         var args: [CExpr] = []
         if isPunct("(") {
             advance()
@@ -1226,6 +1229,21 @@ public final class CParser {
                 if !match(",") { break }
             }
             _ = match(")")
+        } else if arrayForm, isPunct("{") {
+            // `new String[] {"a", "b"}` — the brace initializer is one argument
+            // array. (Java anonymous classes `new Runnable() {...}` hit the
+            // paren branch and are left as plain constructors.)
+            advance()
+            var elems: [CExpr] = []
+            while !isPunct("}") && current.kind != .eof {
+                if !isPunct(",") { elems.append(parseAssignment()) }
+                else { advance() }
+                if !match(",") {
+                    if isPunct("}") { break }
+                }
+            }
+            _ = match("}")
+            args.append(.arrayInit(elements: elems, off))
         }
         return .newExpr(typeName: typeName, args: args, off)
     }
