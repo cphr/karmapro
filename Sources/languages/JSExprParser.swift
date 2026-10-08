@@ -302,13 +302,16 @@ public final class JSExprParser {
                     i += 1
                 }
                 // bound names inside the pattern
+                let patternStart = decls.count
                 for k in start..<i where tokens[k].kind == .identifier && !jsKeywords.contains(tokens[k].text) {
                     decls.append((tokens[k].text, nil))
                 }
                 if peek().text == "=" {
                     i += 1
                     let e = parseExpression(until: nil)
-                    if !decls.isEmpty { decls[decls.count - 1].1 = e }
+                    // Every bound name gets the initializer: `const { a, b } = req.body`
+                    // taints a and b alike (a bare first name is otherwise unbound taint).
+                    for idx in patternStart..<decls.count { decls[idx].1 = e }
                 }
             } else if peek().kind == .identifier {
                 let name = peek().text

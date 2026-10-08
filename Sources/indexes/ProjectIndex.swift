@@ -12,6 +12,25 @@ struct FileAnalysis {
     /// Per-file parameter-taint seeds: which parameters of each function are
     /// tainted at some call site in this file (cross-file parameter provenance).
     let paramTaintSeeds: [String: Set<Int>]
+    /// JS helpers that always escape (sanitizerReturning) or host-validate
+    /// (validatedReturning) their argument before returning.
+    let jsSanitizerReturning: Set<String>
+    let jsValidatedReturning: Set<String>
+
+    init(url: URL, taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
+         astFns: [String: CFunctionDef], callees: [String: [String]],
+         phpSanitizers: Set<String>, paramTaintSeeds: [String: Set<Int>],
+         jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = []) {
+        self.url = url
+        self.taintReturning = taintReturning
+        self.writeThroughParam = writeThroughParam
+        self.astFns = astFns
+        self.callees = callees
+        self.phpSanitizers = phpSanitizers
+        self.paramTaintSeeds = paramTaintSeeds
+        self.jsSanitizerReturning = jsSanitizerReturning
+        self.jsValidatedReturning = jsValidatedReturning
+    }
 }
 
 /// Project-wide cross-file analysis index. Built by scanning all source files
@@ -65,6 +84,10 @@ struct ProjectIndex {
     /// downstream allocation/copy by it is not the unbounded overflow the
     /// taint heuristic assumes. Registered under full and short names.
     let globalClampedReturnFns: Set<String>
+    /// Project-wide JS functions that always escape or host-validate their
+    /// argument before returning (merged per-file wrapper classification).
+    let globalJsSanitizerReturning: Set<String>
+    let globalJsValidatedReturning: Set<String>
 
     /// All source APIs across all languages, used for the cross-file
     /// taint-returning fixpoint.
@@ -110,6 +133,8 @@ struct ProjectIndex {
         let globalDefinedFunctions = projectFunctionNames(astFns: globalAST, files: files, readSource: readSource)
         let globalClampedReturnFns = clampedReturnFunctions(astFns: globalAST)
         let globalParamSeeds = mergeParamTaintSeeds(analyses: analyses)
+        let globalJsSanitizerReturning = Set(analyses.values.flatMap { $0.jsSanitizerReturning })
+        let globalJsValidatedReturning = Set(analyses.values.flatMap { $0.jsValidatedReturning })
 
         return ProjectIndex(fileAnalyses: analyses,
                             globalTaintReturning: globalTaint,
@@ -122,7 +147,9 @@ struct ProjectIndex {
                             globalParamTaintSeeds: globalParamSeeds,
                             globalConstantFormats: globalConstantFormats,
                             globalDefinedFunctions: globalDefinedFunctions,
-                            globalClampedReturnFns: globalClampedReturnFns)
+                            globalClampedReturnFns: globalClampedReturnFns,
+                            globalJsSanitizerReturning: globalJsSanitizerReturning,
+                            globalJsValidatedReturning: globalJsValidatedReturning)
     }
 
     /// True when a C expression denotes a fixed capacity: a literal, a
@@ -1074,6 +1101,7 @@ struct ProjectIndex {
                                         sourceAPIs: jsSourceAPIs,
                                         writeThroughSinks: jsWriteThroughSinks)
             let jsAnalysis = jsAnalyzer.analyze()
+            let jsWrappers = classifyJsReturningWrappers(defs: jsDefs, tokens: jsTokens)
             // Intra-file call edges for the cross-file taint fixpoint: an
             // identifier followed by `(` inside a body that names another
             // defined function in this file.
@@ -1101,7 +1129,9 @@ struct ProjectIndex {
                                  writeThroughParam: jsAnalysis.writeThroughParam,
                                  astFns: jsAnalyzer.astFunctions, callees: calleesMap,
                                   phpSanitizers: [],
-                                  paramTaintSeeds: jsAnalysis.paramTaintSeeds)
+                                  paramTaintSeeds: jsAnalysis.paramTaintSeeds,
+                                  jsSanitizerReturning: jsWrappers.sanitizer,
+                                  jsValidatedReturning: jsWrappers.validated)
         }
 
         if isSwift {

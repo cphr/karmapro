@@ -31,7 +31,7 @@ let jsTaintPropagators: Set<String> = [
     "trim", "trimStart", "trimEnd", "toString", "valueOf", "slice", "substring",
     "substr", "concat", "toLowerCase", "toUpperCase", "padStart", "padEnd",
     "repeat", "replace", "replaceAll", "split", "join", "flat", "map", "filter",
-    "find", "at",
+    "find", "at", "text", "json", "arrayBuffer", "blob", "formData", "buffer",
 ]
 
 /// Source APIs whose synchronous return value is attacker-controlled.
@@ -72,6 +72,8 @@ private final class WalkContext {
     var loopInclusive: Bool = false
     var objectLitVars: Set<String> = []     // locals declared as { … } keyed lookup tables
     var dictionaryKeyVars: Set<String> = [] // vars iterating Object.keys(...) — keyed lookup, not positional index
+    var validatedExprs: Set<String> = []    // names proven safe by an earlier exit-guard on this path
+    var protoValidated: Bool = false        // __proto__-rejection exit-guard seen on this path
 
     func child() -> WalkContext {
         let c = WalkContext()
@@ -83,6 +85,8 @@ private final class WalkContext {
         c.loopBase = loopBase
         c.loopInclusive = loopInclusive
         c.dictionaryKeyVars = dictionaryKeyVars
+        c.validatedExprs = validatedExprs
+        c.protoValidated = protoValidated
         return c
     }
 }
@@ -106,17 +110,31 @@ struct JSSecurityDetector {
     private let reachableNames: Set<String>
     private let taintReturning: Set<String>
     private let crossFileSources: Set<String>
+    /// Project-wide functions that always escape or host-validate their
+    /// argument before returning (classified per file in ProjectIndex).
+    private let sanitizerReturning: Set<String>
+    private let validatedReturning: Set<String>
+    /// Same-file wrappers classified directly from this file's defs.
+    private let localSanitizerReturning: Set<String>
+    private let localValidatedReturning: Set<String>
 
     init(source: String, defs: [JSDef], tokens: [CAstToken]? = nil,
          reachableNames: Set<String> = [],
          taintReturning: Set<String> = [],
-         crossFileSources: Set<String> = []) {
+         crossFileSources: Set<String> = [],
+         sanitizerReturning: Set<String> = [],
+         validatedReturning: Set<String> = []) {
         self.source = source
         self.defs = defs
         self.tokens = tokens ?? JSTokenizer(source: source).tokenize()
         self.reachableNames = reachableNames
         self.taintReturning = taintReturning
         self.crossFileSources = crossFileSources
+        self.sanitizerReturning = sanitizerReturning
+        self.validatedReturning = validatedReturning
+        let local = classifyJsReturningWrappers(defs: defs, tokens: self.tokens)
+        self.localSanitizerReturning = local.sanitizer
+        self.localValidatedReturning = local.validated
     }
 
     func detect() -> [JSFinding] {
@@ -217,6 +235,16 @@ struct JSSecurityDetector {
         return false
     }
 
+    /// The concatenated form `"auth token: " + expr` (a credential-named word
+    /// inside the quoted template immediately before a string concatenation),
+    /// which object-literal colon parsing misses.
+    private func sensitiveConcatLog(in text: String) -> Bool {
+        guard let re = try? NSRegularExpression(pattern: "(?i)[\"'][^\"']*\\b(password|passwd|pwd|token|secret|apikey|api_key|access[_-]?key|private[_-]?key|session[_-]?id|ssn|credit[_-]?card|credential\\w*|auth\\w*)\\b[^\"']*[\"']\\s*\\+") else {
+            return false
+        }
+        return re.rangeOfFirstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)).location != NSNotFound
+    }
+
     /// Joined token text of a function body (for guard-shape checks), with
     /// spaces removed so token-boundary artifacts don't hide patterns.
     private func bodyText(of def: JSDef) -> String {
@@ -227,63 +255,73 @@ struct JSSecurityDetector {
         bodyText(of: def).replacingOccurrences(of: " ", with: "")
     }
 
-    /// True when the function rejects control characters before use — the
-    /// classic CRLF guard (`if (/[\r\n]/.test(next)) throw …`).
-    private func bodySourceContainsCRFGuard(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        return text.contains("\\r") && text.contains("throw")
+    /// True when the given statement list can never fall through (ends in
+    /// return/throw, or an if/else whose branches both exit).
+    private func alwaysExits(_ stmts: [JSStmt]) -> Bool {
+        guard let last = stmts.last else { return false }
+        switch last {
+        case .returnStmt, .throwStmt:
+            return true
+        case .ifStmt(_, let t, let e, _):
+            if let e = e { return alwaysExits(t) && alwaysExits(e) }
+            return false
+        case .block(let inner, _):
+            return alwaysExits(inner)
+        default:
+            return false
+        }
     }
 
-    /// True when the function validates against an allowlist before the
-    /// sink (`if (!ALLOWED_HOSTS.has(host)) throw …`,
-    /// `if (!ALLOWED_HOSTS.includes(host)) return …`).
-    private func bodySourceContainsAllowlistGate(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        return (text.contains(".has(") || text.contains(".includes(")) && text.contains("throw")
+    /// Names constrained on the path that survives an exit-guard: if an
+    /// `if (...) { throw }` guard passes, the expressions it tested are known
+    /// safe for every statement that follows.
+    private func collectGuardedNames(_ e: JSExpr) -> Set<String> {
+        var names = Set<String>()
+        func walk(_ x: JSExpr) {
+            switch x {
+            case .ident(let n, _):
+                names.insert(n)
+            case .member(let b, let m, _):
+                names.insert(b.dottedName.isEmpty ? m : "\(b.dottedName).\(m)")
+                names.insert(m)
+                walk(b)
+            case .index(let b, let i, _):
+                walk(b); walk(i)
+            case .binary(_, let l, let r, _), .assign(_, let l, let r, _):
+                walk(l); walk(r)
+            case .unary(_, let o, _):
+                walk(o)
+            case .ternary(let c, let t, let f, _):
+                walk(c); walk(t); walk(f)
+            case .arrayLit(let els, _):
+                for el in els { walk(el) }
+            case .call(let c, let args, _), .new(let c, let args, _):
+                walk(c)
+                for a in args { walk(a) }
+            case .template:
+                for interp in x.templateExprs() { walk(interp) }
+            default:
+                break
+            }
+        }
+        walk(e)
+        return names
     }
 
-    /// True when a set/array-membership allowlist guards the call site
-    /// (`if (ALLOWED_ORIGINS.has(origin))`, `if (config.ORIGINS.includes(origin))`
-    /// — Set.has or Array.includes, both of which constrain the value to an
-    /// enumerated allowlist before it reaches the header sink).
-    private func bodyHasSetAllowlistGate(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        return text.contains(".has(") || text.contains(".includes(")
+    /// True when this argument expression was validated by an earlier
+    /// exit-guard on the current path (exact dotted-name match).
+    private func isGuardedArg(_ arg: JSExpr?, ctx: WalkContext) -> Bool {
+        guard let arg = arg else { return false }
+        let n = arg.dottedName
+        return !n.isEmpty && ctx.validatedExprs.contains(n)
     }
 
-    /// True when the function rejects a URL based on its host before any
-    /// outbound request — either an allowlist set (`ALLOWED_HOSTS.has(host)`,
-    /// `config.HOSTS.includes(host)`) or a blocklist of forbidden addresses
-    /// (`if (host === '169.254.169.254' …) throw`). Both are the standard SSRF
-    /// egress gates; `reject` is the promise-style `throw` (`Promise.reject` /
-    /// `callback reject`) used by helper-wrapped requests.
-    private func bodyHasHostValidationGate(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        let exits = text.contains("throw") || text.contains("reject")
-        return exits && (text.contains(".has(") || text.contains(".includes(") || text.contains("hostname"))
-    }
-
-    /// True when the function type-validates its inputs with an explicit
-    /// rejection (`if (typeof x !== 'string') throw …`).
-    private func bodySourceTypeValidationGate(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        return text.contains("typeof") && text.contains("throw")
-    }
-
-    /// True when the function validates a redirect target with a prefix check
-    /// plus rejection (`if (!next.startsWith('/') || next.startsWith('//')) throw …`).
-    private func bodyHasPrefixRejectGuard(_ def: JSDef) -> Bool {
-        let text = flatBodyText(of: def)
-        return text.contains("startsWith(") && text.contains("throw")
-    }
-
-    /// True when the file contains a prototype-key rejection guard
-    /// (`if (key === '__proto__' || …) throw …`) — the mitigation lives in the
-    /// sanitizer helper that runs before the merge, not at the assign site.
-    private func bodyHasPrototypeKeyRejection(_ def: JSDef) -> Bool {
-        let lower = source.lowercased()
-        let hasKeyCheck = lower.contains("'__proto__'") || lower.contains("\"__proto__\"")
-        return hasKeyCheck && lower.contains("throw")
+    /// True when some tainted call argument was validated by an exit-guard.
+    private func taintedArgsGuarded(_ args: [JSExpr], _ vals: [TaintVal], ctx: WalkContext) -> Bool {
+        for (i, v) in vals.enumerated() where v.tainted {
+            if isGuardedArg(i < args.count ? args[i] : nil, ctx: ctx) { return true }
+        }
+        return false
     }
 
     /// True when a tainted value carries evidence of a request/attacker surface
@@ -352,13 +390,42 @@ struct JSSecurityDetector {
             // Then-branch: condition guards hold.
             let thenCtx = ctx.child()
             refineGuards(cond: cond, ctx: thenCtx)
+            // `if (ok) { … } else { throw }` — valid code is inside the then.
+            if let eb = elseBody, alwaysExits(eb) {
+                thenCtx.validatedExprs.formUnion(collectGuardedNames(cond))
+            }
             walkAll(thenBody, ctx: thenCtx, def: def, into: &findings)
-            if let eb = elseBody {
-                walkAll(eb, ctx: ctx.child(), def: def, into: &findings)
+            let elseCtx: WalkContext? = elseBody.map { eb in
+                let c = ctx.child()
+                walkAll(eb, ctx: c, def: def, into: &findings)
+                return c
+            }
+            // A then-branch that always exits validates its condition for the
+            // code AFTER the if (`if (!ok(x)) throw; … safe path …`).
+            if alwaysExits(thenBody) {
+                ctx.validatedExprs.formUnion(collectGuardedNames(cond))
+                let condText = sourceText(from: cond).lowercased()
+                if condText.contains("__proto__") || condText.contains("constructor.prototype") {
+                    ctx.protoValidated = true
+                }
             }
             // Early-exit patterns (`if (!x) throw/return`, `if (i >= len) return`)
             // guard everything AFTER the statement.
             applyEarlyExitGuards(cond: cond, thenBody: thenBody, ctx: ctx)
+            // Phi-join: a variable written in a non-exiting branch survives the
+            // statement as the union of the branch values.
+            var surviving = ctx.vars
+            if !alwaysExits(thenBody) {
+                for (k, v) in thenCtx.vars {
+                    surviving[k] = surviving[k].map { $0.union(v) } ?? v
+                }
+            }
+            if let ec = elseCtx {
+                for (k, v) in ec.vars {
+                    surviving[k] = surviving[k].map { $0.union(v) } ?? v
+                }
+            }
+            ctx.vars = surviving
 
         case .forStmt(let loopVar, let bound, let inclusive, let iterable, let isForOf, let body, let offset):
             if let it = iterable { _ = evalExpr(it, ctx: ctx, def: def, into: &findings) }
@@ -381,10 +448,19 @@ struct JSSecurityDetector {
                 bodyCtx.loopBase = lengthBaseName(of: b)
             }
             walkAll(body, ctx: bodyCtx, def: def, into: &findings)
+            // Loop phi: writes inside the body may reach the code after the loop.
+            for (k, v) in bodyCtx.vars {
+                ctx.vars[k] = ctx.vars[k].map { $0.union(v) } ?? v
+            }
 
         case .whileStmt(let cond, let body, _):
             _ = evalExpr(cond, ctx: ctx, def: def, into: &findings)
-            walkAll(body, ctx: ctx.child(), def: def, into: &findings)
+            let bodyCtx = ctx.child()
+            walkAll(body, ctx: bodyCtx, def: def, into: &findings)
+            // Loop phi: writes inside the body may reach the code after the loop.
+            for (k, v) in bodyCtx.vars {
+                ctx.vars[k] = ctx.vars[k].map { $0.union(v) } ?? v
+            }
 
         case .returnStmt(let e, _):
             if let e = e { _ = evalExpr(e, ctx: ctx, def: def, into: &findings) }
@@ -590,12 +666,18 @@ struct JSSecurityDetector {
                                         severity: .medium, reachable: reachable,
                                         message: "\(leaf) with a string argument compiles it as code.",
                                         taint: nil))
+            } else if argVals.first?.tainted == true {
+                // Concatenated string timer: `setTimeout("tick('" + id + "')", …)`.
+                findings.append(finding(def: def, offset: offset, category: "Timer String Injection",
+                                        severity: .medium, reachable: reachable,
+                                        message: "\(leaf) compiles a tainted string argument as code.",
+                                        taint: taintPath(argVals.first).map { "\($0) → \(leaf)" }))
             }
         case "write", "writeln":
-            if name.contains("document") {
+            if name.contains("document"), argVals.first?.tainted == true {
                 findings.append(finding(def: def, offset: offset, category: "XSS (document.write)",
                                         severity: .high, reachable: reachable,
-                                        message: "document.write can inject script into the page.",
+                                        message: "document.write writes untrusted data that can inject script into the page.",
                                         taint: taintPath(argVals.first).map { "\($0) → document.write" }))
             }
         case "insertAdjacentHTML":
@@ -634,7 +716,7 @@ struct JSSecurityDetector {
                 if leaf == "assign", args.count >= 2 {
                     let targetTainted = argVals[0].tainted
                     let attackerKeyedSources = argVals.dropFirst().contains { considerAttackerKeyedSource($0) }
-                    if targetTainted || (attackerKeyedSources && !bodyHasPrototypeKeyRejection(def)) {
+                    if targetTainted || (attackerKeyedSources && !ctx.protoValidated) {
                         findings.append(finding(def: def, offset: offset, category: "Prototype Pollution",
                                                 severity: .high, reachable: reachable,
                                                 message: "Object.\(leaf) with attacker-controlled target/keys can pollute Object.prototype.",
@@ -666,9 +748,10 @@ struct JSSecurityDetector {
             }
         case "fetch":
             if argVals.first?.tainted == true {
-                // A host allowlist checked with `.has(...)` + reject before the
-                // request is the standard SSRF mitigation.
-                if bodySourceContainsAllowlistGate(def) { return .clean }
+                // A host allowlist checked on the URL with an exit-guard
+                // (`if (!ALLOWED.has(host)) throw`) before the request is the
+                // standard SSRF mitigation.
+                if isGuardedArg(args.first, ctx: ctx) { return .clean }
                 findings.append(finding(def: def, offset: offset, category: "SSRF",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted URL in fetch request.",
@@ -676,11 +759,10 @@ struct JSSecurityDetector {
             }
         case "request":
             if argVals.first?.tainted == true {
-                // A host allowlist/blocklist gate (`.has(...)`, `.includes(...)`
-                // on the host, or an explicit https-only hostname rejection)
-                // before the request is the standard SSRF mitigation — the same
-                // relief the `fetch` sink applies.
-                if bodyHasHostValidationGate(def) { return .clean }
+                // A host allowlist/blocklist gate on the URL (`ALLOWED.has(host)`,
+                // `hostname` rejection) before the request is the standard SSRF
+                // mitigation — the same relief the `fetch` sink applies.
+                if isGuardedArg(args.first, ctx: ctx) { return .clean }
                 findings.append(finding(def: def, offset: offset, category: "SSRF",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted URL/options in HTTP request.",
@@ -708,15 +790,13 @@ struct JSSecurityDetector {
             if argVals.first?.tainted == true {
                 // `if (!next.startsWith('/') || …) throw` — a prefix allowlist
                 // with rejection is the standard open-redirect mitigation.
-                if bodyHasPrefixRejectGuard(def) {
-                    return TaintVal.clean
-                }
+                if isGuardedArg(args.first, ctx: ctx) { return TaintVal.clean }
                 findings.append(finding(def: def, offset: offset, category: "Open Redirect",
                                         severity: .high, reachable: reachable,
                                         message: "Tainted redirect target.",
                                         taint: "\(taintPath(argVals.first) ?? "?") → redirect"))
             }
-        case "render", "renderString":
+        case "render", "renderString", "compile":
             let templated = ["nunjucks", "ejs", "pug", "handlebars", "mustache", "hogan"]
                 .contains { name.lowercased().contains($0) }
             if templated, argVals.first?.tainted == true {
@@ -811,7 +891,11 @@ struct JSSecurityDetector {
             // and ordinary fields (email, user id) are not sensitive keys.
             if name.lowercased().contains("console") {
                 for (a, v) in zip(args, argVals) where v.tainted {
-                    if sensitiveLiveValue(in: sourceText(from: a)) {
+                    // Bound the probe to the current statement's line: the raw
+                    // 240-char window can bleed forward into later statements.
+                    let raw = sourceText(from: a)
+                    let text = raw.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? raw
+                    if sensitiveLiveValue(in: text) || sensitiveConcatLog(in: text) {
                         findings.append(finding(def: def, offset: offset, category: "Sensitive Data Logging",
                                                 severity: .medium, reachable: reachable,
                                                 message: "Sensitive credential written to the log; leaked log files expose it.",
@@ -827,7 +911,8 @@ struct JSSecurityDetector {
             // header value passed an allowlist gate (`ALLOWED_ORIGINS.has(...)`).
             let valueIndex = leaf == "writeHead" ? 1 : 1
             if args.count > valueIndex, argVals[valueIndex].tainted == true {
-                let guarded = bodySourceContainsCRFGuard(def) || bodyHasSetAllowlistGate(def)
+                // A CRLF-rejection or allowlist exit-guard on the value suppresses.
+                let guarded = isGuardedArg(args.count > valueIndex ? args[valueIndex] : nil, ctx: ctx)
                 if !guarded {
                     findings.append(finding(def: def, offset: offset, category: "Header Injection (CRLF)",
                                             severity: .high, reachable: reachable,
@@ -842,9 +927,9 @@ struct JSSecurityDetector {
             let clientReceivers: Set<String> = ["superagent", "needle", "undici", "request"]
             let receiver = name.components(separatedBy: ".").dropLast().last?.lowercased() ?? ""
             if clientReceivers.contains(receiver), !args.isEmpty, argVals.first?.tainted == true {
-                // A host allowlist checked with `set.has(...)` + reject before
-                // the request is the standard SSRF mitigation.
-                let allowlisted = bodySourceContainsAllowlistGate(def)
+                // A host allowlist exit-guard on the URL is the standard SSRF
+                // mitigation (`if (!set.has(host)) throw …`).
+                let allowlisted = isGuardedArg(args.first, ctx: ctx)
                 if !allowlisted {
                     findings.append(finding(def: def, offset: offset, category: "SSRF",
                                             severity: .high, reachable: reachable,
@@ -857,7 +942,9 @@ struct JSSecurityDetector {
             // the function explicitly type-validates the input (`typeof x === 'string'`)
             // with a rejection — the safe-parameterized boundary.
             if args.contains(where: { sourceText(from: $0).contains("$where") }) || argVals.contains(where: { $0.tainted }) {
-                let validated = bodySourceTypeValidationGate(def)
+                // A typeof/rejection exit-guard on the tainted argument is the
+                // safe-parameterized boundary.
+                let validated = taintedArgsGuarded(args, argVals, ctx: ctx)
                 if !validated {
                     findings.append(finding(def: def, offset: offset, category: "NoSQL Injection",
                                             severity: .high, reachable: reachable,
@@ -914,7 +1001,7 @@ struct JSSecurityDetector {
         if (name.contains("http") || name.contains("axios") || name.contains("got")),
            ["get", "post", "put", "delete"].contains(leaf),
            argVals.first?.tainted == true,
-           !bodyHasHostValidationGate(def) {
+           !isGuardedArg(args.first, ctx: ctx) {
             findings.append(finding(def: def, offset: offset, category: "SSRF",
                                     severity: .high, reachable: reachable,
                                     message: "Tainted URL in outbound request (\(name)).",
@@ -927,6 +1014,17 @@ struct JSSecurityDetector {
             return unionAll(argVals)
         }
         if jsSanitizers.contains(name) || jsSanitizers.contains(leaf) {
+            return .clean
+        }
+        // Local and cross-file sanitizer/validation wrappers (functions whose
+        // body always escapes or host-validates before returning) neutralize
+        // attacker-controlled arguments like the known sanitizers themselves.
+        if sanitizerReturning.contains(name) || sanitizerReturning.contains(leaf)
+            || localSanitizerReturning.contains(name) || localSanitizerReturning.contains(leaf) {
+            return .clean
+        }
+        if validatedReturning.contains(name) || validatedReturning.contains(leaf)
+            || localValidatedReturning.contains(name) || localValidatedReturning.contains(leaf) {
             return .clean
         }
         if jsSyncReturnSources.contains(leaf) {
@@ -1448,6 +1546,44 @@ struct JSSecurityDetector {
         }
         return findings
     }
+}
+
+/// Classifies defined JS functions that neutralize their argument before
+/// returning, so callers can treat the result as clean even when the input is
+/// attacker-controlled:
+///  - sanitizer: the body's return expression is a known HTML/URL sanitizer
+///    call (`return escapeHtml(v)` / `return encodeURIComponent(v)`);
+///  - validated: the body rejects bad hosts with an exit-guard and returns a
+///    value built from the (now allowed) input (`ALLOWED.has(host) → throw`).
+/// Consumed both per-file by JSSecurityDetector and merged project-wide by
+/// ProjectIndex so cross-file wrappers are neutralized at the call site.
+func classifyJsReturningWrappers(defs: [JSDef], tokens: [CAstToken]) -> (sanitizer: Set<String>, validated: Set<String>) {
+    let sanitizerLeaves: Set<String> = [
+        "encodeURIComponent", "encodeURI", "escape", "sanitize", "sanitizeHtml",
+        "sanitizeHTML", "escapeHtml", "escapeHTML", "stripTags", "htmlEncode",
+        "encodeHtml", "htmlEscape", "Number",
+    ]
+    var sanitizer = Set<String>()
+    var validated = Set<String>()
+    for def in defs {
+        let flat = tokens
+            .filter { $0.offset >= def.bodyRange.location && $0.offset < def.bodyRange.location + def.bodyRange.length && $0.kind != .eof }
+            .map { $0.text }
+            .joined(separator: " ")
+            .replacingOccurrences(of: " ", with: "")
+        if let rt = flat.range(of: "return"),
+           sanitizerLeaves.contains(where: { flat[rt.upperBound...].hasPrefix($0 + "(") }) {
+            sanitizer.insert(def.name)
+            continue
+        }
+        let gated = flat.contains(".has(") || flat.contains(".includes(")
+        let exiting = flat.contains("throw") || flat.contains("return")
+        let hostShaped = flat.contains("hostname") || flat.contains(".host") || flat.contains("href") || flat.contains("protocol")
+        if gated, exiting, hostShaped {
+            validated.insert(def.name)
+        }
+    }
+    return (sanitizer, validated)
 }
 
 /// True when an `http://` occurrence is a protocol-guard literal — the `'http://'`
