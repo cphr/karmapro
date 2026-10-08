@@ -53,8 +53,17 @@ private struct TaintVal {
         if !tainted { return other }
         if !other.tainted { return self }
         return TaintVal(tainted: true,
-                        origin: origin.map { "\($0), \(other.origin ?? "?")" },
+                        origin: Self.cappedOrigin(origin, other.origin),
                         crossFile: crossFile || other.crossFile)
+    }
+
+    /// Bounds a joined origin string; unlimited joins would do O(N²) char copies.
+    private static func cappedOrigin(_ a: String?, _ b: String?) -> String? {
+        guard let a = a, let b = b else { return a ?? b }
+        let joined = "\(a), \(b)"
+        guard joined.count > 160 else { return joined }
+        let head = joined.prefix(130)
+        return "\(head)…(+\(joined.count - 160))"
     }
 }
 
@@ -574,25 +583,24 @@ struct JSSecurityDetector {
             return val
 
         case .objectLit(let offset):
-            // The parser keeps object literals opaque, so taint is derived from
-            // the identifier tokens inside the literal's extent: an object
-            // built from `req.body.*` / tainted locals carries their taint.
-            var val = TaintVal.clean
-            var depth = 0
             if let start = tokens.firstIndex(where: { $0.offset >= offset && ($0.text == "{" || $0.text == "[") }) {
+                var depth = 0
+                var checked = 0
                 for t in tokens[start...] {
+                    checked += 1
+                    if checked > 128 { break }
                     if t.text == "{" || t.text == "[" || t.text == "(" { depth += 1 }
                     if t.text == "}" || t.text == "]" || t.text == ")" {
                         depth -= 1
                         if depth <= 0 { break }
                     }
                     if t.kind == .identifier {
-                        if let v = ctx.vars[t.text], v.tainted { val = val.union(v) }
-                        else if jsSourceAPIs.contains(t.text) { val = .tainted(t.text) }
+                        if let v = ctx.vars[t.text], v.tainted { return v }
+                        if jsSourceAPIs.contains(t.text) { return .tainted(t.text) }
                     }
                 }
             }
-            return val
+            return TaintVal.clean
 
         case .arrow(let params, let body, _):
             let arrowCtx = ctx.child()
@@ -614,6 +622,14 @@ struct JSSecurityDetector {
                           into findings: inout [JSFinding], isNew: Bool = false) -> TaintVal {
         let name = callee.dottedName
         let leaf = name.components(separatedBy: ".").last ?? name
+        // `this.fetch(...)`/`super.fetch(...)` are user-class methods (shields'
+        // service classes define `fetch({ packageName })`), not the global API.
+        let isThisMethod = name.hasPrefix("this.") || name.hasPrefix("super.")
+        // `fetch` is only used as the Fetch API with no receiver or a browser/global
+        // root; member calls on any other object are application methods.
+        let calleeReceiver = name.components(separatedBy: ".").dropLast().last?.lowercased() ?? ""
+        let isApiFetchReceiver = calleeReceiver.isEmpty
+            || ["window", "global", "globalThis", "self"].contains(calleeReceiver)
         let reachable = isReachable(def)
 
         // Bind callback parameters as tainted when the callee is a source or
@@ -747,8 +763,20 @@ struct JSSecurityDetector {
                                         taint: "\(taintPath(argVals.first) ?? "?") → fs.\(leaf)"))
             }
         case "fetch":
-            if argVals.first?.tainted == true {
-                // A host allowlist checked on the URL with an exit-guard
+            // Sink = global Fetch API: a bare `fetch` not bound to a local
+            // (param/let), or a call through a browser/global root. `this.fetch`,
+            // `super.fetch` and member calls on app objects are plain methods.
+            // Not the Fetch API either: `fetch` bound as a local, an options
+            // object as first argument, or a same-file `function fetch` decl.
+            let boundLocal = ctx.vars["fetch"] != nil
+            let objectOptions: Bool = {
+                if case .objectLit = args.first { return true }
+                return false
+            }()
+            let fileDeclaredFetch = defs.contains { $0.kind == .function && $0.name == "fetch" }
+            if argVals.first?.tainted == true, isApiFetchReceiver, !boundLocal,
+               !objectOptions, !fileDeclaredFetch {
+                // Host allowlist checked on the URL with an exit-guard
                 // (`if (!ALLOWED.has(host)) throw`) before the request is the
                 // standard SSRF mitigation.
                 if isGuardedArg(args.first, ctx: ctx) { return .clean }
@@ -758,7 +786,7 @@ struct JSSecurityDetector {
                                         taint: "\(taintPath(argVals.first) ?? "?") → fetch"))
             }
         case "request":
-            if argVals.first?.tainted == true {
+            if argVals.first?.tainted == true, !isThisMethod {
                 // A host allowlist/blocklist gate on the URL (`ALLOWED.has(host)`,
                 // `hostname` rejection) before the request is the standard SSRF
                 // mitigation — the same relief the `fetch` sink applies.
