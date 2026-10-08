@@ -18,13 +18,28 @@ final class ScanWindowController: NSWindowController {
     private let progressBar = NSProgressIndicator()
     private let rescanButton = NSButton(title: "Rescan", target: nil, action: nil)
     private let ignoreButton = NSButton(title: "Ignore issue", target: nil, action: nil)
+    private let autoTriageButton = NSButton(title: "Triage (AI)", target: nil, action: nil)
     private let exportButton = NSButton(title: "Export Scan", target: nil, action: nil)
+
+    // MARK: - Triage state
+
+    /// Verdict per finding key (path#line): true = valid, false = invalid.
+    private var triageVerdicts: [String: Bool] = [:]
+    private var triageRows: [ScanFinding] = []
+    private var triageIndex = 0
+    private var triageFailed = 0
+    private var triageRunning = false
+    private var triageCancelled = false
+    private var triageColumn: NSTableColumn?
 
     private var findings: [ScanFinding] = [] {
         // Export is available exactly when the table has rows to export, so
         // every assignment that changes what is shown updates it here rather
         // than at each of the handful of assignment sites.
-        didSet { exportButton.isEnabled = !findings.isEmpty }
+        didSet {
+            exportButton.isEnabled = !findings.isEmpty
+            refreshAutoTriageButton()
+        }
     }
     private var scannedFolder: URL?
 
@@ -89,6 +104,8 @@ final class ScanWindowController: NSWindowController {
     override func showWindow(_ sender: Any?) {
         window?.center()
         window?.delegate = self
+        // The AI Assistant may have been configured since this window opened.
+        refreshAutoTriageButton()
         super.showWindow(sender)
     }
 
@@ -129,6 +146,26 @@ final class ScanWindowController: NSWindowController {
         ignoreButton.toolTip = "Hide this finding (persisted across sessions)"
         ignoreButton.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(ignoreButton)
+
+        // contentTintColor does not tint a small .rounded button, so the purple
+        // fill is drawn by the button's layer instead.
+        autoTriageButton.bezelStyle = .rounded
+        autoTriageButton.controlSize = .small
+        autoTriageButton.isBordered = false
+        autoTriageButton.wantsLayer = true
+        autoTriageButton.layer?.cornerRadius = 5
+        autoTriageButton.layer?.backgroundColor = NSColor.systemPurple.cgColor
+        // A borderless button shrinks to the title's line box, so its size is
+        // pinned to Ignore's and padded with spaces to match the bezel.
+        autoTriageButton.attributedTitle = NSAttributedString(string: "  Triage (AI)  ", attributes: [
+            .foregroundColor: NSColor.black,
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        ])
+        autoTriageButton.target = self
+        autoTriageButton.action = #selector(autoTriageClicked(_:))
+        autoTriageButton.toolTip = "Ask the AI model to check every finding for validity"
+        autoTriageButton.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(autoTriageButton)
 
         exportButton.bezelStyle = .rounded
         exportButton.controlSize = .small
@@ -205,6 +242,12 @@ final class ScanWindowController: NSWindowController {
         prColumn.width = 90
         prColumn.sortDescriptorPrototype = NSSortDescriptor(key: "inpr", ascending: true)
 
+        // Revealed by Triage (AI); hidden until a triage pass runs.
+        let triColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("triage"))
+        triColumn.title = "Triage"
+        triColumn.width = 70
+        triColumn.isHidden = true
+
         tableView.addTableColumn(expColumn)
         tableView.addTableColumn(sevColumn)
         tableView.addTableColumn(catColumn)
@@ -219,6 +262,9 @@ final class ScanWindowController: NSWindowController {
         prColumn.isHidden = true
         prReviewColumn = prColumn
         tableView.addTableColumn(prColumn)
+        triColumn.isHidden = true
+        triageColumn = triColumn
+        tableView.addTableColumn(triColumn)
         tableView.addTableColumn(msgColumn)
 
         tableView.usesAlternatingRowBackgroundColors = true
@@ -245,7 +291,11 @@ final class ScanWindowController: NSWindowController {
             aiThinkingLabel.trailingAnchor.constraint(equalTo: aiThinkingSpinner.leadingAnchor, constant: -4),
 
             aiThinkingSpinner.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
-            aiThinkingSpinner.trailingAnchor.constraint(lessThanOrEqualTo: ignoreButton.leadingAnchor, constant: -10),
+            aiThinkingSpinner.trailingAnchor.constraint(lessThanOrEqualTo: autoTriageButton.leadingAnchor, constant: -10),
+
+            autoTriageButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            autoTriageButton.heightAnchor.constraint(equalTo: ignoreButton.heightAnchor),
+            autoTriageButton.trailingAnchor.constraint(equalTo: ignoreButton.leadingAnchor, constant: -8),
 
             ignoreButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             ignoreButton.trailingAnchor.constraint(equalTo: exportButton.leadingAnchor, constant: -8),
@@ -272,9 +322,10 @@ final class ScanWindowController: NSWindowController {
     /// fresh scan. `wantsAI` comes from the prompt shown when the Security
     /// Scanner button is pressed.
     func load(folder: URL, wantsAI: Bool) {
-        // Scanning a plain folder ends any pull-request review: the "In PR?"
-        // column and its classifications describe a different question.
+        // Scanning a plain folder ends any pull-request review (the "In PR?"
+        // column describes a different question) and any triage of old rows.
         if prSession != nil { clearPullRequestReview() }
+        cancelAutoTriage()
         self.wantsAI = wantsAI
         scannedFolder = folder
         rescanButton.isEnabled = false
@@ -285,6 +336,7 @@ final class ScanWindowController: NSWindowController {
             let cachedFindings = enforceNoScannerDuplicates(ScanWindowController.cachedFindings)
             findings = applyIgnoredFilter(cachedFindings)
             applySorting()
+            resetTriage()
             tableView.reloadData()
             rescanButton.isEnabled = true
             if cachedFindings.isEmpty {
@@ -303,6 +355,7 @@ final class ScanWindowController: NSWindowController {
     /// base, then shows every finding with an "In PR?" column so the user can
     /// see at a glance which problems this change is responsible for.
     func loadPullRequestReview(_ session: PRReviewSession, wantsAI: Bool, wantsAIBase: Bool = false) {
+        cancelAutoTriage()
         prSession = session
         self.wantsAI = wantsAI
         self.wantsAIBase = wantsAIBase
@@ -340,6 +393,7 @@ final class ScanWindowController: NSWindowController {
             self.findings = self.applyIgnoredFilter(merged)
             self.applySorting()
             self.rebuildAwareness()
+            self.resetTriage()
             self.tableView.reloadData()
             self.updatePRStatus()
         })
@@ -523,11 +577,169 @@ final class ScanWindowController: NSWindowController {
         performScan(folder: folder)
     }
 
+    // MARK: - Triage (AI)
+
+    private func refreshAutoTriageButton() {
+        let enabled = OpenRouterClient.shared.isConfigured
+            && !findings.isEmpty && !triageRunning
+        autoTriageButton.isEnabled = enabled
+        autoTriageButton.layer?.backgroundColor =
+            (enabled ? NSColor.systemPurple : NSColor.systemGray).cgColor
+        autoTriageButton.alphaValue = enabled ? 1.0 : 0.6
+    }
+
+    @objc private func autoTriageClicked(_ sender: Any?) {
+        // rescanButton is disabled exactly while a scan / AI phase is running.
+        guard !triageRunning, !findings.isEmpty, rescanButton.isEnabled else { return }
+        guard OpenRouterClient.shared.isConfigured else { return }
+        let client = OpenRouterClient.shared
+        let ask = NSAlert()
+        ask.messageText = "Triage with AI"
+        ask.informativeText = "Triage is 60-80% accurate depending on the model used, so it is recommended to also verify the results.\n\nEvery finding in the table will be checked with \(client.selectedModel) (\(client.provider.rawValue)). This sends the finding details to the AI model and consumes tokens / credits from your AI account (unless you use Ollama and a local model)."
+        ask.alertStyle = .informational
+        ask.addButton(withTitle: "Triage")
+        ask.addButton(withTitle: "Cancel")
+        guard ask.runModal() == .alertFirstButtonReturn else { return }
+        startAutoTriage()
+    }
+
+    private func startAutoTriage() {
+        triageRows = findings
+        guard !triageRows.isEmpty else { return }
+        triageRunning = true
+        triageCancelled = false
+        triageIndex = 0
+        triageFailed = 0
+        triageVerdicts.removeAll()
+        refreshAutoTriageButton()
+        rescanButton.isEnabled = false
+        triageColumn?.isHidden = false
+        tableView.reloadData()
+        progressBar.isHidden = false
+        progressBar.isIndeterminate = false
+        progressBar.doubleValue = 0
+        statusLabel.stringValue = "Triage: 0/\(triageRows.count) checked…"
+        triageNext()
+    }
+
+    private func triageNext() {
+        guard triageRunning, !triageCancelled else { return }
+        guard triageIndex < triageRows.count else {
+            finishAutoTriage()
+            return
+        }
+        let f = triageRows[triageIndex]
+        let model = OpenRouterClient.shared.selectedModel
+        OpenRouterClient.shared.sendChat(
+            systemPrompt: Self.triageSystemPrompt,
+            userPrompt: Self.triagePrompt(for: f),
+            model: model) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self, self.triageRunning else { return }
+                switch result {
+                case .success(let text):
+                    if let verdict = Self.parseTriageVerdict(text) {
+                        self.triageVerdicts[self.ignoredKey(for: f)] = verdict
+                    } else {
+                        self.triageFailed += 1
+                    }
+                case .failure:
+                    self.triageFailed += 1
+                }
+                self.triageIndex += 1
+                self.progressBar.doubleValue = Double(self.triageIndex) / Double(self.triageRows.count)
+                self.statusLabel.stringValue = "Triage: \(self.triageIndex)/\(self.triageRows.count) checked…"
+                self.tableView.reloadData()
+                self.triageNext()
+            }
+        }
+    }
+
+    private func finishAutoTriage() {
+        let wasCancelled = triageCancelled
+        let total = triageRows.count
+        let checked = triageIndex
+        triageRunning = false
+        triageCancelled = false
+        refreshAutoTriageButton()
+        rescanButton.isEnabled = true
+        progressBar.doubleValue = 1
+        progressBar.isHidden = true
+        ignoreButton.isEnabled = selectedFinding() != nil
+        if wasCancelled {
+            statusLabel.stringValue = "Triage cancelled — \(checked)/\(total) checked."
+        } else if triageFailed > 0 {
+            statusLabel.stringValue = "Triage complete: \(checked)/\(total) checked (\(triageFailed) failed)."
+        } else {
+            statusLabel.stringValue = "Triage complete: \(checked)/\(total) checked."
+        }
+    }
+
+    /// Stops an in-flight triage (window close, new scan, PR switch).
+    private func cancelAutoTriage() {
+        guard triageRunning else { return }
+        triageCancelled = true
+        finishAutoTriage()
+    }
+
+    /// Clears verdicts and hides the column when a new set of rows arrives.
+    private func resetTriage() {
+        guard !triageRunning else { return }
+        triageVerdicts.removeAll()
+        triageColumn?.isHidden = true
+    }
+
+    private static let triageSystemPrompt = """
+    You are a security triage researcher. You are shown a finding reported by a static analysis scanner, including the code around the reported line. Decide whether it is a genuine, exploitable security issue or a false positive / non-issue / purely informational. Answer with exactly one word: VALID or INVALID.
+    """
+
+    private static func triagePrompt(for f: ScanFinding) -> String {
+        var parts: [String] = []
+        parts.append("Category: \(f.category)")
+        parts.append("Severity: \(f.severity.label)")
+        parts.append("Message: \(f.message)")
+        if let p = f.taintPath, !p.isEmpty { parts.append("Data flow: \(p)") }
+        parts.append("Function: \(f.function)")
+        parts.append("File: \(f.fileURL.path)")
+        parts.append("Line: \(f.line)")
+        if let snippet = codeSnippet(for: f) {
+            parts.append("Code around the line:\n\(snippet)")
+        }
+        parts.append("Answer with VALID or INVALID only.")
+        return parts.joined(separator: "\n")
+    }
+
+    /// Lines around the finding, capped, so the model judges real code.
+    private static func codeSnippet(for f: ScanFinding) -> String? {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: f.fileURL.path),
+              let size = attrs[.size] as? Int, size < 1_000_000 else { return nil }
+        guard let text = try? String(contentsOf: f.fileURL, encoding: .utf8) else { return nil }
+        let lines = text.components(separatedBy: "\n")
+        let start = max(0, f.line - 21)
+        let end = min(lines.count, f.line + 25)
+        guard start < end else { return nil }
+        return (start..<end).map { i in
+            let marker = (i + 1) == f.line ? ">>>" : "   "
+            return "\(marker) \(i + 1)| \(lines[i])"
+        }.joined(separator: "\n")
+    }
+
+    private static func parseTriageVerdict(_ raw: String) -> Bool? {
+        let t = raw.uppercased()
+        if t.contains("INVALID") { return false }
+        if t.contains("VALID") { return true }
+        return nil
+    }
+
     /// Runs a scan of `folder` on a background queue, stores the result in the
     /// shared cache, and shows results on the main thread. If the window is
     /// closed while the scan is running, the scan is cancelled and the results
     /// are discarded.
     private func performScan(folder: URL) {
+        // A fresh scan supersedes any triage pass over the previous rows.
+        cancelAutoTriage()
+        resetTriage()
         statusLabel.stringValue = "Scanning \(folder.lastPathComponent)…"
         progressBar.doubleValue = 0
         progressBar.isIndeterminate = true
@@ -629,6 +841,7 @@ final class ScanWindowController: NSWindowController {
                     ScanWindowController.cachedFindings = merged
                     self.findings = self.applyIgnoredFilter(merged)
                     self.applySorting()
+                    self.resetTriage()
                     self.tableView.reloadData()
                     self.progressBar.doubleValue = 1
                     self.progressBar.isHidden = true
@@ -733,6 +946,7 @@ extension ScanWindowController: NSWindowDelegate {
         // Cancel any in-progress scan so the background work stops immediately
         // rather than continuing to churn CPU on a closed window.
         scanCancelled = true
+        cancelAutoTriage()
     }
 }
 
@@ -884,6 +1098,18 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
                 cellView.textField?.stringValue = ""
             }
             cellView.textField?.alignment = .center
+        case "triage":
+            cellView.textField?.alignment = .center
+            if let valid = triageVerdicts[ignoredKey(for: f)] {
+                cellView.textField?.stringValue = valid ? "✓" : "✗"
+                cellView.textField?.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+                cellView.textField?.textColor = valid ? .systemRed : .secondaryLabelColor
+                cellView.textField?.toolTip = valid
+                    ? "AI triage: the model judges this a valid issue."
+                    : "AI triage: the model judges this not a valid issue."
+            } else {
+                cellView.textField?.stringValue = ""
+            }
         case "msg":
             var parts: [String] = []
             if let path = f.taintPath, !path.isEmpty { parts.append("flow: \(path)") }

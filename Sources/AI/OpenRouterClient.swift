@@ -392,6 +392,15 @@ final class OpenRouterClient {
     /// Only OpenRouter enforces an API key; Ollama needs none.
     var requiresAPIKey: Bool { provider == .openRouter }
 
+    /// True when the AI Assistant has a model picked and, for cloud providers,
+    /// an API key entered. Reads the raw stored model (not `selectedModel`) so
+    /// an untouched AI Assistant window counts as unconfigured.
+    var isConfigured: Bool {
+        guard !(defaults.string(forKey: "OpenRouter.model") ?? "").isEmpty else { return false }
+        if requiresAPIKey, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        return true
+    }
+
     private var activeStream: OpenRouterStreamDelegate?
     /// Non-streaming requests (`sendChat` fallback) are plain `URLSession`
     /// tasks with no delegate; they are tracked here so Stop can cancel them.
