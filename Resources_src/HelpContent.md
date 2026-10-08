@@ -101,7 +101,7 @@ The **Packages > Scan project's packages** menu checks the project's own depende
 - **Auto-detection**: manifests and lockfiles are found automatically npm/yarn/pnpm, PyPI, Cargo, Go, RubyGems, Composer, Maven/Gradle, NuGet and Swift Package Manager. Unsupported projects are reported as such.
 - **Scan**: click **Scan** to query every resolved package version against **api.osv.dev**. Results are listed by severity with the package, file and line.
 - **Results**: click a row to open the packages file at the line, **Ignore issue** hides a finding and **Export Scan** saves the shown findings as a SARIF report.
-- **(AI) Is it vulnerable?**: right-click a finding to send the question to the AI Assistant, using whiever model is currently selected.
+- **(AI) Is it vulnerable?**: right-click a finding to send the question to the AI Assistant, using whichever model is currently selected.
 Karma Pro should work from macOS 12.0 (Monterey) and newer versions.
 **ReviewCode.org** is Karma Pro's dedicated website
 **Brought to you by cipher.org.uk**
