@@ -79,11 +79,9 @@ final class UpdateMenuTarget: NSObject, NSMenuDelegate {
     }
 
     @objc func openKnownUpdate(_ sender: Any?) {
-        // The stored release's own page, so Download always lands on the exact
-        // release that was detected rather than on a list to search.
-        let url = UpdateSettings.knownNewerPageURL.flatMap(URL.init(string:))
-            ?? UpdateChecker.fallbackPage
-        NSWorkspace.shared.open(url)
+        // Always the download page; a stale stored URL (e.g. a pre-change
+        // GitHub link) must never win out over it.
+        NSWorkspace.shared.open(UpdateChecker.downloadPage)
     }
 
     // MARK: - Menu state
@@ -151,7 +149,6 @@ final class UpdateMenuTarget: NSObject, NSMenuDelegate {
 
         case .updateAvailable(let release):
             UpdateSettings.knownNewerVersion = release.version
-            UpdateSettings.knownNewerPageURL = release.pageURL.absoluteString
             refreshAvailableItem()
             // Foreground: ask. Background: leave a notification and rely on the
             // menu row, so an update is never only visible behind a permission.

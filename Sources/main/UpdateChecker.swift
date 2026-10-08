@@ -25,8 +25,7 @@ enum UpdateChecker {
     struct Release {
         let version: String
         let publishedAt: Date?
-        /// Always the release's own page, so Download goes to the exact release
-        /// rather than to a list the user then has to search.
+        /// The download destination; Download opens this exact URL.
         let pageURL: URL
     }
 
@@ -34,8 +33,8 @@ enum UpdateChecker {
     /// applies both exclusions, so this needs no second filter of its own.
     static let endpoint = URL(string: "https://api.github.com/repos/cphr/karmapro/releases/latest")!
 
-    /// Used only when the payload carries no `html_url`.
-    static let fallbackPage = URL(string: "https://github.com/cphr/karmapro/releases/latest")!
+    /// Where Download goes, regardless of which release the check found.
+    static let downloadPage = URL(string: "https://reviewcode.org/#download")!
 
     /// Long enough for a slow connection, short enough that a request the
     /// network silently swallows cannot leave the menu item disabled forever.
@@ -54,12 +53,10 @@ enum UpdateChecker {
     private struct Payload: Decodable {
         let tagName: String
         let publishedAt: Date?
-        let htmlURL: URL?
 
         enum CodingKeys: String, CodingKey {
             case tagName = "tag_name"
             case publishedAt = "published_at"
-            case htmlURL = "html_url"
         }
     }
 
@@ -93,7 +90,7 @@ enum UpdateChecker {
         }
         return .updateAvailable(Release(version: version,
                                         publishedAt: payload.publishedAt,
-                                        pageURL: payload.htmlURL ?? fallbackPage))
+                                        pageURL: downloadPage))
     }
 
     /// GitHub sends `published_at` as an ISO 8601 timestamp, which is not what
