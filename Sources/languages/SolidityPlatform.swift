@@ -1,6 +1,15 @@
 // by cipher.org.uk
 import Foundation
 
+/// Solidity globals that yield *predictable* block-level entropy. Used to find
+/// functions whose return value is a forecasting source (block.timestamp etc.),
+/// independent of the broader taint set (which also covers msg.data).
+let solidityEntropyAPIs: Set<String> = [
+    "now", "block",
+    "block.timestamp", "block.number", "block.gaslimit", "block.difficulty",
+    "block.prevrandao", "block.coinbase", "block.basefee", "blockhash",
+]
+
 /// Solidity global APIs that return untrusted / attacker-controlled data. These
 /// seed the Solidity AST taint pass (mirroring the scanner's taint-return set).
 /// In a smart contract, the classic untrusted sources are msg/tx globals and

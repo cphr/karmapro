@@ -57,6 +57,10 @@ struct AstSecurityDetector {
     let solidityPre08: Bool
     private let isKernel: Bool
     private let taintReturning: Set<String>
+    /// Functions (unqualified names) whose return value derives from block-level
+    /// entropy (`block.timestamp`/`block.number`/...). A cross-file helper in
+    /// this set makes a caller's `keccak256` seed predictable.
+    let entropyReturning: Set<String>
     private let crossFileSources: Set<String>
     private let writeThroughParam: [String: Set<Int>]
     /// Project-wide write-through table, consulted via lookup (never merged
@@ -131,6 +135,7 @@ struct AstSecurityDetector {
                 solidityPre08: Bool = false,
                 isKernel: Bool = false,
                 taintReturning: Set<String>,
+                entropyReturning: Set<String> = [],
                 crossFileSources: Set<String>,
                 writeThroughParam: [String: Set<Int>],
                 globalWriteThroughParam: [String: Set<Int>] = [:],
@@ -158,6 +163,7 @@ struct AstSecurityDetector {
         self.solidityPre08 = solidityPre08
         self.isKernel = isKernel
         self.taintReturning = taintReturning
+        self.entropyReturning = entropyReturning
         self.crossFileSources = crossFileSources
         self.writeThroughParam = writeThroughParam
         self.globalWriteThroughParam = globalWriteThroughParam

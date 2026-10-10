@@ -146,11 +146,25 @@ public struct SolidityAnalyzer {
     // MARK: - Taint-returning functions (fixpoint over the shared AST)
 
     private func computeTaintReturning() -> Set<String> {
+        Self.computeReturning(astFns: astFns, seed: soliditySourceAPIs)
+    }
+
+    /// Functions whose return value derives from block-level entropy
+    /// (`block.timestamp`/`block.number`/...). Distinct from `taintReturning`
+    /// (which also covers msg.data): this is the predictable-randomness source
+    /// set, consulted cross-file so a helper returning `block.timestamp` marks a
+    /// caller's keccak seed as predictable.
+    public static func entropyReturning(astFns: [String: CFunctionDef]) -> Set<String> {
+        computeReturning(astFns: astFns, seed: solidityEntropyAPIs)
+    }
+
+    private static func computeReturning(astFns: [String: CFunctionDef], seed: Set<String>) -> Set<String> {
         var returning = Set<String>()
         for _ in 0..<6 {
             var changed = false
             for fn in astFns.values where !returning.contains(fn.name) {
-                if functionReturnsTaint(fn, taintReturning: returning) {
+                let params = Set(fn.params.compactMap { $0.name })
+                if stmtReturnsSeed(fn.body, params: params, seedFns: seed.union(returning)) {
                     returning.insert(fn.name)
                     changed = true
                 }
@@ -160,82 +174,76 @@ public struct SolidityAnalyzer {
         return returning
     }
 
-    private func functionReturnsTaint(_ fn: CFunctionDef, taintReturning: Set<String>) -> Bool {
-        let params = Set(fn.params.compactMap { $0.name })
-        let seedFns = soliditySourceAPIs.union(taintReturning)
-        return stmtReturnsTaint(fn.body, params: params, seedFns: seedFns)
-    }
-
-    private func stmtReturnsTaint(_ stmt: CStmt, params: Set<String>, seedFns: Set<String>) -> Bool {
+    private static func stmtReturnsSeed(_ stmt: CStmt, params: Set<String>, seedFns: Set<String>) -> Bool {
         switch stmt {
         case .block(let arr):
-            for s in arr where stmtReturnsTaint(s, params: params, seedFns: seedFns) { return true }
+            for s in arr where stmtReturnsSeed(s, params: params, seedFns: seedFns) { return true }
         case .expr(let e):
-            return exprReferencesTaint(e, params: params, seedFns: seedFns)
+            return exprReferencesSeed(e, params: params, seedFns: seedFns)
         case .declaration(let d):
             if case .variable(_, _, let ie?) = d.kind {
-                return exprReferencesTaint(ie, params: params, seedFns: seedFns)
+                return exprReferencesSeed(ie, params: params, seedFns: seedFns)
             }
         case .ifStmt(_, let t, let e, _):
-            return stmtReturnsTaint(t, params: params, seedFns: seedFns)
-                || (e.map { stmtReturnsTaint($0, params: params, seedFns: seedFns) } ?? false)
+            return stmtReturnsSeed(t, params: params, seedFns: seedFns)
+                || (e.map { stmtReturnsSeed($0, params: params, seedFns: seedFns) } ?? false)
         case .whileStmt(_, let b, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
+            return stmtReturnsSeed(b, params: params, seedFns: seedFns)
         case .doWhileStmt(let b, _, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
+            return stmtReturnsSeed(b, params: params, seedFns: seedFns)
         case .forStmt(_, _, _, let b, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
+            return stmtReturnsSeed(b, params: params, seedFns: seedFns)
         case .switchStmt(_, let cases, _):
-            for c in cases where c.body.contains(where: { stmtReturnsTaint($0, params: params, seedFns: seedFns) }) { return true }
+            for c in cases where c.body.contains(where: { stmtReturnsSeed($0, params: params, seedFns: seedFns) }) { return true }
         case .returnStmt(let e, _):
-            if let e = e { return exprReferencesTaint(e, params: params, seedFns: seedFns) }
+            if let e = e { return exprReferencesSeed(e, params: params, seedFns: seedFns) }
         case .labeledStmt(_, let s, _):
-            return stmtReturnsTaint(s, params: params, seedFns: seedFns)
+            return stmtReturnsSeed(s, params: params, seedFns: seedFns)
         default:
             break
         }
         return false
     }
 
-    private func exprReferencesTaint(_ e: CExpr, params: Set<String>, seedFns: Set<String>) -> Bool {
+    private static func exprReferencesSeed(_ e: CExpr, params: Set<String>, seedFns: Set<String>) -> Bool {
         switch e {
         case .identifier(let n, _):
             return params.contains(n)
         case .call(let callee, let args, _):
             if cExprCalleeIsSeed(callee, seedFns) { return true }
-            if exprReferencesTaint(callee, params: params, seedFns: seedFns) { return true }
-            return args.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
+            if exprReferencesSeed(callee, params: params, seedFns: seedFns) { return true }
+            return args.contains { exprReferencesSeed($0, params: params, seedFns: seedFns) }
         case .member(let b, _, _, _):
             // A member access rooted at an untrusted global (`msg.data`,
             // `tx.origin`, `block.timestamp`, ...) is itself untrusted data.
             if let q = cExprQualifiedName(e), seedFns.contains(q) { return true }
             if let t = cExprTrailingName(e), seedFns.contains(t) { return true }
-            return exprReferencesTaint(b, params: params, seedFns: seedFns)
+            return exprReferencesSeed(b, params: params, seedFns: seedFns)
         case .index(let b, let idx, _):
-            return exprReferencesTaint(b, params: params, seedFns: seedFns)
-                || exprReferencesTaint(idx, params: params, seedFns: seedFns)
+            return exprReferencesSeed(b, params: params, seedFns: seedFns)
+                || exprReferencesSeed(idx, params: params, seedFns: seedFns)
         case .unary(_, let o, _):
-            return exprReferencesTaint(o, params: params, seedFns: seedFns)
+            return exprReferencesSeed(o, params: params, seedFns: seedFns)
         case .binary(_, let l, let r, _), .comma(let l, let r, _):
-            return exprReferencesTaint(l, params: params, seedFns: seedFns)
-                || exprReferencesTaint(r, params: params, seedFns: seedFns)
+            return exprReferencesSeed(l, params: params, seedFns: seedFns)
+                || exprReferencesSeed(r, params: params, seedFns: seedFns)
         case .assign(_, let l, let r, _):
-            return exprReferencesTaint(l, params: params, seedFns: seedFns)
-                || exprReferencesTaint(r, params: params, seedFns: seedFns)
+            return exprReferencesSeed(l, params: params, seedFns: seedFns)
+                || exprReferencesSeed(r, params: params, seedFns: seedFns)
         case .ternary(let c, let t, let f, _):
-            return exprReferencesTaint(c, params: params, seedFns: seedFns)
-                || exprReferencesTaint(t, params: params, seedFns: seedFns)
-                || exprReferencesTaint(f, params: params, seedFns: seedFns)
+            return exprReferencesSeed(c, params: params, seedFns: seedFns)
+                || exprReferencesSeed(t, params: params, seedFns: seedFns)
+                || exprReferencesSeed(f, params: params, seedFns: seedFns)
         case .cast(let x, _):
-            return exprReferencesTaint(x, params: params, seedFns: seedFns)
+            return exprReferencesSeed(x, params: params, seedFns: seedFns)
         case .sizeOf(let x, _, _):
-            return x.map { exprReferencesTaint($0, params: params, seedFns: seedFns) } ?? false
+            return x.map { exprReferencesSeed($0, params: params, seedFns: seedFns) } ?? false
         case .paren(let x, _):
-            return exprReferencesTaint(x, params: params, seedFns: seedFns)
+            return exprReferencesSeed(x, params: params, seedFns: seedFns)
         case .arrayInit(let arr, _):
-            return arr.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
+            return arr.contains { exprReferencesSeed($0, params: params, seedFns: seedFns) }
         case .newExpr(_, let args, _):
-            return args.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
+            return args.contains { exprReferencesSeed($0, params: params, seedFns: seedFns) }
         default:
             return false
         }

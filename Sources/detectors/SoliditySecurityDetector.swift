@@ -68,12 +68,15 @@ extension AstSecurityDetector {
                  message: "\(name)() sends Ether to an attacker-controlled address; funds can be drained to any recipient.",
                  taint: taintLabel(recv, tainted: tainted), reachable: reachable,
                  crossFile: exprCrossFile(recv, crossTainted: crossTainted))
-            return true
+            // `transfer` reverts on failure, so this is the only finding for it.
+            // `send` can also be a silent-failure hazard (below).
+            if name == "transfer" { return true }
         }
         // ERC20-style transfer to the zero address: `token.transfer(address(0), x)`
         // silently burns tokens or breaks bookkeeping when the zero address is not
         // rejected.
-        if (name == "transfer" || name == "transferFrom"), args.contains(where: { isAddressZeroExpr($0) }) {
+        if (name == "transfer" || name == "transferFrom"), hasMemberReceiver(callee),
+           args.contains(where: { isAddressZeroExpr($0) }) {
             emit(&findings, function, offset,
                  rule("Transfer to Zero Address", .medium, always: true),
                  message: "\(name)() sends tokens to address(0); the zero address should be rejected to avoid burned or stuck funds.",
@@ -82,7 +85,7 @@ extension AstSecurityDetector {
         }
         // Unsafe `send`: forwards only the 2300 gas stipend and returns `false`
         // on failure instead of reverting — silently lost funds.
-        if name == "send" {
+        if name == "send", hasMemberReceiver(callee) {
             emit(&findings, function, offset,
                  rule("Unsafe send", .medium, always: true),
                  message: "send() forwards only 2300 gas and silently returns false on failure; prefer transfer/revert or a checked call.",
@@ -129,6 +132,9 @@ extension AstSecurityDetector {
             return exprReferencesPredictable(b)
         case .call(let c, let args, _):
             if exprReferencesPredictable(c) { return true }
+            // A call to a helper that returns block-derived entropy (possibly
+            // defined in another file) is itself predictable.
+            if let n = callName(c), entropyReturning.contains(n) { return true }
             return args.contains { exprReferencesPredictable($0) }
         case .binary(_, let l, let r, _), .comma(let l, let r, _):
             return exprReferencesPredictable(l) || exprReferencesPredictable(r)
@@ -180,9 +186,12 @@ extension AstSecurityDetector {
             // (checks-effects-interactions broken). A write merely *before* the
             // call does not excuse a later write, so compare the earliest call
             // against the LAST write. `send()` forwards only the 2300 gas
-            // stipend, which cannot re-enter, so it is excluded.
-            if let firstCall = externalCalls.first(where: { $0.name != "send" }),
-               let lastWrite = stateWrites.last, firstCall.offset < lastWrite {
+            // stipend, which cannot re-enter, so it is excluded. External calls
+            // hidden behind local helpers are inlined so a call-before-write
+            // split across functions is still caught.
+            let calls = (externalCalls + inlinedHelperExternalCalls(fn.body)).filter { $0.name != "send" }
+            if let firstCall = calls.min(by: { $0.offset < $1.offset }),
+               let lastWrite = stateWrites.max(), firstCall.offset < lastWrite {
                 emit(&findings, function, firstCall.offset,
                      rule("Reentrancy", .high, always: true),
                      message: "External call before state update with no reentrancy guard; re-entrant callers can corrupt storage.",
@@ -348,7 +357,8 @@ extension AstSecurityDetector {
         let fnNS = masked as NSString
         let options: NSRegularExpression.Options = []
         guard let kw = try? NSRegularExpression(pattern: "\\bunchecked\\s*\\{", options: options),
-              let ops = try? NSRegularExpression(pattern: "(?:\\+\\=|\\-\\=|\\*=|\\+|\\+|\\-\\-)", options: options) else { return }
+              let compoundOps = try? NSRegularExpression(pattern: "(?:\\+\\=|\\-\\=|\\*=|/=|%=|\\+\\+|\\-\\-)", options: options),
+              let bareOps = try? NSRegularExpression(pattern: "(?:\\*|/|%|<<|>>|\\+|-|&|\\||\\^)", options: options) else { return }
         for m in kw.matches(in: masked, options: [], range: NSRange(location: 0, length: fnNS.length)) {
             let open = m.range.location + m.range.length - 1
             guard open >= 0, open < fnNS.length else { continue }
@@ -367,8 +377,17 @@ extension AstSecurityDetector {
             guard close > open else { continue }
             let bodyRange = NSRange(location: open, length: close - open + 1)
             let body = fnNS.substring(with: bodyRange) as NSString
-            if !ops.matches(in: body as String, options: [], range: NSRange(location: 0, length: body.length)).isEmpty {
+            let bodyLen = NSRange(location: 0, length: body.length)
+            // A compound assignment / increment is reported at the block header
+            // (its exact operand may be a continuation line); a bare operator is
+            // reported at its own position.
+            if !compoundOps.matches(in: body as String, options: [], range: bodyLen).isEmpty {
                 emit(&findings, fn.name, fn.startOffset + open,
+                     rule("Unchecked Arithmetic Overflow", .high, always: true),
+                     message: "unchecked block restores pre-0.8 wrap-around arithmetic; overflow/underflow is silently possible.",
+                     taint: nil, reachable: reachable, crossFile: false)
+            } else if let op = bareOps.firstMatch(in: body as String, options: [], range: bodyLen) {
+                emit(&findings, fn.name, fn.startOffset + open + op.range.location,
                      rule("Unchecked Arithmetic Overflow", .high, always: true),
                      message: "unchecked block restores pre-0.8 wrap-around arithmetic; overflow/underflow is silently possible.",
                      taint: nil, reachable: reachable, crossFile: false)
@@ -513,10 +532,10 @@ extension AstSecurityDetector {
             if cn == "ecrecover" {
                 ev.ecrecoverOffsets.append(offset)
             }
-            if let cn = cn, isSolidityExternalCall(cn) {
+            if let ext = solidityExternalCallName(callee) {
                 if inLoop { ev.loopCallOffsets.append(offset) }
-                if (cn == "transfer" && args.count == 2) || (cn == "transferFrom" && args.count == 3) {
-                    ev.erc20TransferCalls.append((offset: offset, name: cn))
+                if (ext == "transfer" && args.count == 2) || (ext == "transferFrom" && args.count == 3) {
+                    ev.erc20TransferCalls.append((offset: offset, name: ext))
                 }
             }
             if cn == "assert", let first = args.first, case .binary(let op, let l, let r, _) = first,
@@ -840,8 +859,7 @@ extension AstSecurityDetector {
             if isSolidityArrayMutationCall(callee, params: params) {
                 stateWrites.append(offset)
             }
-            let extName = callName(callee).flatMap { isSolidityExternalCall($0) ? $0 : nil }
-                ?? solidityChainedExternalCall(callee)
+            let extName = solidityExternalCallName(callee)
             if let cn = extName {
                 externalCalls.append((offset: offset, name: cn))
             }
@@ -851,8 +869,8 @@ extension AstSecurityDetector {
             }
         case .assign(_, let lhs, let rhs, let offset2):
             if solidityIsStateWrite(lhs, params: params) {
-                stateWrites.append(offset2)
                 if isGuardVar(lhs), isTruthyGuardValue(rhs) { sawGuardSet = true }
+                if isReentrancyEffectWrite(lhs, rhs: rhs) { stateWrites.append(offset2) }
             }
             collectSolidityExpr(lhs, params: params, externalCalls: &externalCalls, stateWrites: &stateWrites, txOriginUses: &txOriginUses, sawGuardSet: &sawGuardSet)
             collectSolidityExpr(rhs, params: params, externalCalls: &externalCalls, stateWrites: &stateWrites, txOriginUses: &txOriginUses, sawGuardSet: &sawGuardSet)
@@ -946,7 +964,7 @@ extension AstSecurityDetector {
                 for a in args { collectConsumedExternalCallExpr(a, offsets: &offsets, callSourceVar: &callSourceVar) }
                 return
             }
-            if let cn = callName(callee), isSolidityExternalCall(cn) {
+            if solidityExternalCallName(callee) != nil {
                 offsets.insert(offset)
                 return
             }
@@ -986,7 +1004,7 @@ extension AstSecurityDetector {
     private func bindExternalCallResult(_ e: CExpr, to name: String, callSourceVar: inout [String: Int], offsets: inout Set<Int>) {
         switch e {
         case .call(let callee, _, let offset):
-            if let cn = callName(callee), isSolidityExternalCall(cn) {
+            if solidityExternalCallName(callee) != nil {
                 callSourceVar[name] = offset
             }
         case .binary(_, let l, let r, _), .comma(let l, let r, _):
@@ -1006,9 +1024,7 @@ extension AstSecurityDetector {
     private func collectConsumedExternalCallExpr(_ e: CExpr, offsets: inout Set<Int>, callSourceVar: inout [String: Int]) {
         switch e {
         case .call(let callee, let args, let offset):
-            let extName = callName(callee).flatMap { isSolidityExternalCall($0) ? $0 : nil }
-                ?? solidityChainedExternalCall(callee)
-            if extName != nil {
+            if solidityExternalCallName(callee) != nil {
                 offsets.insert(offset)
             }
             collectConsumedExternalCallExpr(callee, offsets: &offsets, callSourceVar: &callSourceVar)
@@ -1044,7 +1060,29 @@ extension AstSecurityDetector {
 
     private func isSolidityExternalCall(_ name: String) -> Bool {
         name == "call" || name == "delegatecall" || name == "staticcall"
-            || name == "callcode" || name == "transfer" || name == "send"
+            || name == "callcode" || name == "transfer" || name == "transferFrom"
+            || name == "send"
+    }
+
+    /// True when the callee is reached through a member access, i.e. the call
+    /// has an explicit receiver (`token.transfer(...)`, `addr.call{...}()`) and
+    /// is therefore an external call. A bare identifier call (`transfer(...)`)
+    /// is a local/self function and never external.
+    private func hasMemberReceiver(_ callee: CExpr) -> Bool {
+        switch callee {
+        case .member: return true
+        case .call(let inner, _, _): return hasMemberReceiver(inner)
+        default: return false
+        }
+    }
+
+    /// The external-call name for a callee, or nil when it is not an external
+    /// call. Requires a member receiver so same-named internal functions are
+    /// not misclassified, and recognises 0.4.x chained forms.
+    private func solidityExternalCallName(_ callee: CExpr) -> String? {
+        guard hasMemberReceiver(callee) else { return nil }
+        if let n = callName(callee), isSolidityExternalCall(n) { return n }
+        return solidityChainedExternalCall(callee)
     }
 
     /// Solidity 0.4.x chained external calls — `<addr>.call.value(v)(...)` /
@@ -1096,6 +1134,104 @@ extension AstSecurityDetector {
             return !params.contains(n)
         default:
             return false
+        }
+    }
+
+    /// A state write is only a reentrancy hazard when it changes attacker-
+    /// observable storage: a container element/field, or a variable assigned a
+    /// non-literal value. Resetting a scalar to a constant (`stored = 1`) is a
+    /// benign effect and must not, on its own, complete a reentrancy pattern.
+    private func isReentrancyEffectWrite(_ lhs: CExpr, rhs: CExpr) -> Bool {
+        switch lhs {
+        case .member, .index: return true
+        case .identifier: return !isLiteralExpr(rhs)
+        default: return false
+        }
+    }
+
+    /// External calls performed by local helper functions reachable from `body`
+    /// (breadth-first, depth-capped). Lets the reentrancy walk see a call that
+    /// lives in a helper but is ordered before a write in the caller.
+    private func inlinedHelperExternalCalls(_ body: CStmt) -> [(offset: Int, name: String)] {
+        var helpers = Set<String>()
+        collectInternalHelperNames(body, into: &helpers)
+        guard !helpers.isEmpty else { return [] }
+        var out: [(offset: Int, name: String)] = []
+        var seen = helpers
+        var queue = Array(helpers)
+        var steps = 0
+        while let h = queue.first, steps < 32 {
+            queue.removeFirst()
+            steps += 1
+            guard let hf = astFns[h] else { continue }
+            var calls: [(offset: Int, name: String)] = []
+            var writes: [Int] = []
+            var txo: [Int] = []
+            var g = false
+            collectSolidityEvents(hf.body, params: Set(hf.params.compactMap { $0.name }), externalCalls: &calls, stateWrites: &writes, txOriginUses: &txo, sawGuardSet: &g)
+            out.append(contentsOf: calls)
+            var nested = Set<String>()
+            collectInternalHelperNames(hf.body, into: &nested)
+            for n in nested where !seen.contains(n) { seen.insert(n); queue.append(n) }
+        }
+        return out
+    }
+
+    private func collectInternalHelperNames(_ stmt: CStmt, into names: inout Set<String>) {
+        switch stmt {
+        case .block(let arr): for s in arr { collectInternalHelperNames(s, into: &names) }
+        case .declaration(let d):
+            if case .variable(_, _, let ie?) = d.kind { collectInternalHelperNames(ie, into: &names) }
+        case .expr(let e): collectInternalHelperNames(e, into: &names)
+        case .ifStmt(let c, let t, let e2, _):
+            collectInternalHelperNames(c, into: &names)
+            collectInternalHelperNames(t, into: &names)
+            if let e2 = e2 { collectInternalHelperNames(e2, into: &names) }
+        case .whileStmt(let c, let b, _):
+            collectInternalHelperNames(c, into: &names)
+            collectInternalHelperNames(b, into: &names)
+        case .doWhileStmt(let b, let c, _):
+            collectInternalHelperNames(b, into: &names)
+            collectInternalHelperNames(c, into: &names)
+        case .forStmt(let i, let c, let inc, let b, _):
+            if let i = i { collectInternalHelperNames(i, into: &names) }
+            if let c = c { collectInternalHelperNames(c, into: &names) }
+            if let inc = inc { collectInternalHelperNames(inc, into: &names) }
+            collectInternalHelperNames(b, into: &names)
+        case .switchStmt(_, let cases, _):
+            for cc in cases { for s in cc.body { collectInternalHelperNames(s, into: &names) } }
+        case .returnStmt(let e, _):
+            if let e = e { collectInternalHelperNames(e, into: &names) }
+        case .labeledStmt(_, let s, _): collectInternalHelperNames(s, into: &names)
+        default: break
+        }
+    }
+
+    private func collectInternalHelperNames(_ e: CExpr, into names: inout Set<String>) {
+        switch e {
+        case .call(let callee, let args, _):
+            if case .identifier(let n, _) = callee, astFns[n] != nil { names.insert(n) }
+            collectInternalHelperNames(callee, into: &names)
+            for a in args { collectInternalHelperNames(a, into: &names) }
+        case .assign(_, let l, let r, _):
+            collectInternalHelperNames(l, into: &names)
+            collectInternalHelperNames(r, into: &names)
+        case .member(let b, _, _, _): collectInternalHelperNames(b, into: &names)
+        case .index(let b, let i, _):
+            collectInternalHelperNames(b, into: &names)
+            collectInternalHelperNames(i, into: &names)
+        case .binary(_, let l, let r, _), .comma(let l, let r, _):
+            collectInternalHelperNames(l, into: &names)
+            collectInternalHelperNames(r, into: &names)
+        case .unary(_, let o, _): collectInternalHelperNames(o, into: &names)
+        case .ternary(let c, let t, let f, _):
+            collectInternalHelperNames(c, into: &names)
+            collectInternalHelperNames(t, into: &names)
+            collectInternalHelperNames(f, into: &names)
+        case .cast(let x, _), .paren(let x, _): collectInternalHelperNames(x, into: &names)
+        case .arrayInit(let arr, _): for a in arr { collectInternalHelperNames(a, into: &names) }
+        case .newExpr(_, let args, _): for a in args { collectInternalHelperNames(a, into: &names) }
+        default: break
         }
     }
 
