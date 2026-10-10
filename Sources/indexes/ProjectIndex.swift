@@ -51,6 +51,10 @@ struct ProjectIndex {
     /// resolved from every C-family file so a format argument that names a
     /// macro constant is treated as the literal format string it expands to.
     let globalStringMacros: [String: String]
+    /// Project-wide object-like identifier macros (`#define POPEN popen`). A
+    /// call through the macro is a call to the aliased function after
+    /// preprocessing, so it must resolve to the aliased sink.
+    let globalMacroAliases: [String: String]
     /// Cross-file *rejecting* functions, classified by the shape of their body:
     /// `"id"`  = character-whitelist validator returning a constant nonzero only
     ///           for accepted input (guards Command/SQL/Path) — e.g. a
@@ -128,6 +132,7 @@ struct ProjectIndex {
         let globalPHP = Set(analyses.values.flatMap { $0.phpSanitizers })
         let globalPythonSSRFValidators = computePythonSSRFValidators(files: files, readSource: readSource)
         let globalMacros = extractStringMacros(files: files, readSource: readSource)
+        let globalMacroAliases = extractMacroAliases(files: files, readSource: readSource)
         let globalSanitizers = classifySanitizers(astFns: globalAST)
         let globalConstantFormats = extractGlobalStringConstants(files: files, readSource: readSource)
         let globalDefinedFunctions = projectFunctionNames(astFns: globalAST, files: files, readSource: readSource)
@@ -143,6 +148,7 @@ struct ProjectIndex {
                             globalPHPSanitizers: globalPHP,
                             globalPythonSSRFValidators: globalPythonSSRFValidators,
                             globalStringMacros: globalMacros,
+                            globalMacroAliases: globalMacroAliases,
                             globalSanitizers: globalSanitizers,
                             globalParamTaintSeeds: globalParamSeeds,
                             globalConstantFormats: globalConstantFormats,
@@ -315,7 +321,7 @@ struct ProjectIndex {
         for url in files where isCFamily.contains(url.pathExtension.lowercased()) {
             guard let source = readSource(url),
                   source.count <= 1_000_000 else { continue }
-            let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+            let lines = splitLines(source)
             var i = 0
             while i < lines.count {
                 let trimmed = String(lines[i]).trimmingCharacters(in: .whitespaces)
@@ -337,6 +343,44 @@ struct ProjectIndex {
             }
         }
         return macros
+    }
+
+    /// Object-like `#define NAME ident` macros whose body is a single identifier
+    /// (`#define POPEN popen`). A call through the macro is a call to `ident`
+    /// after preprocessing. Function-like macros, string/number bodies,
+    /// expressions and line-continued bodies are excluded. Last definition wins
+    /// (the `#else` POSIX name over `#ifdef _WIN32`'s).
+    private static func extractMacroAliases(files: [URL], readSource: (URL) -> String?) -> [String: String] {
+        var aliases: [String: String] = [:]
+        let isCFamily: Set<String> = ["c", "h", "cpp", "cc", "cxx", "hpp", "m", "mm"]
+        guard let macroRe = try? NSRegularExpression(
+            pattern: #"#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)$"#) else {
+            return aliases
+        }
+        for url in files where isCFamily.contains(url.pathExtension.lowercased()) {
+            guard let source = readSource(url),
+                  source.count <= 1_000_000 else { continue }
+            for raw in splitLines(source) {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                guard line.hasPrefix("#define"), !line.hasPrefix("#define("),
+                      let m = macroRe.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                      m.numberOfRanges >= 3,
+                      let nameR = Range(m.range(at: 1), in: line),
+                      let valR = Range(m.range(at: 2), in: line) else { continue }
+                aliases[String(line[nameR])] = String(line[valR])
+            }
+        }
+        return aliases
+    }
+
+    /// Splits source into lines. `String.split(separator: "\n")` does not split
+    /// CRLF files because `"\r\n"` is a single Swift `Character`; normalise the
+    /// endings first so `#define` lines in CRLF sources are still seen.
+    private static func splitLines(_ source: String) -> [String] {
+        source.replacingOccurrences(of: "\r\n", with: "\n")
+              .replacingOccurrences(of: "\r", with: "\n")
+              .split(separator: "\n", omittingEmptySubsequences: false)
+              .map(String.init)
     }
 
     // MARK: - Global string constants
