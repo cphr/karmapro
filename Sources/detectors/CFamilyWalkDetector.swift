@@ -63,6 +63,13 @@ struct CFamilyWalkDetector {
         "scanf", "fscanf", "sscanf",
     ]
 
+    /// Conversions that preserve the taint of their input: a numeric/boolean
+    /// value derived from tainted text stays attacker-influenced (`atoi(getenv())`).
+    private static let taintPreservingConversions: Set<String> = [
+        "atoi", "atol", "atoll", "atof", "strtol", "strtoul", "strtoll",
+        "strtoull", "strtof", "strtod", "strtold", "abs", "labs", "llabs",
+    ]
+
     /// STL/container mutators whose call inside a loop over the same container
     /// invalidates iteration (Array Mutation During Iteration).
     fileprivate static let containerMutators: Set<String> = [
@@ -76,6 +83,9 @@ struct CFamilyWalkDetector {
     private let reachableNames: Set<String>
     private let taintReturning: Set<String>
     private let crossFileSources: Set<String>
+    /// File-scope fixed-size array capacities (`int table[8];`), so index checks
+    /// apply to globals as well as locals.
+    private let globalCapacities: [String: Int]
 
     /// Fixpoint context for Walk 3 (boundary).
     private struct Walk3Context {
@@ -133,6 +143,34 @@ struct CFamilyWalkDetector {
         self.reachableNames = reachableNames
         self.taintReturning = taintReturning
         self.crossFileSources = crossFileSources
+        self.globalCapacities = Self.fileScopeArrayCapacities(in: source)
+    }
+
+    /// Anchored scan for file-scope `type name[N]` declarations. Lines with a
+    /// `(` are skipped so function-local or call-bearing declarations are not
+    /// mistaken for globals.
+    private static func fileScopeArrayCapacities(in source: String) -> [String: Int] {
+        var out: [String: Int] = [:]
+        guard let re = try? NSRegularExpression(
+            pattern: "(?m)^[ \\t]*(?:[A-Za-z_][A-Za-z0-9_]*[ \\t\\*]+)+(\\w+)[ \\t]*\\[[ \\t]*(\\d+)[ \\t]*\\]") else {
+            return out
+        }
+        let ns = source as NSString
+        for m in re.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
+            let line = ns.substring(with: ns.lineRange(for: m.range))
+            if line.contains("(") { continue }
+            // Skip if this looks like usage (indexing/return/if/while/for/switch/case/goto/throw/break/continue)
+            let lower = line.lowercased()
+            if lower.contains("return") || lower.contains("if ") || lower.contains("while") || lower.contains("for ") || lower.contains("switch") || lower.contains("case ") || lower.contains("goto ") || lower.contains("throw") || lower.contains("break") || lower.contains("continue") {
+                continue
+            }
+            guard m.numberOfRanges >= 3,
+                  let nameRange = Range(m.range(at: 1), in: source),
+                  let countRange = Range(m.range(at: 2), in: source),
+                  let n = Int(source[countRange]) else { continue }
+            out[String(source[nameRange])] = n
+        }
+        return out
     }
 
     // MARK: - Detect (three-walk driver)
@@ -265,9 +303,10 @@ struct CFamilyWalkDetector {
             }
             factsWalk(thenBranch, fn: fn, facts: facts, bounded: &thenB, nonZero: &thenN,
                       constBounded: &constBounded)
-            bounded.formUnion(thenB)
-            nonZero.formUnion(thenN)
             if let eb = elseBranch {
+                // A real else: after the if/else exactly one of the two branches
+                // ran, so the after-state is the union of the two branch states
+                // (each seeded from the pre-if facts).
                 var elseB = bounded
                 var elseN = nonZero
                 for (varName, effOp) in comparisons(in: cond) {
@@ -276,9 +315,13 @@ struct CFamilyWalkDetector {
                 }
                 factsWalk(eb, fn: fn, facts: facts, bounded: &elseB, nonZero: &elseN,
                           constBounded: &constBounded)
-                bounded.formUnion(elseB)
-                nonZero.formUnion(elseN)
+                bounded = thenB.union(elseB)
+                nonZero = thenN.union(elseN)
             }
+            // else (no `else` branch): the fallthrough path skips the then body
+            // entirely, so the guard facts established *inside* it must not leak
+            // past the statement — `if (d > 100) return; … / d` still divides by a
+            // possibly-zero `d <= 100`. Early-exit models handle the return shape.
         case .whileStmt(let cond, let body, _):
             var bodyB = bounded
             var bodyN = nonZero
@@ -688,7 +731,7 @@ struct CFamilyWalkDetector {
                                   emit: Bool, reached: Bool, result: inout FlowResult) {
         guard emit, let cond = cond else { return }
         guard let sizeBase = sizeBoundBase(in: cond) else { return }
-        if body.containsMutatorCall(on: sizeBase) {
+        if bodyMutates(body, container: sizeBase) {
             emitFinding(&result, function: fn.name, offset: cond.offset,
                         category: "Array Mutation During Iteration", severity: .medium,
                         message: "Container '\(sizeBase)' is mutated while being iterated; the loop bound '\(sizeBase).size()' is unstable.",
@@ -701,12 +744,88 @@ struct CFamilyWalkDetector {
                                     result: inout FlowResult) {
         guard emit else { return }
         guard let sizeBase = sizeBoundBase(in: cond) else { return }
-        if body.containsMutatorCall(on: sizeBase) {
+        if bodyMutates(body, container: sizeBase) {
             emitFinding(&result, function: fn.name, offset: offset,
                         category: "Array Mutation During Iteration", severity: .medium,
                         message: "Container '\(sizeBase)' is mutated while being iterated; the loop bound '\(sizeBase).size()' is unstable.",
                         taint: nil, reachable: reached)
         }
+    }
+
+    /// Whether a loop body mutates `name` — either directly (`v.push_back(...)`)
+    /// or indirectly by passing it to a local helper whose reference/pointer
+    /// parameter the helper itself mutates (`grow(v, n)` where the helper is
+    /// `void grow(std::vector<int> &v, int k) { v.push_back(k); }`).
+    private func bodyMutates(_ body: CStmt, container name: String) -> Bool {
+        if body.containsMutatorCall(on: name) { return true }
+        var found = false
+        func helperMutatesParam(_ fnName: String, args: [CExpr]) -> Bool {
+            guard let fn = astFns[fnName] else { return false }
+            for (idx, p) in fn.params.enumerated() {
+                guard idx < args.count, let pname = p.name else { continue }
+                guard let ptype = p.type, ptype.contains("&") || ptype.contains("*") else { continue }
+                if fn.body.containsMutatorCall(on: pname),
+                   case .identifier(let argName, _) = args[idx], argName == name {
+                    return true
+                }
+            }
+            return false
+        }
+        func scanExpr(_ e: CExpr) {
+            guard !found else { return }
+            switch e {
+            case .call(let callee, let args, _):
+                if case .identifier(let fnName, _) = callee, helperMutatesParam(fnName, args: args) {
+                    found = true
+                    return
+                }
+                scanExpr(callee)
+                args.forEach { scanExpr($0) }
+            case .assign(_, let l, let r, _):
+                scanExpr(l); scanExpr(r)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                scanExpr(l); scanExpr(r)
+            case .ternary(let c, let t, let f, _):
+                scanExpr(c); scanExpr(t); scanExpr(f)
+            case .unary(_, let o, _), .cast(let o, _), .paren(let o, _):
+                scanExpr(o)
+            case .member(let b, _, _, _):
+                scanExpr(b)
+            case .index(let b, let i, _):
+                scanExpr(b); scanExpr(i)
+            case .arrayInit(let arr, _):
+                arr.forEach { scanExpr($0) }
+            default:
+                break
+            }
+        }
+        func scanStmt(_ s: CStmt) {
+            guard !found else { return }
+            switch s {
+            case .block(let arr):
+                for x in arr { scanStmt(x) }
+            case .expr(let e):
+                scanExpr(e)
+            case .declaration(let d):
+                if case .variable(_, _, let initExpr?) = d.kind { scanExpr(initExpr) }
+            case .ifStmt(_, let t, let e, _):
+                scanStmt(t)
+                if let e = e { scanStmt(e) }
+            case .whileStmt(_, let b, _), .doWhileStmt(let b, _, _):
+                scanStmt(b)
+            case .forStmt(let i, _, _, let b, _):
+                if let i = i { scanStmt(i) }
+                scanStmt(b)
+            case .switchStmt(_, let cases, _):
+                for c in cases { for s in c.body { scanStmt(s) } }
+            case .labeledStmt(_, let s, _):
+                scanStmt(s)
+            default:
+                break
+            }
+        }
+        scanStmt(body)
+        return found
     }
 
     // MARK: - Walk 2 helpers
@@ -850,6 +969,7 @@ struct CFamilyWalkDetector {
 
     private func fnFacts(for fn: CFunctionDef) -> FnFacts {
         var facts = FnFacts()
+        facts.capacities = globalCapacities
         walkStructurally(fn.body) { stmt in
             if case .declaration(let d) = stmt,
                case .variable(let typeName, let name, let initExpr) = d.kind {
@@ -864,14 +984,20 @@ struct CFamilyWalkDetector {
 
     /// `char buf[32];` -> 32 and `int a[] = {1,2,3};` -> 3.
     private func arrayCapacity(typeName: String?, initExpr: CExpr?) -> Int? {
+        // A declared bound wins: `int a[8] = {0}` is 8 elements, even though the
+        // initializer lists only one. Fall back to the initializer only for
+        // unsized arrays (`int a[] = {1,2,3}`).
+        if let t = typeName {
+            let pattern = "\\[(\\d+)\\]"
+            if let range = t.range(of: pattern, options: .regularExpression) {
+                let digits = t[range].dropFirst().dropLast()
+                if let n = Int(digits) { return n }
+            }
+        }
         if let initExpr = initExpr, case .arrayInit(let elements, _) = initExpr {
             return elements.count
         }
-        guard let t = typeName else { return nil }
-        let pattern = "\\[(\\d+)\\]"
-        guard let range = t.range(of: pattern, options: .regularExpression) else { return nil }
-        let digits = t[range].dropFirst().dropLast()
-        return Int(digits)
+        return nil
     }
 
     private func walkStructurally(_ stmt: CStmt, _ visit: (CStmt) -> Void) {
@@ -988,11 +1114,14 @@ struct CFamilyWalkDetector {
         switch e {
         case .identifier(let n, _):
             return tainted.contains(n)
-        case .call(let callee, _, _):
+        case .call(let callee, let args, _):
             if let name = calleeName(callee) {
                 if Self.returnTaintingSources.contains(name) { return true }
                 if taintReturning.contains(name) { return true }
                 if ctx.taintReturningFns.contains(name) { return true }
+                if Self.taintPreservingConversions.contains(name) {
+                    return args.contains { exprTainted($0, tainted: tainted, ctx: ctx) }
+                }
             }
             return false
         case .assign(_, _, let r, _):
@@ -1023,11 +1152,17 @@ struct CFamilyWalkDetector {
         switch e {
         case .identifier(let n, _):
             return roots[n] ?? (tainted.contains(n) ? n : nil)
-        case .call(let callee, _, _):
+        case .call(let callee, let args, _):
             if let name = calleeName(callee) {
                 if Self.returnTaintingSources.contains(name) { return name }
                 if taintReturning.contains(name) || ctx.taintReturningFns.contains(name) {
                     return name
+                }
+                if Self.taintPreservingConversions.contains(name) {
+                    for a in args {
+                        if let r = rootLabel(of: a, tainted: tainted, roots: roots, ctx: ctx) { return r }
+                    }
+                    return nil
                 }
             }
             return "input"
@@ -1263,6 +1398,14 @@ struct CFamilyWalkDetector {
             // The loop may run zero times, so the state at the top joins back in.
             state = Self.union([loopEntry].compactMap { $0 } + [bodyExit].compactMap { $0 }
                                + local.breaks) ?? loopEntry
+            // A `while (p)` / `while (p != NULL)` loop only reaches the code
+            // after it by making its condition false, so `p` is NULL on every
+            // non-break exit — `while (n) { n = n->next; }` then `n->v` is a
+            // real deref. Skip the inference when a `break` can leave the loop
+            // mid-body with `p` still non-NULL.
+            if local.breaks.isEmpty {
+                for name in loopExitNulls(in: cond) { state.nullVars.insert(name) }
+            }
             return .fellThrough
         case .doWhileStmt(let body, let cond, _):
             let loopEntry = state
@@ -1434,6 +1577,25 @@ struct CFamilyWalkDetector {
             if whenTrue && !name.isEmpty && name != "NULL" { state.nullVars.remove(name) }
         default:
             break
+        }
+    }
+
+    /// Variables guaranteed NULL when a `while` condition first tests false:
+    /// the condition is a bare pointer, its negation, or an explicit
+    /// `p != NULL` comparison — all false exactly when the pointer is NULL.
+    private func loopExitNulls(in cond: CExpr) -> Set<String> {
+        switch unwrap(cond) {
+        case .identifier(let name, _):
+            return name.isEmpty || name == "NULL" ? [] : [name]
+        case .unary(let op, let operand, _):
+            if op == "!" { return loopExitNulls(in: operand) }
+            return []
+        case .binary(let op, let l, let r, _):
+            if op == "!=" && isNullConstant(r), let n = simpleIdentifier(l), !n.isEmpty { return [n] }
+            if op == "!=" && isNullConstant(l), let n = simpleIdentifier(r), !n.isEmpty { return [n] }
+            return []
+        default:
+            return []
         }
     }
 

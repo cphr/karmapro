@@ -648,8 +648,14 @@ walk(fn.body)
         if isIntReturn, inputRejects > 0, hasLiteralNonzeroReturn {
             return "id"
         }
-        if isPointerReturn, inputRejects > 0, traversalMarkerRejects > 0, hasPointerReturn {
-            return "path"
+        if isPointerReturn, inputRejects > 0, hasPointerReturn {
+            // A pointer-returning validator that rejects bad input by returning
+            // NULL and otherwise returns its input. Rejections carrying a
+            // traversal marker are path sanitizers; any other allowlist/reject
+            // shape (e.g. a command validator checking `isalnum`/`-`/`_`) is a
+            // general rejecting validator.
+            if traversalMarkerRejects > 0 { return "path" }
+            return "id"
         }
         return nil
     }
@@ -691,7 +697,11 @@ walk(fn.body)
                     if let e = eb { walk(e) }
                 case .whileStmt(_, let b, _), .doWhileStmt(let b, _, _):
                     walk(b)
-                case .forStmt(_, _, _, let b, _):
+                case .forStmt(let initStmt, _, _, let b, _):
+                    // The loop initialiser may declare/assign a local derived
+                    // from a parameter (`for (const char *p = c; *p; p++)`), so
+                    // it must be visited before the body.
+                    if let initStmt = initStmt { walk(initStmt) }
                     walk(b)
                 case .switchStmt(_, let cases, _):
                     for c in cases { for s in c.body { walk(s) } }

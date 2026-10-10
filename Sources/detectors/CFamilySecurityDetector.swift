@@ -12,7 +12,6 @@ extension AstSecurityDetector {
     /// `strcpy`, `printf` and `fopen`. Kernel categories are owned by the
     /// dedicated KernelAstDetector and are intentionally absent here.
 
-
     static let cSinks: [String: AstSinkRule] = [
         "strcpy": .init(category: "Buffer Overflow", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
         "strcat": .init(category: "Buffer Overflow", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
@@ -76,12 +75,14 @@ extension AstSecurityDetector {
             return
         }
         // A bare, unqualified sink name that is also a user-defined function in
-        // the project shadows the C library symbol at the call site:
-        // `Session::open(id)` (via a local `open(...)` call inside a namespace)
-        // must not be treated as the POSIX `open()` path-traversal sink. Keep the
+        // *this* file shadows the C library symbol at the call site:
+        // `Session::open(id)` (via a local `open(...)` call) must not be treated
+        // as the POSIX `open()` path-traversal sink. A same-named definition in a
+        // sibling translation unit does not shadow the library symbol here, so
+        // project-wide definitions are intentionally not consulted. Keep the
         // `::`-qualified and library member forms intact.
         if !isJava, !isCSharp, !name.contains("."), !name.contains("::"),
-           userDefinedFunctions.contains(name) {
+           localDefinedFunctionNames.contains(name) {
             return
         }
         if rule.alwaysVulnerable {
@@ -1024,6 +1025,29 @@ extension AstSecurityDetector {
                                        severity: .medium,
                                        message: "Multiplication of tainted values can wrap past the integer width, defeating size and bounds checks.",
                                        taintPath: taint, reachable: reachable, crossFile: false))
+        } else if op == "+" {
+            // Adding a header/padding offset to an attacker-controlled length
+            // can wrap the resulting allocation size. Only fire when exactly one
+            // side is tainted and the other is a real offset (a constant >= 2 or
+            // `sizeof`), so pointer arithmetic like `base + 1` stays clean and
+            // homogenous additions are left to the multiplication rule.
+            let lTainted = exprTainted(l, tainted: tainted) != nil
+            let rTainted = exprTainted(r, tainted: tainted) != nil
+            let addend: CExpr?
+            if lTainted && !rTainted { addend = r }
+            else if rTainted && !lTainted { addend = l }
+            else { addend = nil }
+            guard let c = addend, isOverflowAddend(c) else { return }
+            let taintedSide = lTainted ? l : r
+            if let tn = taintedIdentifier(taintedSide, tainted: tainted),
+               guarded.contains(tn) || sizeBounded.contains(tn)
+               || overflowConstBoundedRef.vars.contains(tn) { return }
+            let taint = exprTainted(taintedSide, tainted: tainted)
+            findings.append(AstFinding(function: function, offset: offset,
+                                       category: "Integer Overflow",
+                                       severity: .medium,
+                                       message: "Addition of a header offset to tainted data can wrap the size, defeating bounds checks.",
+                                       taintPath: taint, reachable: reachable, crossFile: false))
         } else if op == "/" || op == "%" {
             guard isZeroRiskyDivisor(r, tainted: tainted) else { return }
             let taint = exprTainted(r, tainted: tainted)
@@ -1056,7 +1080,7 @@ extension AstSecurityDetector {
     private func isLargeFactor(_ e: CExpr) -> Bool {
         switch e {
         case .integerLiteral(let s, _):
-            return abs(intLiteralValue(s) ?? 0) > 1024
+            return abs(intLiteralValue(s) ?? 0) >= 1024
         case .charLiteral:
             return false
         case .floatLiteral:
@@ -1065,6 +1089,21 @@ extension AstSecurityDetector {
             return true
         case .paren(let x, _), .cast(let x, _):
             return isLargeFactor(x)
+        default:
+            return false
+        }
+    }
+
+    /// True when an additive term is a real offset (`>= 2`, or `sizeof`) rather
+    /// than the ubiquitous `+ 1` pointer/terminator bump.
+    private func isOverflowAddend(_ e: CExpr) -> Bool {
+        switch e {
+        case .integerLiteral(let s, _):
+            return (intLiteralValue(s) ?? 0) >= 2
+        case .sizeOf:
+            return true
+        case .paren(let x, _), .cast(let x, _):
+            return isOverflowAddend(x)
         default:
             return false
         }
@@ -1079,6 +1118,9 @@ extension AstSecurityDetector {
             return intLiteralValue(s) == 0
         case .identifier(let n, _):
             if zeroCheckedRef.vars.contains(n) { return false }
+            // Branch-scoped proof: `if (divisor > 100) { return 1000/d; }` keeps
+            // `divisor` non-negative-and-above-zero only inside the guard.
+            if branchNonZero.vars.contains(n) { return false }
             return tainted.contains(n)
         case .member, .index:
             return exprTainted(e, tainted: tainted) != nil

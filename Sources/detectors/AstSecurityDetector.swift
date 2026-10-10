@@ -81,6 +81,20 @@ struct AstSecurityDetector {
     /// the C/POSIX library sink — `Session::open(id)` must not fire the `open`
     /// path-traversal rule.
     let userDefinedFunctions: Set<String>
+
+    /// Function names defined in *this* translation unit (both the raw key and
+    /// its unqualified last `::` component). A bare-name sink call only resolves
+    /// to a local user function when the definition is visible here; a same-named
+    /// function in a sibling file does not shadow the library sink across
+    /// translation units, so cross-file shadowing must not suppress detection.
+    var localDefinedFunctionNames: Set<String> {
+        var names = Set<String>()
+        for key in astFns.keys {
+            names.insert(key)
+            if let last = key.split(separator: ":").last { names.insert(String(last)) }
+        }
+        return names
+    }
     /// Namespace/global-scope `const char*`/`std::string` constants initialized
     /// to a string literal anywhere in the project — constant format arguments.
     let globalConstantFormats: Set<String>
@@ -213,19 +227,20 @@ struct AstSecurityDetector {
         for t in tokens where t.kind == .identifier && names.contains(t.text) {
             occurrenceCounts[t.text, default: 0] += 1
         }
-        // C-static suppression only applies when the file has a recognized
-        // entry point: without one, every unreferenced function may be an
-        // externally registered callback (kernel ioctls, workqueue handlers).
-        let hasEntryPoint = !reachableNames.isEmpty
+        // C-static suppression: an unreferenced `static` function has internal
+        // linkage, so it is dead regardless of whether the file has a
+        // recognized entry point.
         for (name, fn) in astFns {
             // The definition itself contributes one occurrence, so more than
             // one means the function is referenced. Each branch decides
             // independently whether it needs references: provable-dead cases
             // (C `static`, Java `private`) are also dead with zero call sites.
             if fn.qualifiers.contains("static") {
-                // C/C++: `static` gives internal linkage, so with a live entry
-                // point present an unreferenced static function is dead code.
-                if hasEntryPoint, !reachableNames.contains(name) { dead.insert(name) }
+                // C/C++: `static` gives internal linkage, so nothing outside
+                // this translation unit can call it. An unreferenced static is
+                // dead code even when the file has no recognized entry point.
+                let referenced = (occurrenceCounts[name] ?? 0) > 1
+                if !reachableNames.contains(name) && !referenced { dead.insert(name) }
             } else if isJava {
                 // Java: a `private` method cannot be called from outside the
                 // class, so findings there are internal regardless of call
@@ -354,6 +369,13 @@ struct AstSecurityDetector {
 
         var findings: [AstFinding] = []
         scanStmt(fn.body, function: name, params: Set(fn.params.compactMap { $0.name }), tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeB, findings: &findings, reachable: reachable)
+        // POSIX check-then-use race: `access()`/`stat()` on a path followed by
+        // opening/using the same path is a TOCTOU. The check itself is not a
+        // finding; the *use* is the race, and a check without a pairing use
+        // (plain `access()` accessor) stays clean.
+        if isCArithmeticTarget {
+            applyPosixToctou(fn: fn, function: name, tainted: tainted, crossTainted: crossTainted, findings: &findings, reachable: reachable)
+        }
         // C++-shaped structural patterns the generic C sink table cannot see:
         // `std::ifstream file(path)` parses into an object read + a ctor-style
         // call named after the *variable*, so no sink name matches. Detect the
@@ -429,6 +451,113 @@ struct AstSecurityDetector {
         return findings
     }
 
+    /// POSIX check-then-use TOCTOU: `access()`/`stat()`/`lstat()` on a path
+    /// followed by opening or using the *same* path (`open`, `fopen`, `unlink`,
+    /// …) is a race — the file can be swapped between the check and the use.
+    /// The check itself is never reported (a bare accessor is not a race), and
+    /// an `open` of a previously-`access()`-checked path is reported as TOCTOU,
+    /// not a plain path traversal.
+    private func applyPosixToctou(fn: CFunctionDef, function: String, tainted: Set<String>, crossTainted: Set<String>, findings: inout [AstFinding], reachable: Bool) {
+        let checkNames: Set<String> = ["access", "stat", "lstat", "stat64", "lstat64"]
+        let useNames: Set<String> = ["open", "openat", "fopen", "fdopen", "freopen",
+                                     "unlink", "remove", "rename", "truncate",
+                                     "opendir", "mkdir", "rmdir", "execve"]
+        var checkedIdents = Set<String>()
+        var useCalls: [(offset: Int, arg: CExpr)] = []
+
+        func collectIdentifiers(_ e: CExpr, into ids: inout Set<String>) {
+            switch e {
+            case .identifier(let n, _): ids.insert(n)
+            case .paren(let x, _), .cast(let x, _): collectIdentifiers(x, into: &ids)
+            default: break
+            }
+        }
+
+        func walkExpr(_ e: CExpr) {
+            switch e {
+            case .call(let callee, let args, let off):
+                let n = callName(callee) ?? ""
+                if let first = args.first {
+                    var ids = Set<String>()
+                    collectIdentifiers(first, into: &ids)
+                    if checkNames.contains(n), !ids.isEmpty,
+                       exprTainted(first, tainted: tainted) != nil {
+                        checkedIdents.formUnion(ids)
+                    }
+                    if useNames.contains(n) { useCalls.append((off, first)) }
+                }
+                walkExpr(callee)
+                for a in args { walkExpr(a) }
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _):
+                walkExpr(x)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                walkExpr(l); walkExpr(r)
+            case .ternary(let c, let t, let f, _):
+                walkExpr(c); walkExpr(t); walkExpr(f)
+            case .assign(_, let l, let r, _):
+                walkExpr(l); walkExpr(r)
+            case .member(let b, _, _, _):
+                walkExpr(b)
+            case .index(let b, let idx, _):
+                walkExpr(b); walkExpr(idx)
+            case .arrayInit(let els, _):
+                for el in els { walkExpr(el) }
+            case .newExpr(_, let args, _):
+                for a in args { walkExpr(a) }
+            case .identifier, .sizeOf, .lambda, .integerLiteral, .floatLiteral, .stringLiteral, .charLiteral, .booleanLiteral:
+                break
+            }
+        }
+
+        func walkStmt(_ s: CStmt) {
+            switch s {
+            case .block(let arr):
+                for x in arr { walkStmt(x) }
+            case .expr(let e):
+                walkExpr(e)
+            case .declaration(let d):
+                if case .variable(_, _, let ie?) = d.kind { walkExpr(ie) }
+            case .ifStmt(let cond, let t, let eb, _):
+                walkExpr(cond); walkStmt(t); if let eb = eb { walkStmt(eb) }
+            case .whileStmt(let cond, let b, _):
+                walkExpr(cond); walkStmt(b)
+            case .doWhileStmt(let b, let cond, _):
+                walkStmt(b); walkExpr(cond)
+            case .forStmt(let initS, let cond, let inc, let b, _):
+                if let initS = initS { walkStmt(initS) }
+                if let cond = cond { walkExpr(cond) }
+                if let inc = inc { walkExpr(inc) }
+                walkStmt(b)
+            case .switchStmt(let e, let cases, _):
+                walkExpr(e)
+                for c in cases { for x in c.body { walkStmt(x) } }
+            case .returnStmt(let e, _):
+                if let e = e { walkExpr(e) }
+            case .labeledStmt(_, let inner, _):
+                walkStmt(inner)
+            default:
+                break
+            }
+        }
+
+        walkStmt(fn.body)
+
+        for use in useCalls {
+            var usedIdents = Set<String>()
+            collectIdentifiers(use.arg, into: &usedIdents)
+            guard !usedIdents.isDisjoint(with: checkedIdents) else { continue }
+            let off = use.offset
+            findings.removeAll { $0.offset == off && $0.category == "Path Traversal" }
+            let rule = AstSinkRule(category: "TOCTOU / Race Condition", severity: .medium,
+                                   vulnArgIndex: 0, alwaysVulnerable: false,
+                                   formatArgIndex: nil, bufferOverflowOnFormat: false)
+            emit(&findings, function, off, rule,
+                 message: "Path was checked with access()/stat() immediately before this use; the file may be replaced between the check and the use (TOCTOU race).",
+                 taint: taintLabel(use.arg, tainted: tainted),
+                 reachable: reachable, crossFile: exprCrossFile(use.arg, crossTainted: crossTainted))
+        }
+    }
+
     // MARK: - Statement walking
 
     private func scanStmt(_ stmt: CStmt, function: String, params: Set<String>, tainted: inout Set<String>, crossTainted: inout Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool) {
@@ -450,9 +579,19 @@ struct AstSecurityDetector {
                 }
                 scanExpr(initExpr, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
             }
-        case .ifStmt(_, let t, let e, _):
-            scanStmt(t, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
-            if let e = e { scanStmt(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable) }
+        case .ifStmt(let cond, let t, let e, _):
+            // Branch-scoped positive guards: `if (validator(x)) { sink(x) }`
+            // proves `x` valid only on the then path; the else path (if any) is
+            // left unguarded so a raw use there is still reported.
+            let thenGuarded = guarded.union(branchTrueGuards(in: cond))
+            let savedNonZero = branchNonZero.vars
+            branchNonZero.vars.formUnion(positiveNonZero(in: cond))
+            scanStmt(t, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: thenGuarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            if let e = e {
+                let elseGuarded = guarded.union(branchFalseGuards(in: cond))
+                scanStmt(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: elseGuarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            }
+            branchNonZero.vars = savedNonZero
         case .whileStmt(_, let b, _):
             scanStmt(b, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         case .doWhileStmt(let b, _, _):
@@ -526,10 +665,18 @@ struct AstSecurityDetector {
                !isPythonSSRFValidatedURL(rhs),
                exprTainted(rhs, tainted: tainted) != nil {
                 tainted.insert(name)
+            } else if op == "=", let name = simpleIdentifier(lhs),
+                      plainSourceCall(rhs) == nil, crossFileSourceCall(rhs) == nil {
+                // Flow-sensitive kill: reassigning a variable to a value that no
+                // longer derives from a tainted source clears its taint, so a
+                // later `system(cmd)` after `cmd = "ls -l"` is not a finding.
+                tainted.remove(name)
             }
             if let name = simpleIdentifier(lhs),
                (crossFileSourceCall(rhs) != nil || exprCrossFile(rhs, crossTainted: crossTainted)) {
                 crossTainted.insert(name)
+            } else if op == "=", let name = simpleIdentifier(lhs) {
+                crossTainted.remove(name)
             }
             checkCOverflowAssign(op: op, lhs: lhs, rhs: rhs, offset: offset, function: function, tainted: tainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
             scanExpr(lhs, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
@@ -811,6 +958,90 @@ struct AstSecurityDetector {
         return false
     }
 
+    /// Variables a rejecting validator (`F(x)` with `F` classified `"id"`)
+    /// proves valid when the whole condition is *true*. Unlike the function-wide
+    /// `guarded` set (which handles early-return rejection forms), these apply
+    /// only inside the guarded branch, so a sibling `else` path stays unguarded.
+    /// Handles `&&` conjunctions and parenthesisation.
+    private func branchTrueGuards(in cond: CExpr) -> Set<String> {
+        switch cond {
+        case .paren(let x, _), .cast(let x, _):
+            return branchTrueGuards(in: x)
+        case .binary(let op, let l, let r, _):
+            if op == "&&" { return branchTrueGuards(in: l).union(branchTrueGuards(in: r)) }
+            return []
+        case .unary:
+            // `!F(x)` being true means the value is *not* validated.
+            return []
+        default:
+            if let target = whitelistTarget(in: cond) { return [target] }
+            return []
+        }
+    }
+
+    /// Variables a rejecting validator proves valid when the condition is
+    /// *false* (`!F(x)` / `A || B`). Used to guard the `else` branch.
+    private func branchFalseGuards(in cond: CExpr) -> Set<String> {
+        switch cond {
+        case .paren(let x, _), .cast(let x, _):
+            return branchFalseGuards(in: x)
+        case .unary(let op, let o, _):
+            return op == "!" ? branchTrueGuards(in: o) : []
+        case .binary(let op, let l, let r, _):
+            if op == "||" { return branchFalseGuards(in: l).union(branchFalseGuards(in: r)) }
+            return []
+        default:
+            return []
+        }
+    }
+
+    /// Variables a positive comparison proves non-zero inside the then branch:
+    /// `if (divisor > 100)` / `if (len != 0)` — the divisor is non-zero while
+    /// the guard holds. Conservative about the threshold: only scalar integer
+    /// literals `>= 1` (so `x > 0` and `x > 100` count, `x > -5` does not).
+    private func positiveNonZero(in cond: CExpr) -> Set<String> {
+        let intLiteral: (CExpr) -> Int64? = { e in
+            switch e {
+            case .integerLiteral(let s, _):
+                var v = s.lowercased()
+                while let last = v.last, last == "u" || last == "l" { v.removeLast() }
+                if v.isEmpty { return nil }
+                var radix = 10
+                if v.hasPrefix("0x") { radix = 16; v = String(v.dropFirst(2)) }
+                else if v.hasPrefix("0b") { radix = 2; v = String(v.dropFirst(2)) }
+                else if v.hasPrefix("0o") { radix = 8; v = String(v.dropFirst(2)) }
+                else if v.count > 1 && v.hasPrefix("0") { radix = 8; v = String(v.dropFirst(1)) }
+                return Int64(v, radix: radix)
+            default:
+                return nil
+            }
+        }
+        let isZero: (CExpr) -> Bool = { e in
+            if case .integerLiteral(let s, _) = e { return s.trimmingCharacters(in: .alphanumerics.inverted) == "0" }
+            return false
+        }
+        var out = Set<String>()
+        switch cond {
+        case .paren(let x, _), .cast(let x, _):
+            return positiveNonZero(in: x)
+        case .binary(let op, let l, let r, _):
+            if op == "||" || op == "&&" {
+                out.formUnion(positiveNonZero(in: l))
+                out.formUnion(positiveNonZero(in: r))
+                return out
+            }
+            if op == ">", let c = intLiteral(r), c >= 1, let n = simpleIdentifier(l), !n.isEmpty { out.insert(n) }
+            if op == "<", let c = intLiteral(l), c >= 1, let n = simpleIdentifier(r), !n.isEmpty { out.insert(n) }
+            if op == ">=", let c = intLiteral(r), c >= 1, let n = simpleIdentifier(l), !n.isEmpty { out.insert(n) }
+            if op == "<=", let c = intLiteral(l), c >= 1, let n = simpleIdentifier(r), !n.isEmpty { out.insert(n) }
+            if op == "!=", isZero(r), let n = simpleIdentifier(l), !n.isEmpty { out.insert(n) }
+            if op == "!=", isZero(l), let n = simpleIdentifier(r), !n.isEmpty { out.insert(n) }
+            return out
+        default:
+            return out
+        }
+    }
+
     private func collectGuardedVars(in stmt: CStmt, into guarded: inout Set<String>, pathResults: Set<String>) {
         switch stmt {
         case .block(let arr):
@@ -998,7 +1229,7 @@ struct AstSecurityDetector {
     /// categories). Handles both a bare guarded variable and an expression
     /// (e.g. a concatenation `prefix + input`) that references one.
     func isGuarded(_ e: CExpr, guarded: Set<String>, category: String) -> Bool {
-        let guardableCats: Set<String> = ["Command Injection", "SQL Injection", "Path Traversal"]
+        let guardableCats: Set<String> = ["Command Injection", "SQL Injection", "Path Traversal", "Buffer Overflow"]
         guard guardableCats.contains(category) else { return false }
         if guarded.isEmpty { return false }
         return referencesGuarded(e, guarded: guarded)
@@ -1154,6 +1385,17 @@ struct AstSecurityDetector {
     }
     let zeroCheckedRef = ZeroCheckedBox()
 
+    /// Variables the *current scan position* proves non-zero from a branch
+    /// guard's positive comparison (`if (divisor > 100) { return 1000/d; }`
+    /// proves `divisor` non-zero inside the then branch). Branch-scoped, unlike
+    /// the whole-function `zeroCheckedRef`: a `> 100` test must not leak past
+    /// its `if`, where the fallthrough can still be zero. Saved and restored
+    /// around each `if` branch scan.
+    final class BranchNonZeroBox {
+        var vars: Set<String> = []
+    }
+    let branchNonZero = BranchNonZeroBox()
+
     /// Loop variables with constant `for` headers (`for (i = 0; i < 8; i++)`)
     /// for the current function, fed by the walk detector's cross-over facts.
     /// Consulted by the integer-overflow suppression only (see
@@ -1186,7 +1428,16 @@ struct AstSecurityDetector {
                     else { otherAssigns.insert(n) }
                 }
                 walkExpr(rhs)
-            case .call(_, let args, _):
+            case .call(let callee, let args, _):
+                // A bounded copy of a string literal into `dst` makes `dst` a
+                // constant string for downstream format-string use
+                // (`strcpy(dst, "fixed"); printf(dst)`).
+                if let fn = callName(callee),
+                   ["strcpy", "strncpy", "strlcpy", "strscpy", "stpcpy"].contains(fn),
+                   args.count >= 2, let dst = simpleIdentifier(args[0]),
+                   case .stringLiteral = args[1] {
+                    literalAssigns.insert(dst)
+                }
                 for a in args { walkExpr(a) }
             case .binary(_, let l, let r, _), .comma(let l, let r, _):
                 walkExpr(l); walkExpr(r)

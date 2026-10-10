@@ -22,16 +22,100 @@ public struct CTokenizer {
         func col(_ offset: Int) -> Int { offset - lineStart + 1 }
         func isWS(_ c: unichar) -> Bool { c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D }
 
+        // Preprocessor conditional state. `ppStack` holds one frame per open
+        // `#if`; `ppActive` is false while inside a disabled branch (`#if 0`).
+        var ppActive = true
+        var ppStack: [(parentActive: Bool, taken: Bool, active: Bool)] = []
+        // True once a non-whitespace token has appeared on the current line, so
+        // a `#` is only treated as a directive at the start of a line.
+        var lineHasCode = false
+
         while i < length {
             let c = ns.character(at: i)
             let next = i + 1 < length ? ns.character(at: i + 1) : 0
 
-            if c == 0x0A { line += 1; i += 1; lineStart = i; continue }
+            if c == 0x0A { line += 1; i += 1; lineStart = i; lineHasCode = false; continue }
             if isWS(c) { i += 1; continue }
 
-            // Preprocessor line: skip to end of line.
-            if c == 0x23 {
-                while i < length && ns.character(at: i) != 0x0A { i += 1 }
+            // Preprocessor directive (only at the start of a line). Consume the
+            // whole line, update the conditional stack, and emit no token.
+            if c == 0x23 && !lineHasCode {
+                i += 1
+                while i < length, ns.character(at: i) == 0x20 || ns.character(at: i) == 0x09 { i += 1 }
+                let dStart = i
+                while i < length, isIdentPart(ns.character(at: i)) { i += 1 }
+                let directive = ns.substring(with: NSRange(location: dStart, length: i - dStart))
+                let argStart = i
+                var argEnd = i
+                while argEnd < length, ns.character(at: argEnd) != 0x0A { argEnd += 1 }
+                let arg = ns.substring(with: NSRange(location: argStart, length: argEnd - argStart))
+                    .trimmingCharacters(in: .whitespaces)
+                i = argEnd
+                switch directive {
+                case "if":
+                    // Only a literal `0` disables the branch; unknown conditions
+                    // (`#if FOO`) are treated as active to avoid dropping live code.
+                    let parent = ppActive
+                    let on = arg != "0"
+                    ppStack.append((parent, on, parent && on))
+                    ppActive = parent && on
+                case "ifdef", "ifndef":
+                    let parent = ppActive
+                    ppStack.append((parent, true, parent))
+                    ppActive = parent
+                case "elif":
+                    if let top = ppStack.last {
+                        let on = arg != "0"
+                        let active = top.parentActive && !top.taken && on
+                        ppStack[ppStack.count - 1] = (top.parentActive, top.taken || on, active)
+                        ppActive = active
+                    }
+                case "else":
+                    if let top = ppStack.last {
+                        let active = top.parentActive && !top.taken
+                        ppStack[ppStack.count - 1] = (top.parentActive, true, active)
+                        ppActive = active
+                    }
+                case "endif":
+                    if !ppStack.isEmpty { ppStack.removeLast() }
+                    ppActive = ppStack.last?.active ?? true
+                default:
+                    break
+                }
+                continue
+            }
+
+            // Disabled branch: consume input without emitting tokens, but still
+            // skip comments/literals so a `#` inside them is not read as a
+            // directive and nested conditionals stay balanced.
+            if !ppActive {
+                lineHasCode = true
+                if c == 0x2F && next == 0x2F {
+                    while i < length, ns.character(at: i) != 0x0A { i += 1 }
+                    continue
+                }
+                if c == 0x2F && next == 0x2A {
+                    i += 2
+                    while i + 1 < length {
+                        if ns.character(at: i) == 0x2A && ns.character(at: i + 1) == 0x2F { i += 2; break }
+                        if ns.character(at: i) == 0x0A { line += 1; lineStart = i + 1 }
+                        i += 1
+                    }
+                    continue
+                }
+                if c == 0x22 || c == 0x27 {
+                    let quote = c
+                    var k = i + 1
+                    while k < length {
+                        if ns.character(at: k) == 0x5C && k + 1 < length { k += 2; continue }
+                        if ns.character(at: k) == quote { k += 1; break }
+                        if ns.character(at: k) == 0x0A { line += 1; lineStart = k + 1; lineHasCode = false }
+                        k += 1
+                    }
+                    i = k
+                    continue
+                }
+                i += 1
                 continue
             }
 
@@ -109,6 +193,7 @@ public struct CTokenizer {
                     tokens.append(CAstToken(kind: quote == 0x22 ? .string : .character,
                                             text: ns.substring(with: NSRange(location: startOff, length: k - startOff)),
                                             line: startLine, column: startCol, offset: startOff))
+                    lineHasCode = true
                     i = k
                     _ = closed
                     continue
@@ -144,6 +229,7 @@ public struct CTokenizer {
                 }
                 tokens.append(CAstToken(kind: .number, text: ns.substring(with: NSRange(location: startOff, length: j - startOff)),
                                         line: startLine, column: startCol, offset: startOff))
+                lineHasCode = true
                 i = j
                 continue
             }

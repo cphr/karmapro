@@ -72,13 +72,17 @@ struct KernelAstDetector {
     /// Whether `source` looks like a Linux-kernel source file. Cheap and safe:
     /// the detector only ever runs when this returns true, so unrelated corpus
     /// files keep their previous behaviour.
+    ///
+    /// `<linux/module.h>` alone is decisive: it is the kernel-module build
+    /// header and userspace code never includes it. Requiring a userspace copy
+    /// call on top of it (the previous rule) missed drivers that only consume a
+    /// scalar ioctl argument — `kmalloc(arg * 2, GFP_KERNEL)` in a handler with
+    /// an `unsigned long arg` parameter — so the shape test no longer gates on
+    /// `copy_from_user`/`copy_to_user`.
     static func isKernelShaped(_ source: String) -> Bool {
         if source.contains("__user") { return true }
         if source.contains("<linux/uaccess.h>") || source.contains("<linux/uaccess.h> //") { return true }
-        if source.contains("<linux/module.h>"),
-           (source.contains("copy_from_user") || source.contains("copy_to_user")) {
-            return true
-        }
+        if source.contains("<linux/module.h>") { return true }
         return false
     }
 
