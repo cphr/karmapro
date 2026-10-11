@@ -23,6 +23,12 @@ let javaSourceAPIs: Set<String> = [
     "getText", "getRawValue", "getUserInput",
     // Environment / system properties / decoding.
     "getenv", "getProperty", "System.getProperty", "System.getenv", "URLDecoder.decode",
+    // JDBC ResultSet reads: a value read from the database is untrusted input.
+    "getString", "getInt", "getLong", "getShort", "getByte", "getBytes", "getBoolean",
+    "getFloat", "getDouble", "getBigDecimal", "getDate", "getTime", "getTimestamp",
+    "getObject", "getAsciiStream", "getBinaryStream", "getCharacterStream",
+    "getClob", "getBlob", "getArray", "getRef", "getURL", "getNString",
+    "getNCharacterStream", "getRowId", "getSQLXML",
     // C-ish buffer readers that also apply to Java streams.
     "fgets", "fgetc", "recv", "recvfrom", "fread", "scanf", "fscanf", "sscanf", "getwd", "getpass", "strdup"
 ]

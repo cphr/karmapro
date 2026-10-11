@@ -19,12 +19,16 @@ struct FileAnalysis {
     /// Per-function parameter-write summary: how many constant elements each
     /// pointer parameter receives from a copy sink inside the function.
     let paramWrites: VulnerabilityScanner.ParamSummaries
+    /// Java fields this file declares and writes untrusted data into, qualified
+    /// as `Class.field`, so a read of `Class.field` in another file stays tainted.
+    let javaTaintedFields: Set<String>
 
     init(url: URL, taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
          astFns: [String: CFunctionDef], callees: [String: [String]],
          phpSanitizers: Set<String>, paramTaintSeeds: [String: Set<Int>],
          jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = [],
-         paramWrites: VulnerabilityScanner.ParamSummaries = [:]) {
+         paramWrites: VulnerabilityScanner.ParamSummaries = [:],
+         javaTaintedFields: Set<String> = []) {
         self.url = url
         self.taintReturning = taintReturning
         self.writeThroughParam = writeThroughParam
@@ -35,6 +39,7 @@ struct FileAnalysis {
         self.jsSanitizerReturning = jsSanitizerReturning
         self.jsValidatedReturning = jsValidatedReturning
         self.paramWrites = paramWrites
+        self.javaTaintedFields = javaTaintedFields
     }
 }
 
@@ -99,6 +104,9 @@ struct ProjectIndex {
     let globalJsValidatedReturning: Set<String>
     /// Project-wide parameter-write summary, collapsed across files.
     let globalParamSummaries: VulnerabilityScanner.ParamSummaries
+    /// Project-wide Java fields written untrusted data, qualified `Class.field`,
+    /// so a cross-file read of such a field is recognized as tainted.
+    let globalJavaTaintedFields: Set<String>
 
     /// All source APIs across all languages, used for the cross-file
     /// taint-returning fixpoint.
@@ -148,6 +156,7 @@ struct ProjectIndex {
         let globalJsSanitizerReturning = Set(analyses.values.flatMap { $0.jsSanitizerReturning })
         let globalJsValidatedReturning = Set(analyses.values.flatMap { $0.jsValidatedReturning })
         let globalParamSummaries = mergeParamSummaries(analyses: analyses)
+        let globalJavaTaintedFields = Set(analyses.values.flatMap { $0.javaTaintedFields })
 
         return ProjectIndex(fileAnalyses: analyses,
                             globalTaintReturning: globalTaint,
@@ -164,7 +173,8 @@ struct ProjectIndex {
                             globalClampedReturnFns: globalClampedReturnFns,
                             globalJsSanitizerReturning: globalJsSanitizerReturning,
                             globalJsValidatedReturning: globalJsValidatedReturning,
-                            globalParamSummaries: globalParamSummaries)
+                            globalParamSummaries: globalParamSummaries,
+                            globalJavaTaintedFields: globalJavaTaintedFields)
     }
 
     /// Collapses per-file parameter summaries into one project-wide table,
@@ -1025,6 +1035,18 @@ walk(fn.body)
 
     // MARK: - Per-file pre-scan
 
+    /// The name of the file's primary class, used to qualify per-file tainted
+    /// fields for the project-wide cross-file table. Tokenized so a `class` in a
+    /// comment/string ("another class in the same package") is not mistaken for
+    /// the declaration.
+    private static func primaryJavaClassName(in source: String) -> String? {
+        let tokens = CTokenizer(source: source).tokenize()
+        for (i, t) in tokens.enumerated() where t.text == "class" {
+            if i + 1 < tokens.count, tokens[i + 1].kind == .identifier { return tokens[i + 1].text }
+        }
+        return nil
+    }
+
     private static func analyzeForIndex(url: URL, source: String) -> FileAnalysis? {
         let isC = isCFile(url)
         let isJava = isJavaFile(url)
@@ -1106,11 +1128,25 @@ walk(fn.body)
                 }
                 calleesMap[m.name] = Array(calling)
             }
+            let jDefs = methods.map { def in
+                CCFunctionParser.FunctionDef(name: def.name,
+                                             bodyRange: def.bodyRange,
+                                             signatureRange: NSRange(location: def.startOffset, length: max(0, def.bodyOffset - def.startOffset)),
+                                             nameRange: NSRange(location: def.startOffset, length: (def.name as NSString).length))
+            }
+            let bareFields = VulnerabilityScanner.taintedJavaFields(source: source, definitions: jDefs,
+                                                                    tokens: scanTokens(tokens),
+                                                                    taintReturning: jAnalysis.taintReturning)
+            var javaTaintedFields = Set<String>()
+            if !bareFields.isEmpty, let cls = Self.primaryJavaClassName(in: source) {
+                for f in bareFields { javaTaintedFields.insert("\(cls).\(f)") }
+            }
             return FileAnalysis(url: url, taintReturning: jAnalysis.taintReturning,
-                                     writeThroughParam: jAnalysis.writeThroughParam,
-                                     astFns: jAnalyzer.astFunctions, callees: calleesMap,
-                                      phpSanitizers: [],
-                                      paramTaintSeeds: jAnalysis.paramTaintSeeds)
+                                 writeThroughParam: jAnalysis.writeThroughParam,
+                                 astFns: jAnalyzer.astFunctions, callees: calleesMap,
+                                  phpSanitizers: [],
+                                  paramTaintSeeds: jAnalysis.paramTaintSeeds,
+                                  javaTaintedFields: javaTaintedFields)
         }
 
         if isCSharp {

@@ -447,52 +447,100 @@ extension VulnerabilityScanner {
         return visited
     }
 
-    /// Java class fields written untrusted data somewhere in the file. A
-    /// `this.<f> = <rhs>` store in any constructor/method marks `<f>` tainted
-    /// for every method of the file, so a bare field read used at a sink in
-    /// another method keeps its flow. The RHS is tainted when it references a
-    /// parameter of the enclosing method (params are the untrusted sources) or
-    /// a known taint-return API (e.g. `intent.getStringExtra(...)`).
+    /// Java class fields written untrusted data somewhere in the file. A store
+    /// to a declared field — `this.<f> = <rhs>` or a bare `<f> = <rhs>` — in any
+    /// constructor/method marks `<f>` tainted for every method of the file, so a
+    /// bare field read used at a sink in another method keeps its flow. The RHS
+    /// is tainted when it references a parameter of the enclosing method, a
+    /// known taint-return API (e.g. `intent.getStringExtra(...)`), a source API,
+    /// or a local already tracked as tainted (so `data = <source>; field = data`
+    /// propagates).
     static func taintedJavaFields(source: String,
                                   definitions: [CCFunctionParser.FunctionDef],
                                   tokens: [Token],
                                   taintReturning: Set<String>) -> Set<String> {
+        let fieldNames = declaredJavaFieldNames(source: source, definitions: definitions)
+        guard !fieldNames.isEmpty else { return [] }
         var fields = Set<String>()
         for def in definitions {
             let sigTokens = def.signatureRange.length > 0 ? Self.tokens(in: def.signatureRange, tokenList: tokens) : []
             let bodyTokens = Self.tokens(in: def.bodyRange, tokenList: tokens)
             let params = parameterNames(tokens: sigTokens.isEmpty ? bodyTokens : sigTokens)
+            var taintedLocals = Set(params)
             var i = 0
             let n = bodyTokens.count
-            while i + 3 < n {
+            while i < n {
+                var lhs: String?
+                var lhsIsField = false
+                var rhsStart = 0
                 if bodyTokens[i].kind == .identifier, bodyTokens[i].text == "this",
-                   bodyTokens[i + 1].text == ".",
-                   bodyTokens[i + 2].kind == .identifier,
-                   bodyTokens[i + 3].text == "=" {
-                    let field = bodyTokens[i + 2].text
-                    var j = i + 4
-                    var parenDepth = 0
-                    var rhsRefsParam = false
-                    var rhsRefsTaintReturn = false
-                    while j < n {
-                        let rt = bodyTokens[j]
-                        if rt.text == "(" { parenDepth += 1 }
-                        else if rt.text == ")" { parenDepth -= 1 }
-                        if rt.text == ";" && parenDepth <= 0 { break }
-                        if rt.kind == .identifier {
-                            if params.contains(rt.text) { rhsRefsParam = true }
-                            if taintReturning.contains(rt.text) { rhsRefsTaintReturn = true }
-                        }
-                        j += 1
-                    }
-                    // Stop scanning this store's RHS once both signals found.
-                    if rhsRefsParam || rhsRefsTaintReturn {
-                        fields.insert(field)
-                    }
-                    i = j
-                } else {
-                    i += 1
+                   i + 3 < n, bodyTokens[i + 1].text == ".",
+                   bodyTokens[i + 2].kind == .identifier, bodyTokens[i + 3].text == "=" {
+                    lhs = bodyTokens[i + 2].text
+                    lhsIsField = true
+                    rhsStart = i + 4
+                } else if bodyTokens[i].kind == .identifier,
+                          i + 1 < n, bodyTokens[i + 1].text == "=" {
+                    lhs = bodyTokens[i].text
+                    lhsIsField = fieldNames.contains(bodyTokens[i].text)
+                    rhsStart = i + 2
                 }
+                guard let name = lhs else { i += 1; continue }
+                var j = rhsStart
+                var parenDepth = 0
+                var taintedRHS = false
+                while j < n {
+                    let rt = bodyTokens[j]
+                    if rt.text == "(" { parenDepth += 1 }
+                    else if rt.text == ")" { parenDepth -= 1 }
+                    if (rt.text == ";" || rt.text == ",") && parenDepth <= 0 { break }
+                    if rt.kind == .identifier,
+                       taintedLocals.contains(rt.text)
+                        || taintReturning.contains(rt.text)
+                        || javaSourceAPIs.contains(rt.text) {
+                        taintedRHS = true
+                    }
+                    j += 1
+                }
+                if taintedRHS {
+                    if lhsIsField { fields.insert(name) } else { taintedLocals.insert(name) }
+                }
+                i = rhsStart
+            }
+        }
+        return fields
+    }
+
+    /// Names of fields declared at class scope. Method signatures and bodies are
+    /// blanked first, so only class-body member declarations remain; the name is
+    /// the last identifier before the terminating `;` or the declarator before
+    /// `=`.
+    static func declaredJavaFieldNames(source: String,
+                                       definitions: [CCFunctionParser.FunctionDef]) -> Set<String> {
+        var chars = Array(source)
+        func blank(_ r: NSRange) {
+            guard r.location >= 0, r.length > 0, r.location + r.length <= chars.count else { return }
+            for k in r.location..<(r.location + r.length) where chars[k] != "\n" { chars[k] = " " }
+        }
+        for def in definitions { blank(def.signatureRange); blank(def.bodyRange) }
+        let tokens = CTokenizer(source: String(chars)).tokenize()
+        var fields = Set<String>()
+        var depth = 0
+        var lastIdent: String?
+        var assignLhs: String?
+        for t in tokens {
+            switch t.text {
+            case "{":
+                depth += 1; lastIdent = nil; assignLhs = nil
+            case "}":
+                depth -= 1; lastIdent = nil; assignLhs = nil
+            case ";":
+                if depth == 1, let n = assignLhs ?? lastIdent { fields.insert(n) }
+                lastIdent = nil; assignLhs = nil
+            case "=":
+                if depth == 1 { assignLhs = lastIdent }
+            default:
+                if t.kind == .identifier { lastIdent = t.text }
             }
         }
         return fields

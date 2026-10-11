@@ -62,6 +62,9 @@ struct AstSecurityDetector {
     /// this set makes a caller's `keccak256` seed predictable.
     let entropyReturning: Set<String>
     private let crossFileSources: Set<String>
+    /// Java field names that stay tainted across methods: bare names seeded for
+    /// same-class flow, plus `Class.field` qualified names for cross-file flow.
+    private let fieldSeeds: Set<String>
     private let writeThroughParam: [String: Set<Int>]
     /// Project-wide write-through table, consulted via lookup (never merged
     /// into the local map — that was O(files x global entries)).
@@ -137,6 +140,7 @@ struct AstSecurityDetector {
                 taintReturning: Set<String>,
                 entropyReturning: Set<String> = [],
                 crossFileSources: Set<String>,
+                fieldSeeds: Set<String> = [],
                 writeThroughParam: [String: Set<Int>],
                 globalWriteThroughParam: [String: Set<Int>] = [:],
                 paramTaintSeeds: [String: Set<Int>] = [:],
@@ -165,6 +169,7 @@ struct AstSecurityDetector {
         self.taintReturning = taintReturning
         self.entropyReturning = entropyReturning
         self.crossFileSources = crossFileSources
+        self.fieldSeeds = fieldSeeds
         self.writeThroughParam = writeThroughParam
         self.globalWriteThroughParam = globalWriteThroughParam
         self.paramTaintSeeds = paramTaintSeeds
@@ -248,17 +253,18 @@ struct AstSecurityDetector {
                 let referenced = (occurrenceCounts[name] ?? 0) > 1
                 if !reachableNames.contains(name) && !referenced { dead.insert(name) }
             } else if isJava {
-                // Java: a `private` method cannot be called from outside the
-                // class, so findings there are internal regardless of call
-                // sites. The check looks only at this declaration's own prefix
-                // (after the last `;`, `{` or `}`), not the previous member's
-                // modifiers.
+                // Java: a `private` method referenced anywhere else in the file
+                // is live (called from within its own class); only an
+                // unreferenced one is dead. The check looks only at this
+                // declaration's own prefix (after the last `;`, `{` or `}`),
+                // not the previous member's modifiers.
+                let referenced = (occurrenceCounts[name] ?? 0) > 1
                 let lo = max(0, fn.startOffset - 400)
                 let before = ns.substring(with: NSRange(location: lo, length: fn.startOffset - lo))
                 let separators: [(Character)] = [";", "{", "}"]
                 let fragments = before.split(whereSeparator: { c in separators.contains(c) })
                 let prefix = fragments.last.map(String.init) ?? before
-                if prefix.contains("private") { dead.insert(name) }
+                if prefix.contains("private") && !referenced { dead.insert(name) }
             } else if isPython || isRuby || isGo || isRust || isKotlin || isPHP || isCSharp {
                 // Script languages have no linkage: require an explicit
                 // retirement marker so live API surface is never suppressed.
@@ -352,6 +358,14 @@ struct AstSecurityDetector {
         // `mysqli_query($c, $_POST['x'])`, `echo $_GET['q']`, etc. propagate.
         if isPHP {
             tainted.formUnion(Self.phpSuperglobalSeeds)
+        }
+
+        // Class fields written untrusted data in another method of this file are
+        // tainted on every read, so a helper that stores into a field and a sink
+        // reached through that field keep the flow. Qualified `Class.field`
+        // entries (cross-file) are matched in `exprTainted`'s member case.
+        if !fieldSeeds.isEmpty {
+            for f in fieldSeeds where !f.contains(".") { tainted.insert(f) }
         }
 
         // C# parameters often arrive as `out`/`ref` (write-through seeds) and the
@@ -592,16 +606,39 @@ struct AstSecurityDetector {
             let thenGuarded = guarded.union(branchTrueGuards(in: cond))
             let savedNonZero = branchNonZero.vars
             branchNonZero.vars.formUnion(positiveNonZero(in: cond))
+            // Scan each branch from the state on entry and union the results: a
+            // variable tainted on either branch stays tainted after the `if`, so
+            // a kill on one path (`else { x = null; }`) cannot erase a taint set
+            // on the other. Reassignment kills are per-path, not cross-path.
+            let entryTainted = tainted
+            let entryCross = crossTainted
             scanStmt(t, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: thenGuarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            let thenTainted = tainted
+            let thenCross = crossTainted
+            tainted = entryTainted
+            crossTainted = entryCross
             if let e = e {
                 let elseGuarded = guarded.union(branchFalseGuards(in: cond))
                 scanStmt(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: elseGuarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
             }
+            tainted.formUnion(thenTainted)
+            crossTainted.formUnion(thenCross)
             branchNonZero.vars = savedNonZero
         case .whileStmt(_, let b, _):
+            // A variable tainted before the loop stays tainted after it: the
+            // body may never run, or may not reassign it on every iteration, so
+            // union the body's effects onto the entry state.
+            let entryTainted = tainted
+            let entryCross = crossTainted
             scanStmt(b, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            tainted.formUnion(entryTainted)
+            crossTainted.formUnion(entryCross)
         case .doWhileStmt(let b, _, _):
+            let entryTainted = tainted
+            let entryCross = crossTainted
             scanStmt(b, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            tainted.formUnion(entryTainted)
+            crossTainted.formUnion(entryCross)
         case .forStmt(let initS, let cond, _, let b, _):
             if let initS = initS {
                 scanStmt(initS, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
@@ -617,13 +654,30 @@ struct AstSecurityDetector {
                     crossTainted.insert(loopVar)
                 }
             }
+            let entryTainted = tainted
+            let entryCross = crossTainted
             scanStmt(b, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+            tainted.formUnion(entryTainted)
+            crossTainted.formUnion(entryCross)
         case .switchStmt(_, let cases, _):
+            // Scan every case from the state on entry and union the results: a
+            // variable tainted on any case stays tainted after the `switch`, so a
+            // `default { x = null; }` cannot erase a taint set on a live case.
+            let entryTainted = tainted
+            let entryCross = crossTainted
+            var joinedTainted = entryTainted
+            var joinedCross = entryCross
             for c in cases {
+                tainted = entryTainted
+                crossTainted = entryCross
                 for s in c.body {
                     scanStmt(s, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
                 }
+                joinedTainted.formUnion(tainted)
+                joinedCross.formUnion(crossTainted)
             }
+            tainted = joinedTainted
+            crossTainted = joinedCross
         case .returnStmt(let e, _):
             if let e = e { scanExpr(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable) }
         case .labeledStmt(_, let s, _):
@@ -1923,7 +1977,11 @@ struct AstSecurityDetector {
                 if let t = exprTainted(a, tainted: tainted) { return t }
             }
             return nil
-        case .member(let b, _, _, _):
+        case .member(let b, let m, _, _):
+            // Cross-file field flow: a `Class.field` written untrusted data in
+            // another file is tainted wherever it is read.
+            if !fieldSeeds.isEmpty, case .identifier(let baseName, _) = b,
+               fieldSeeds.contains("\(baseName).\(m)") { return m }
             return exprTainted(b, tainted: tainted)
         case .index(let b, let idx, _):
             return exprTainted(b, tainted: tainted) ?? exprTainted(idx, tainted: tainted)
