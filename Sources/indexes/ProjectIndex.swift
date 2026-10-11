@@ -16,11 +16,15 @@ struct FileAnalysis {
     /// (validatedReturning) their argument before returning.
     let jsSanitizerReturning: Set<String>
     let jsValidatedReturning: Set<String>
+    /// Per-function parameter-write summary: how many constant elements each
+    /// pointer parameter receives from a copy sink inside the function.
+    let paramWrites: VulnerabilityScanner.ParamSummaries
 
     init(url: URL, taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
          astFns: [String: CFunctionDef], callees: [String: [String]],
          phpSanitizers: Set<String>, paramTaintSeeds: [String: Set<Int>],
-         jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = []) {
+         jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = [],
+         paramWrites: VulnerabilityScanner.ParamSummaries = [:]) {
         self.url = url
         self.taintReturning = taintReturning
         self.writeThroughParam = writeThroughParam
@@ -30,6 +34,7 @@ struct FileAnalysis {
         self.paramTaintSeeds = paramTaintSeeds
         self.jsSanitizerReturning = jsSanitizerReturning
         self.jsValidatedReturning = jsValidatedReturning
+        self.paramWrites = paramWrites
     }
 }
 
@@ -92,6 +97,8 @@ struct ProjectIndex {
     /// argument before returning (merged per-file wrapper classification).
     let globalJsSanitizerReturning: Set<String>
     let globalJsValidatedReturning: Set<String>
+    /// Project-wide parameter-write summary, collapsed across files.
+    let globalParamSummaries: VulnerabilityScanner.ParamSummaries
 
     /// All source APIs across all languages, used for the cross-file
     /// taint-returning fixpoint.
@@ -140,6 +147,7 @@ struct ProjectIndex {
         let globalParamSeeds = mergeParamTaintSeeds(analyses: analyses)
         let globalJsSanitizerReturning = Set(analyses.values.flatMap { $0.jsSanitizerReturning })
         let globalJsValidatedReturning = Set(analyses.values.flatMap { $0.jsValidatedReturning })
+        let globalParamSummaries = mergeParamSummaries(analyses: analyses)
 
         return ProjectIndex(fileAnalyses: analyses,
                             globalTaintReturning: globalTaint,
@@ -155,7 +163,58 @@ struct ProjectIndex {
                             globalDefinedFunctions: globalDefinedFunctions,
                             globalClampedReturnFns: globalClampedReturnFns,
                             globalJsSanitizerReturning: globalJsSanitizerReturning,
-                            globalJsValidatedReturning: globalJsValidatedReturning)
+                            globalJsValidatedReturning: globalJsValidatedReturning,
+                            globalParamSummaries: globalParamSummaries)
+    }
+
+    /// Collapses per-file parameter summaries into one project-wide table,
+    /// keeping the largest write and the strictest length bound per parameter.
+    private static func mergeParamSummaries(analyses: [URL: FileAnalysis]) -> VulnerabilityScanner.ParamSummaries {
+        var out: VulnerabilityScanner.ParamSummaries = [:]
+        for fa in analyses.values {
+            for (fn, s) in fa.paramWrites {
+                var dst = out[fn] ?? VulnerabilityScanner.ParamSummary()
+                for (p, size) in s.writes {
+                    if let e = dst.writes[p], e.elems >= size.elems { continue }
+                    dst.writes[p] = size
+                }
+                for (p, limit) in s.maxSourceLen {
+                    if limit > (dst.maxSourceLen[p] ?? 0) { dst.maxSourceLen[p] = limit }
+                }
+                out[fn] = dst
+            }
+        }
+        return out
+    }
+
+    /// Summarizes, per function, how it consumes its pointer parameters via copy
+    /// sinks in the function body.
+    private static func paramWrites(tu: CTranslationUnit, tokens: [CAstToken], macroAliases: [String: String]) -> VulnerabilityScanner.ParamSummaries {
+        var out: VulnerabilityScanner.ParamSummaries = [:]
+        for fn in tu.functions where fn.isDefinition {
+            let names = fn.params.compactMap { $0.name }
+            guard !names.isEmpty else { continue }
+            let slice = Self.bodyTokens(fn.bodyOffset, fn.endOffset, tokens: tokens)
+            guard !slice.isEmpty else { continue }
+            let summary = VulnerabilityScanner.paramWriteSizes(bodyTokens: scanTokens(slice), params: names, macroAliases: macroAliases)
+            if !summary.writes.isEmpty || !summary.maxSourceLen.isEmpty { out[fn.name] = summary }
+        }
+        return out
+    }
+
+    /// Converts the AST frontend's tokens to the scanner's lightweight token type.
+    private static func scanTokens(_ astTokens: [CAstToken]) -> [VulnerabilityScanner.Token] {
+        astTokens.map { t in
+            let kind: VulnerabilityScanner.Token.Kind
+            switch t.kind {
+            case .identifier, .keyword, .eof: kind = .identifier
+            case .number: kind = .number
+            case .string, .character: kind = .string
+            case .operator, .punct: kind = .symbol
+            }
+            return VulnerabilityScanner.Token(kind: kind, text: t.text, line: t.line,
+                                              range: NSRange(location: t.offset, length: t.text.utf16.count))
+        }
     }
 
     /// True when a C expression denotes a fixed capacity: a literal, a
@@ -1018,10 +1077,13 @@ walk(fn.body)
                     calleesMap[def.name, default: []].append(contentsOf: Array(calls))
                 }
             }
+            let fileMacros = Self.extractMacroAliases(files: [url], readSource: { _ in source })
+            let paramWrites = Self.paramWrites(tu: tu, tokens: tokens, macroAliases: fileMacros)
             return FileAnalysis(url: url, taintReturning: taintRet,
                                 writeThroughParam: wt, astFns: ast, callees: calleesMap,
                                 phpSanitizers: [],
-                                paramTaintSeeds: [:])
+                                paramTaintSeeds: [:],
+                                paramWrites: paramWrites)
         }
 
         if isJava {
