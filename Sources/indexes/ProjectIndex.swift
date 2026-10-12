@@ -22,13 +22,24 @@ struct FileAnalysis {
     /// Java fields this file declares and writes untrusted data into, qualified
     /// as `Class.field`, so a read of `Class.field` in another file stays tainted.
     let javaTaintedFields: Set<String>
+    /// Java fields declared once to a literal and never mutated, qualified as
+    /// `Class.field`, so a constant test in another file resolves.
+    let javaConstInts: [String: Int]
+    let javaConstBools: [String: Bool]
+    /// Per-method Java field-taint context: the project-wide fields that are
+    /// tainted at the call sites invoking each method, qualified `Class.field`.
+    /// Lets a `goodG2B*Sink` (reached only after the field is set to a constant)
+    /// avoid inheriting the global field taint that its sibling `badSink` needs.
+    let javaFieldSeedsByMethod: [String: Set<String>]
 
     init(url: URL, taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
          astFns: [String: CFunctionDef], callees: [String: [String]],
          phpSanitizers: Set<String>, paramTaintSeeds: [String: Set<Int>],
          jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = [],
          paramWrites: VulnerabilityScanner.ParamSummaries = [:],
-         javaTaintedFields: Set<String> = []) {
+         javaTaintedFields: Set<String> = [],
+         javaConstInts: [String: Int] = [:], javaConstBools: [String: Bool] = [:],
+         javaFieldSeedsByMethod: [String: Set<String>] = [:]) {
         self.url = url
         self.taintReturning = taintReturning
         self.writeThroughParam = writeThroughParam
@@ -40,6 +51,9 @@ struct FileAnalysis {
         self.jsValidatedReturning = jsValidatedReturning
         self.paramWrites = paramWrites
         self.javaTaintedFields = javaTaintedFields
+        self.javaConstInts = javaConstInts
+        self.javaConstBools = javaConstBools
+        self.javaFieldSeedsByMethod = javaFieldSeedsByMethod
     }
 }
 
@@ -107,6 +121,15 @@ struct ProjectIndex {
     /// Project-wide Java fields written untrusted data, qualified `Class.field`,
     /// so a cross-file read of such a field is recognized as tainted.
     let globalJavaTaintedFields: Set<String>
+    /// Project-wide Java constant fields (declared once to a literal, never
+    /// mutated), qualified `Class.field`, so a constant test in one file can be
+    /// folded even when the field is declared in another.
+    let globalJavaConstInts: [String: Int]
+    let globalJavaConstBools: [String: Bool]
+    /// Project-wide per-method Java field-taint seeds (see
+    /// `FileAnalysis.javaFieldSeedsByMethod`), keyed by method name and merged
+    /// by union across all files that call the method.
+    let globalJavaFieldSeedsByMethod: [String: Set<String>]
 
     /// All source APIs across all languages, used for the cross-file
     /// taint-returning fixpoint.
@@ -157,6 +180,18 @@ struct ProjectIndex {
         let globalJsValidatedReturning = Set(analyses.values.flatMap { $0.jsValidatedReturning })
         let globalParamSummaries = mergeParamSummaries(analyses: analyses)
         let globalJavaTaintedFields = Set(analyses.values.flatMap { $0.javaTaintedFields })
+        var globalJavaConstInts: [String: Int] = [:]
+        var globalJavaConstBools: [String: Bool] = [:]
+        for fa in analyses.values {
+            for (k, v) in fa.javaConstInts { globalJavaConstInts[k] = v }
+            for (k, v) in fa.javaConstBools { globalJavaConstBools[k] = v }
+        }
+        var globalJavaFieldSeedsByMethod: [String: Set<String>] = [:]
+        for fa in analyses.values {
+            for (m, seeds) in fa.javaFieldSeedsByMethod {
+                globalJavaFieldSeedsByMethod[m, default: []].formUnion(seeds)
+            }
+        }
 
         return ProjectIndex(fileAnalyses: analyses,
                             globalTaintReturning: globalTaint,
@@ -174,7 +209,142 @@ struct ProjectIndex {
                             globalJsSanitizerReturning: globalJsSanitizerReturning,
                             globalJsValidatedReturning: globalJsValidatedReturning,
                             globalParamSummaries: globalParamSummaries,
-                            globalJavaTaintedFields: globalJavaTaintedFields)
+                            globalJavaTaintedFields: globalJavaTaintedFields,
+                            globalJavaConstInts: globalJavaConstInts,
+                            globalJavaConstBools: globalJavaConstBools,
+                            globalJavaFieldSeedsByMethod: globalJavaFieldSeedsByMethod)
+    }
+
+    /// Computes, per method *invoked* from a Java file, the set of globally
+    /// tainted fields (of this file's class) that are provably clean at every
+    /// call site invoking it — qualified `Class.field`. A field counts as clean
+    /// only when it is assigned a compile-time constant somewhere in the calling
+    /// method and never assigned anything else. A callee invoked only after such
+    /// an assignment therefore drops that field from its seeds, suppressing the
+    /// variant-68 `goodG2B*Sink` false positive without hiding the bad path.
+    static func javaFieldSeedsByMethod(astFns: [String: CFunctionDef],
+                                       taintedFields: Set<String>,
+                                       className: String?) -> [String: Set<String>] {
+        guard let cls = className, !taintedFields.isEmpty else { return [:] }
+        var out: [String: Set<String>] = [:]
+
+        func callName(_ callee: CExpr) -> String? {
+            switch callee {
+            case .identifier(let n, _): return n
+            case .member(_, let m, _, _): return m
+            case .call(let inner, _, _): return callName(inner)
+            default: return nil
+            }
+        }
+
+        func children(_ e: CExpr) -> [CExpr] {
+            switch e {
+            case .integerLiteral, .floatLiteral, .stringLiteral, .charLiteral,
+                 .identifier, .booleanLiteral, .lambda:
+                return []
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _):
+                return [x]
+            case .binary(_, let l, let r, _), .comma(let l, let r, _), .assign(_, let l, let r, _):
+                return [l, r]
+            case .ternary(let c, let t, let f, _):
+                return [c, t, f]
+            case .member(let b, _, _, _):
+                return [b]
+            case .index(let b, let i, _):
+                return [b, i]
+            case .sizeOf(let x, _, _):
+                return x.map { [$0] } ?? []
+            case .arrayInit(let els, _):
+                return els
+            case .newExpr(_, let args, _):
+                return args
+            case .call(let callee, let args, _):
+                return [callee] + args
+            }
+        }
+
+        func isConstExpr(_ e: CExpr) -> Bool {
+            switch e {
+            case .integerLiteral, .floatLiteral, .booleanLiteral, .stringLiteral, .charLiteral:
+                return true
+            case .member(let b, let m, _, _):
+                if case .identifier(let bn, _) = b,
+                   ["Byte", "Short", "Integer", "Long", "Float", "Double", "Character"].contains(bn),
+                   ["MIN_VALUE", "MAX_VALUE", "NaN", "POSITIVE_INFINITY", "NEGATIVE_INFINITY"].contains(m) {
+                    return true
+                }
+                return false
+            case .unary(let op, let x, _):
+                return (op == "-" || op == "+") && isConstExpr(x)
+            case .cast(let x, _), .paren(let x, _):
+                return isConstExpr(x)
+            default:
+                return false
+            }
+        }
+
+        for (_, fn) in astFns {
+            var constFields = Set<String>()
+            var otherFields = Set<String>()
+            var callees = Set<String>()
+
+            func fieldName(_ e: CExpr) -> String? {
+                switch e {
+                case .identifier(let n, _):
+                    return taintedFields.contains(n) ? n : nil
+                case .member(let base, let m, _, _):
+                    if case .identifier("this", _) = base, taintedFields.contains(m) { return m }
+                    if case .identifier(let b, _) = base, b == cls, taintedFields.contains(m) { return m }
+                    return nil
+                default:
+                    return nil
+                }
+            }
+
+            func walkExpr(_ e: CExpr) {
+                if case .assign(_, let lhs, let rhs, _) = e, let f = fieldName(lhs) {
+                    if isConstExpr(rhs) { constFields.insert(f) } else { otherFields.insert(f) }
+                }
+                if case .call(let callee, _, _) = e, let m = callName(callee) { callees.insert(m) }
+                for c in children(e) { walkExpr(c) }
+            }
+
+            func walkStmt(_ s: CStmt) {
+                switch s {
+                case .expr(let e):
+                    walkExpr(e)
+                case .declaration(let d):
+                    if case .variable(_, _, let initExpr) = d.kind, let ie = initExpr { walkExpr(ie) }
+                case .ifStmt(let c, let t, let e, _):
+                    walkExpr(c); walkStmt(t); if let e { walkStmt(e) }
+                case .whileStmt(let c, let b, _):
+                    walkExpr(c); walkStmt(b)
+                case .doWhileStmt(let b, let c, _):
+                    walkStmt(b); walkExpr(c)
+                case .forStmt(let i, let c, let inc, let b, _):
+                    if let i { walkStmt(i) }
+                    if let c { walkExpr(c) }
+                    if let inc { walkExpr(inc) }
+                    walkStmt(b)
+                case .returnStmt(let e, _):
+                    if let e { walkExpr(e) }
+                case .block(let body):
+                    body.forEach(walkStmt)
+                case .switchStmt(let e, let cases, _):
+                    walkExpr(e)
+                    for cs in cases { cs.values.forEach(walkExpr); cs.body.forEach(walkStmt) }
+                case .labeledStmt(_, let s, _):
+                    walkStmt(s)
+                default:
+                    break
+                }
+            }
+
+            walkStmt(fn.body)
+            let clean = Set(constFields.subtracting(otherFields).map { "\(cls).\($0)" })
+            for m in callees { out[m] = out[m].map { $0.intersection(clean) } ?? clean }
+        }
+        return out
     }
 
     /// Collapses per-file parameter summaries into one project-wide table,
@@ -1138,15 +1308,26 @@ walk(fn.body)
                                                                     tokens: scanTokens(tokens),
                                                                     taintReturning: jAnalysis.taintReturning)
             var javaTaintedFields = Set<String>()
-            if !bareFields.isEmpty, let cls = Self.primaryJavaClassName(in: source) {
+            var javaConstInts: [String: Int] = [:]
+            var javaConstBools: [String: Bool] = [:]
+            if let cls = Self.primaryJavaClassName(in: source) {
                 for f in bareFields { javaTaintedFields.insert("\(cls).\(f)") }
+                let constScalars = VulnerabilityScanner.constantScalarFields(tokens: tokens)
+                for (f, v) in constScalars.ints { javaConstInts["\(cls).\(f)"] = v }
+                for (f, v) in constScalars.bools { javaConstBools["\(cls).\(f)"] = v }
             }
             return FileAnalysis(url: url, taintReturning: jAnalysis.taintReturning,
                                  writeThroughParam: jAnalysis.writeThroughParam,
                                  astFns: jAnalyzer.astFunctions, callees: calleesMap,
                                   phpSanitizers: [],
                                   paramTaintSeeds: jAnalysis.paramTaintSeeds,
-                                  javaTaintedFields: javaTaintedFields)
+                                  javaTaintedFields: javaTaintedFields,
+                                  javaConstInts: javaConstInts,
+                                  javaConstBools: javaConstBools,
+                                  javaFieldSeedsByMethod: Self.javaFieldSeedsByMethod(
+                                      astFns: jAnalyzer.astFunctions,
+                                      taintedFields: bareFields,
+                                      className: Self.primaryJavaClassName(in: source)))
         }
 
         if isCSharp {

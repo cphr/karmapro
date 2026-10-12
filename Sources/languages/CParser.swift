@@ -1127,7 +1127,7 @@ public final class CParser {
                 // tentative C-style cast: consume type then ')' then unary
                 if consumeTypeUntilRParen() {
                     let inner = parseUnary()
-                    return .cast(expr: inner, tok.offset)
+                    return parsePostfix(.cast(expr: inner, tok.offset))
                 }
             }
             // Function call `name(args)` was handled in postfix; here '(' is grouping.
@@ -1135,11 +1135,11 @@ public final class CParser {
             advance() // '('
             if isPunct(")") {
                 advance()
-                return .paren(expr: .identifier("", tok.offset), tok.offset)
+                return parsePostfix(.paren(expr: .identifier("", tok.offset), tok.offset))
             }
             let inner = parseExpression()
             _ = match(")")
-            return .paren(expr: inner, tok.offset)
+            return parsePostfix(.paren(expr: inner, tok.offset))
         }
 
         // Primary / postfix operand.
@@ -1151,7 +1151,7 @@ public final class CParser {
         // After '(' we have a type: keyword or identifier (possibly with ::, *, &, and maybe ')' next).
         if current.kind == .keyword {
             let kw = current.text
-            let typeKw: Set<String> = ["int","char","short","long","float","double","void","bool","unsigned","signed",
+            let typeKw: Set<String> = ["int","char","short","long","float","double","void","bool","byte","boolean","unsigned","signed",
                                        "struct","union","class","enum","typename","wchar_t","char16_t","char32_t"]
             return typeKw.contains(kw)
         }

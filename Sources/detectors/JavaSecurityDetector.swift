@@ -394,6 +394,420 @@ extension AstSecurityDetector {
             return
         }
     }
+
+    // MARK: - Java value-bounds analysis
+
+    /// Java arithmetic/bounds faults: silent integer wraparound, division by an
+    /// unchecked zero divisor, and array indexes that reach a tainted or
+    /// out-of-range offset. Java has no buffer memory-unsafety, so these model
+    /// the value fault itself (wrapped result, `ArithmeticException`,
+    /// `ArrayIndexOutOfBoundsException`), not a memory overwrite.
+    ///
+    /// A value is "risky" when it derives from untrusted input, was seeded with a
+    /// type-extreme constant, or was assigned a negative literal. A value is
+    /// treated as safe when the body proves a bound on it: a MAX/MIN comparison
+    /// (wraparound), a non-zero guard (division), or both a `>= 0` and a
+    /// `< length` check (array index).
+    func checkJavaNumeric(fn: CFunctionDef, function: String, tainted: Set<String>, findings: inout [AstFinding], reachable: Bool) {
+        var atBound = Set<String>()
+        var negative = Set<String>()
+        var zeroed = Set<String>()
+        var boundGuarded = Set<String>()
+        var nonZero = Set<String>()
+        var lowerBounded = Set<String>()
+        var upperBounded = Set<String>()
+        var numUpperBounded = Set<String>()
+        func isNumericLit(_ e: CExpr) -> Bool {
+            switch e {
+            case .integerLiteral, .floatLiteral: return true
+            case .paren(let x, _), .cast(let x, _): return isNumericLit(x)
+            default: return false
+            }
+        }
+        func collectIds(_ e: CExpr, into ids: inout Set<String>) {
+            switch e {
+            case .identifier(let n, _): ids.insert(n)
+            case .call(let c, let args, _):
+                collectIds(c, into: &ids); for a in args { collectIds(a, into: &ids) }
+            case .member(let b, _, _, _): collectIds(b, into: &ids)
+            case .index(let b, let i, _): collectIds(b, into: &ids); collectIds(i, into: &ids)
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _): collectIds(x, into: &ids)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                collectIds(l, into: &ids); collectIds(r, into: &ids)
+            case .ternary(let c, let t, let f, _):
+                collectIds(c, into: &ids); collectIds(t, into: &ids); collectIds(f, into: &ids)
+            case .arrayInit(let els, _): for el in els { collectIds(el, into: &ids) }
+            case .newExpr(_, let args, _): for a in args { collectIds(a, into: &ids) }
+            default: break
+            }
+        }
+
+        func isLengthRef(_ e: CExpr) -> Bool {
+            switch e {
+            case .member(_, let m, _, _): return m == "length" || m == "size"
+            case .call(let c, _, _): return callName(c) == "length" || callName(c) == "size"
+            case .binary(_, let l, let r, _): return isLengthRef(l) || isLengthRef(r)
+            case .paren(let x, _), .cast(let x, _): return isLengthRef(x)
+            default: return false
+            }
+        }
+        func isZeroLit(_ e: CExpr) -> Bool {
+            switch e {
+            case .integerLiteral(let s, _): return s == "0" || s == "0L" || s == "0l"
+            case .paren(let x, _), .cast(let x, _): return isZeroLit(x)
+            default: return false
+            }
+        }
+        func isNonZeroLit(_ e: CExpr) -> Bool {
+            switch e {
+            case .integerLiteral(let s, _): return s != "0" && s != "0L" && s != "0l"
+            case .floatLiteral(let s, _): return Double(s) != 0
+            case .paren(let x, _), .cast(let x, _): return isNonZeroLit(x)
+            default: return false
+            }
+        }
+        // `Math.abs(x) > <positive literal>` or `abs(x) >= ...` proves `x` is
+        // bounded away from zero, so a division/modulo by it cannot throw.
+        func absArg(_ e: CExpr) -> String? {
+            guard case .call(let c, let args, _) = e, callName(c) == "abs",
+                  args.count == 1, let n = simpleIdentifier(args[0]) else { return nil }
+            return n
+        }
+        func isNegLit(_ e: CExpr) -> Bool {
+            switch e {
+            case .integerLiteral(let s, _): return s.hasPrefix("-")
+            case .unary("-", let x, _):
+                if case .integerLiteral = x { return true }
+                return false
+            case .paren(let x, _), .cast(let x, _): return isNegLit(x)
+            default: return false
+            }
+        }
+        func isBoundConstant(_ e: CExpr) -> Bool {
+            switch e {
+            case .member(_, let m, _, _): return m == "MAX_VALUE" || m == "MIN_VALUE"
+            case .binary(_, let l, let r, _): return isBoundConstant(l) || isBoundConstant(r)
+            case .paren(let x, _), .cast(let x, _): return isBoundConstant(x)
+            default: return false
+            }
+        }
+
+        func flip(_ op: String) -> String {
+            switch op {
+            case "<": return ">"
+            case "<=": return ">="
+            case ">": return "<"
+            case ">=": return "<="
+            default: return op
+            }
+        }
+
+        func noteBounds(_ op: String, _ a: CExpr, _ b: CExpr) {
+            if isBoundConstant(a) { collectIds(b, into: &boundGuarded) }
+            if isBoundConstant(b) { collectIds(a, into: &boundGuarded) }
+            if isZeroLit(b) {
+                if op == "!=" { collectIds(a, into: &nonZero) }
+                if op == ">" || op == "<" { collectIds(a, into: &nonZero) }
+                if op == ">" || op == ">=" { collectIds(a, into: &lowerBounded) }
+            } else if isZeroLit(a) {
+                if op == "!=" { collectIds(b, into: &nonZero) }
+                if op == ">" || op == "<" { collectIds(b, into: &nonZero) }
+                if op == ">" || op == ">=" { collectIds(b, into: &lowerBounded) }
+            }
+            if op == ">" || op == ">=" {
+                if let n = absArg(a), isNonZeroLit(b) { nonZero.insert(n) }
+                if let n = absArg(b), isNonZeroLit(a) { nonZero.insert(n) }
+            }
+            if isLengthRef(b) && (op == "<" || op == "<=") { collectIds(a, into: &upperBounded) }
+            if isLengthRef(a) && (op == ">" || op == ">=") { collectIds(b, into: &upperBounded) }
+            // A comparison against a numeric literal upper-bounds the other
+            // operand (`if (count <= 20)`), which caps a loop driven by it.
+            if isNumericLit(b) && (op == "<" || op == "<=") { collectIds(a, into: &numUpperBounded) }
+            if isNumericLit(a) && (op == ">" || op == ">=") { collectIds(b, into: &numUpperBounded) }
+        }
+
+        func walkExpr(_ e: CExpr, _ visit: (CExpr) -> Void) {
+            visit(e)
+            switch e {
+            case .call(let c, let args, _):
+                walkExpr(c, visit); for a in args { walkExpr(a, visit) }
+            case .member(let b, _, _, _): walkExpr(b, visit)
+            case .index(let b, let i, _): walkExpr(b, visit); walkExpr(i, visit)
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _): walkExpr(x, visit)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _): walkExpr(l, visit); walkExpr(r, visit)
+            case .ternary(let c, let t, let f, _): walkExpr(c, visit); walkExpr(t, visit); walkExpr(f, visit)
+            case .assign(_, let l, let r, _): walkExpr(l, visit); walkExpr(r, visit)
+            case .arrayInit(let arr, _): for a in arr { walkExpr(a, visit) }
+            case .newExpr(_, let args, _): for a in args { walkExpr(a, visit) }
+            default: break
+            }
+        }
+
+        func evalConstInt(_ e: CExpr) -> Int? {
+            switch e {
+            case .integerLiteral(let s, _): return Int(s)
+            case .identifier(let n, _): return javaIntConst[n]
+            case .member(let b, let m, _, _):
+                if case .identifier(let base, _) = b, let v = javaIntConst["\(base).\(m)"] { return v }
+                return nil
+            case .paren(let x, _), .cast(let x, _): return evalConstInt(x)
+            case .unary(let op, let x, _) where op == "-" || op == "+":
+                return evalConstInt(x).map { op == "-" ? -$0 : $0 }
+            default: return nil
+            }
+        }
+        func evalConstCond(_ e: CExpr) -> Bool? {
+            switch e {
+            case .booleanLiteral(let b, _): return b
+            case .identifier(let n, _): return javaBoolConst[n]
+            case .member(let b, let m, _, _):
+                if case .identifier(let base, _) = b { return javaBoolConst["\(base).\(m)"] }
+                return nil
+            case .paren(let x, _), .cast(let x, _): return evalConstCond(x)
+            case .unary("!", let x, _): return evalConstCond(x).map { !$0 }
+            case .binary(let op, let l, let r, _):
+                guard let a = evalConstInt(l), let b = evalConstInt(r) else { return nil }
+                switch op {
+                case "==": return a == b
+                case "!=": return a != b
+                case ">": return a > b
+                case "<": return a < b
+                case ">=": return a >= b
+                case "<=": return a <= b
+                default: return nil
+                }
+            default: return nil
+            }
+        }
+
+        func walkStmt(_ s: CStmt, _ visit: (CExpr) -> Void) {
+            switch s {
+            case .block(let arr): for x in arr { walkStmt(x, visit) }
+            case .expr(let e): walkExpr(e, visit)
+            case .declaration(let d): if case .variable(_, _, let ie?) = d.kind { walkExpr(ie, visit) }
+            case .ifStmt(let c, let t, let eb, _):
+                if let cond = evalConstCond(c) {
+                    if cond { walkStmt(t, visit) } else if let eb = eb { walkStmt(eb, visit) }
+                } else {
+                    walkExpr(c, visit); walkStmt(t, visit); if let eb = eb { walkStmt(eb, visit) }
+                }
+            case .whileStmt(let c, let b, _): walkExpr(c, visit); walkStmt(b, visit)
+            case .doWhileStmt(let b, let c, _): walkStmt(b, visit); walkExpr(c, visit)
+            case .forStmt(let initS, let c, let inc, let b, _):
+                if let initS = initS { walkStmt(initS, visit) }
+                if let c = c { walkExpr(c, visit) }
+                if let inc = inc { walkExpr(inc, visit) }
+                walkStmt(b, visit)
+            case .switchStmt(let e, let cases, _):
+                walkExpr(e, visit)
+                // A `switch` on a compile-time constant selects one arm; the
+                // other arms are dead and only hold compiler-satisfying
+                // initializers (`data = 0`), so walking them invents a flow
+                // that can never execute.
+                if let v = evalConstInt(e) {
+                    let match = cases.first { cs in
+                        !cs.isDefault && cs.values.contains { evalConstInt($0) == v }
+                    }
+                    if let chosen = match ?? cases.first(where: { $0.isDefault }) {
+                        for x in chosen.body { walkStmt(x, visit) }
+                    }
+                } else {
+                    for cs in cases { for x in cs.body { walkStmt(x, visit) } }
+                }
+            case .returnStmt(let e, _): if let e = e { walkExpr(e, visit) }
+            case .labeledStmt(_, let x, _): walkStmt(x, visit)
+            default: break
+            }
+        }
+
+        let compareOps: Set<String> = ["<", "<=", ">", ">=", "==", "!="]
+        walkStmt(fn.body) { e in
+            switch e {
+            case .assign(_, let lhs, let rhs, _):
+                if let n = simpleIdentifier(lhs) {
+                    if isBoundConstant(rhs) { atBound.insert(n) }
+                    if isNegLit(rhs) { negative.insert(n) }
+                    if isZeroLit(rhs) { zeroed.insert(n) }
+                }
+            case .binary(let op, let l, let r, _) where compareOps.contains(op):
+                noteBounds(op, l, r)
+            default:
+                break
+            }
+        }
+
+        let risky = tainted.union(atBound).union(negative)
+        let divisorRisk = tainted.union(atBound).union(zeroed)
+
+        // An operand participates in string concatenation when it is a string
+        // literal, a `+` chain that reaches one, or a stringification call. The
+        // whole chain must be skipped so `"n=" + x + " = " + (a % b)` is not read
+        // as integer overflow on each nested `+`.
+        func isStringOperand(_ e: CExpr) -> Bool {
+            switch e {
+            case .stringLiteral:
+                return true
+            case .paren(let x, _), .cast(let x, _):
+                return isStringOperand(x)
+            case .binary("+", let l, let r, _):
+                return isStringOperand(l) || isStringOperand(r)
+            case .call(let c, _, _):
+                if let n = callName(c) {
+                    return n == "valueOf" || n == "toString" || n == "format" || n == "concat" || n == "append"
+                }
+                return false
+            default:
+                return false
+            }
+        }
+        func riskyIds(_ e: CExpr) -> Set<String> {
+            var ids = Set<String>()
+            collectIds(e, into: &ids)
+            return ids.filter { risky.contains($0) && !boundGuarded.contains($0) }
+        }
+
+        walkStmt(fn.body) { e in
+            switch e {
+            case .binary(let op, let l, let r, let off) where op == "+" || op == "-" || op == "*":
+                if isStringOperand(l) || isStringOperand(r) { break }
+                if !riskyIds(l).isEmpty || !riskyIds(r).isEmpty {
+                    let category = op == "-" ? "Integer Underflow" : "Integer Overflow"
+                    emit(&findings, function, off, rule(category, .medium),
+                         message: "Arithmetic on a caller-influenced value can wrap past the numeric range without a bound check.",
+                         taint: riskyIds(l).first ?? riskyIds(r).first, reachable: reachable, crossFile: false)
+                }
+            case .binary(let op, let l, let r, let off) where op == "/" || op == "%":
+                _ = l
+                let riskyDivisor: Bool
+                if isZeroLit(r) { riskyDivisor = true }
+                else if let n = simpleIdentifier(r), divisorRisk.contains(n), !nonZero.contains(n) { riskyDivisor = true }
+                else { riskyDivisor = false }
+                if riskyDivisor {
+                    emit(&findings, function, off, rule("Possible Division by Zero", .medium),
+                         message: "Division by a value that can be zero throws at runtime.",
+                         taint: simpleIdentifier(r), reachable: reachable, crossFile: false)
+                }
+            case .unary(let op, let x, let off) where op == "++" || op == "--":
+                if let n = simpleIdentifier(x), risky.contains(n), !boundGuarded.contains(n) {
+                    let category = op == "--" ? "Integer Underflow" : "Integer Overflow"
+                    emit(&findings, function, off, rule(category, .medium),
+                         message: "Increment/decrement of a caller-influenced value can wrap past the numeric range.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+            case .assign(let op, let lhs, let rhs, let off) where op == "+=" || op == "-=" || op == "*=":
+                _ = rhs
+                if let n = simpleIdentifier(lhs), risky.contains(n), !boundGuarded.contains(n) {
+                    let category = op == "-=" ? "Integer Underflow" : "Integer Overflow"
+                    emit(&findings, function, off, rule(category, .medium),
+                         message: "Compound arithmetic on a caller-influenced value can wrap past the numeric range.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+            case .index(let base, let idx, let off):
+                _ = base
+                if isNegLit(idx) {
+                    emit(&findings, function, off, rule("Array Index Out of Bounds", .medium),
+                         message: "A negative constant array index reads or writes outside the array bounds.",
+                         taint: nil, reachable: reachable, crossFile: false)
+                } else if let n = simpleIdentifier(idx), risky.contains(n),
+                          !(lowerBounded.contains(n) && upperBounded.contains(n)) {
+                    emit(&findings, function, off, rule("Array Index Out of Bounds", .medium),
+                         message: "Array index derives from caller-influenced data without both lower- and upper-bound checks.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+            case .cast(let inner, let off):
+                // Numeric truncation: a narrowing cast (`(byte)`/`(short)`/
+                // `(char)`) of a caller-influenced integer silently loses the
+                // high-order bits.
+                if let n = riskyIds(inner).first {
+                    let st = self.statementText(off)
+                    if st.contains("(byte)") || st.contains("(short)") || st.contains("(char)") {
+                        emit(&findings, function, off, rule("Numeric Truncation Error", .medium),
+                             message: "Narrowing cast truncates a caller-influenced value; a numeric truncation error is possible.",
+                             taint: n, reachable: reachable, crossFile: false)
+                    }
+                }
+            case .newExpr(let typeName, let args, let off):
+                let leaf = typeName.split(separator: ".").last.map(String.init) ?? typeName
+                let sizedCollections: Set<String> = ["ArrayList", "HashMap", "HashSet", "Hashtable",
+                                                     "Vector", "StringBuilder", "StringBuffer",
+                                                     "ConcurrentHashMap", "LinkedHashMap",
+                                                     "LinkedHashSet", "TreeMap", "TreeSet",
+                                                     "ByteArrayOutputStream", "PriorityQueue"]
+                if sizedCollections.contains(leaf), let first = args.first,
+                   let n = riskyIds(first).first {
+                    emit(&findings, function, off, rule("Uncontrolled Memory Allocation", .medium),
+                         message: "\(leaf) is sized from untrusted data and can exhaust memory.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+            default:
+                break
+            }
+        }
+
+        // Uncontrolled resource consumption: a loop whose iteration bound is a
+        // caller-influenced value with no upper-bound validation, and
+        // Thread.sleep(tainted) which stalls for an attacker-chosen duration.
+        func loopTaintedBound(_ cond: CExpr, _ bounded: Set<String>) -> String? {
+            guard case .binary(let op, let l, let r, _) = cond, op == "<" || op == "<=" else { return nil }
+            _ = l
+            if isLengthRef(r) { return nil }
+            if let n = simpleIdentifier(r), risky.contains(n), !boundGuarded.contains(n),
+               !numUpperBounded.contains(n), !bounded.contains(n) { return n }
+            return nil
+        }
+        func upperBoundVars(_ e: CExpr) -> Set<String> {
+            var out = Set<String>()
+            func scan(_ e: CExpr) {
+                switch e {
+                case .binary(let op, let l, let r, _):
+                    if op == "<" || op == "<=" {
+                        if isNumericLit(r) || isLengthRef(r) { collectIds(l, into: &out) }
+                    }
+                    if op == ">" || op == ">=" {
+                        if isNumericLit(l) || isLengthRef(l) { collectIds(r, into: &out) }
+                    }
+                    scan(l); scan(r)
+                case .unary(_, let x, _), .paren(let x, _), .cast(let x, _): scan(x)
+                default: break
+                }
+            }
+            scan(e)
+            return out
+        }
+        func scanResource(_ s: CStmt, _ bounded: Set<String>) {
+            switch s {
+            case .block(let arr):
+                for x in arr { scanResource(x, bounded) }
+            case .forStmt(_, let cond, _, let body, let off):
+                if let cond = cond, let n = loopTaintedBound(cond, bounded) {
+                    emit(&findings, function, off, rule("Uncontrolled Resource Consumption", .medium),
+                         message: "Loop iteration count derives from untrusted data without an upper bound; resource exhaustion is possible.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+                scanResource(body, bounded)
+            case .whileStmt(_, let body, _), .doWhileStmt(let body, _, _):
+                scanResource(body, bounded)
+            case .ifStmt(let c, let t, let e, _):
+                let b2 = bounded.union(upperBoundVars(c))
+                scanResource(t, b2); if let e = e { scanResource(e, bounded) }
+            case .switchStmt(_, let cases, _):
+                for c in cases { for x in c.body { scanResource(x, bounded) } }
+            case .labeledStmt(_, let x, _):
+                scanResource(x, bounded)
+            case .expr(let e):
+                if case .call(let callee, let args, let off) = e, callName(callee) == "sleep",
+                   args.count == 1, let n = riskyIds(args[0]).first,
+                   !boundGuarded.contains(n), !numUpperBounded.contains(n), !bounded.contains(n) {
+                    emit(&findings, function, off, rule("Uncontrolled Resource Consumption", .medium),
+                         message: "Thread.sleep() uses an attacker-controlled duration; resource exhaustion is possible.",
+                         taint: n, reachable: reachable, crossFile: false)
+                }
+            default:
+                break
+            }
+        }
+        scanResource(fn.body, [])
+    }
 }
 
 extension VulnerabilityScanner {
@@ -515,17 +929,65 @@ extension VulnerabilityScanner {
     /// blanked first, so only class-body member declarations remain; the name is
     /// the last identifier before the terminating `;` or the declarator before
     /// `=`.
+    /// Class fields assigned exactly once to a literal (at class-body scope) and
+    /// never mutated — effectively constants. Juliet's flow-variant testcases
+    /// guard dead code behind `if (PRIVATE_STATIC_FINAL_FALSE)` or
+    /// `if (privateFive != 5)`, where the field is never reassigned; folding
+    /// those conditions removes the dead `data = 0` initializer that would
+    /// otherwise look like a zero divisor.
+    static func constantScalarFields(source: String) -> (bools: [String: Bool], ints: [String: Int]) {
+        constantScalarFields(tokens: CTokenizer(source: source).tokenize())
+    }
+
+    static func constantScalarFields(tokens: [CAstToken]) -> (bools: [String: Bool], ints: [String: Int]) {
+        var depth = 0
+        var assignCount: [String: Int] = [:]
+        var assignLit: [String: String] = [:]
+        var mutable = Set<String>()
+        let mutateOps: Set<String> = ["++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="]
+        var i = 0
+        while i < tokens.count {
+            let t = tokens[i]
+            if t.text == "{" { depth += 1; i += 1; continue }
+            if t.text == "}" { depth -= 1; i += 1; continue }
+            if t.kind == .identifier, i + 1 < tokens.count {
+                let nx = tokens[i + 1].text
+                if mutateOps.contains(nx) { mutable.insert(t.text) }
+                else if nx == "=", depth == 1 {
+                    assignCount[t.text, default: 0] += 1
+                    if i + 2 < tokens.count {
+                        let lit = tokens[i + 2]
+                        let isLiteral = lit.kind == .number
+                            || (lit.kind == .keyword && (lit.text == "true" || lit.text == "false"))
+                        if isLiteral { assignLit[t.text] = lit.text }
+                        else { assignLit.removeValue(forKey: t.text) }
+                    }
+                }
+            }
+            i += 1
+        }
+        var bools: [String: Bool] = [:]
+        var ints: [String: Int] = [:]
+        for (name, count) in assignCount where count == 1 && !mutable.contains(name) {
+            guard let lit = assignLit[name] else { continue }
+            if lit == "true" || lit == "false" { bools[name] = (lit == "true") }
+            else if let value = Int(lit) { ints[name] = value }
+        }
+        return (bools, ints)
+    }
+
     static func declaredJavaFieldNames(source: String,
                                        definitions: [CCFunctionParser.FunctionDef]) -> Set<String> {
-        var chars = Array(source)
+        var chars = Array(source.utf16)
         func blank(_ r: NSRange) {
             guard r.location >= 0, r.length > 0, r.location + r.length <= chars.count else { return }
-            for k in r.location..<(r.location + r.length) where chars[k] != "\n" { chars[k] = " " }
+            for k in r.location..<(r.location + r.length) where chars[k] != 0x0A { chars[k] = 0x20 }
         }
         for def in definitions { blank(def.signatureRange); blank(def.bodyRange) }
-        let tokens = CTokenizer(source: String(chars)).tokenize()
+        let tokens = CTokenizer(source: String(decoding: chars, as: UTF16.self)).tokenize()
         var fields = Set<String>()
         var depth = 0
+        var parenDepth = 0
         var lastIdent: String?
         var assignLhs: String?
         for t in tokens {
@@ -534,13 +996,17 @@ extension VulnerabilityScanner {
                 depth += 1; lastIdent = nil; assignLhs = nil
             case "}":
                 depth -= 1; lastIdent = nil; assignLhs = nil
+            case "(":
+                parenDepth += 1
+            case ")":
+                if parenDepth > 0 { parenDepth -= 1 }
             case ";":
-                if depth == 1, let n = assignLhs ?? lastIdent { fields.insert(n) }
+                if depth == 1, parenDepth == 0, let n = assignLhs ?? lastIdent { fields.insert(n) }
                 lastIdent = nil; assignLhs = nil
             case "=":
-                if depth == 1 { assignLhs = lastIdent }
+                if depth == 1, parenDepth == 0 { assignLhs = lastIdent }
             default:
-                if t.kind == .identifier { lastIdent = t.text }
+                if t.kind == .identifier, parenDepth == 0 { lastIdent = t.text }
             }
         }
         return fields

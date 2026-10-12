@@ -364,10 +364,11 @@ switch e {
                         taintedIdxs.insert(i)
                     }
                 }
-                if !taintedIdxs.isEmpty {
-                    if let name = callName(callee) {
-                        callSites.append((name: name, indices: taintedIdxs))
-                    }
+                // Record the call even when no argument is tainted: an explicit
+                // empty seed set marks a callee that is only ever called with
+                // safe values, so its parameters are not caller-controlled.
+                if let name = callName(callee) {
+                    callSites.append((name: name, indices: taintedIdxs))
                 }
             }
             recordCallSites(callee, tainted: tainted, seedFns: seedFns, callSites: &callSites)

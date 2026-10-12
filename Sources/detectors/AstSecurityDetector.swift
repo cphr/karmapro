@@ -65,6 +65,11 @@ struct AstSecurityDetector {
     /// Java field names that stay tainted across methods: bare names seeded for
     /// same-class flow, plus `Class.field` qualified names for cross-file flow.
     private let fieldSeeds: Set<String>
+    /// Per-method field-taint overrides: when a method has an entry, its field
+    /// seeds are exactly that set (so a `goodG2B*Sink` invoked only on a clean
+    /// field does not inherit the bad-path field taint). Absent ⇒ use
+    /// `fieldSeeds`.
+    private let fieldSeedsByMethod: [String: Set<String>]
     private let writeThroughParam: [String: Set<Int>]
     /// Project-wide write-through table, consulted via lookup (never merged
     /// into the local map — that was O(files x global entries)).
@@ -118,6 +123,13 @@ struct AstSecurityDetector {
     private let walkNonZero: [String: Set<String>]
     private let walkConstBounded: [String: Set<String>]
 
+    /// Class fields initialized once to a literal and never reassigned — an
+    /// effectively constant value a data-flow walk can fold, so dead branches
+    /// guarded by `if (FIELD == 5)`/`if (FIELD)` are pruned. `bools` holds
+    /// boolean-literal fields, `ints` integer-literal fields.
+    let javaBoolConst: [String: Bool]
+    let javaIntConst: [String: Int]
+
     /// This file's language-specific source APIs only (tiny set). Seed
     /// membership checks consult this *and* the shared project-wide
     /// `taintReturning` set via `isSeedFn(_:)` — materializing their union
@@ -141,6 +153,7 @@ struct AstSecurityDetector {
                 entropyReturning: Set<String> = [],
                 crossFileSources: Set<String>,
                 fieldSeeds: Set<String> = [],
+                fieldSeedsByMethod: [String: Set<String>] = [:],
                 writeThroughParam: [String: Set<Int>],
                 globalWriteThroughParam: [String: Set<Int>] = [:],
                 paramTaintSeeds: [String: Set<Int>] = [:],
@@ -152,6 +165,8 @@ struct AstSecurityDetector {
                 walkBounded: [String: Set<String>] = [:],
                 walkNonZero: [String: Set<String>] = [:],
                 walkConstBounded: [String: Set<String>] = [:],
+                javaQualifiedConstInts: [String: Int] = [:],
+                javaQualifiedConstBools: [String: Bool] = [:],
                 reachableNames: Set<String>) {
         self.astFns = astFns
         self.source = source
@@ -170,6 +185,7 @@ struct AstSecurityDetector {
         self.entropyReturning = entropyReturning
         self.crossFileSources = crossFileSources
         self.fieldSeeds = fieldSeeds
+        self.fieldSeedsByMethod = fieldSeedsByMethod
         self.writeThroughParam = writeThroughParam
         self.globalWriteThroughParam = globalWriteThroughParam
         self.paramTaintSeeds = paramTaintSeeds
@@ -182,6 +198,9 @@ struct AstSecurityDetector {
         self.walkBounded = walkBounded
         self.walkNonZero = walkNonZero
         self.walkConstBounded = walkConstBounded
+        let constScalars = isJava ? VulnerabilityScanner.constantScalarFields(source: source) : (bools: [:], ints: [:])
+        self.javaBoolConst = constScalars.bools.merging(javaQualifiedConstBools) { a, _ in a }
+        self.javaIntConst = constScalars.ints.merging(javaQualifiedConstInts) { a, _ in a }
         self.langSourceAPIs = Self.langAPIs(isCSharp: isCSharp, isJava: isJava,
                                             isGo: isGo, isKotlin: isKotlin,
                                             isPython: isPython, isRuby: isRuby,
@@ -345,11 +364,16 @@ struct AstSecurityDetector {
         // Seed only parameters that are tainted at actual call sites when
         // project-wide parameter-taint seeds are available; otherwise seed all
         // params (existing behavior for C and other analyzers without seeds).
-        if let seeds = paramTaintSeeds[name], !seeds.isEmpty {
+        if let seeds = paramTaintSeeds[name] {
+            // An explicit entry means the callee has known call sites: seed only
+            // the parameters that are actually tainted at one of them, so a
+            // helper reached solely with safe values stays untainted.
             for idx in seeds where idx < fn.params.count {
                 if let pname = fn.params[idx].name { tainted.insert(pname) }
             }
         } else {
+            // No call site is visible (entry point, externally invoked, or
+            // pointer-dispatched): conservatively treat every parameter as input.
             for p in fn.params where p.name != nil { tainted.insert(p.name!) }
         }
 
@@ -364,8 +388,10 @@ struct AstSecurityDetector {
         // tainted on every read, so a helper that stores into a field and a sink
         // reached through that field keep the flow. Qualified `Class.field`
         // entries (cross-file) are matched in `exprTainted`'s member case.
-        if !fieldSeeds.isEmpty {
-            for f in fieldSeeds where !f.contains(".") { tainted.insert(f) }
+        let effectiveSeeds = fieldSeeds.subtracting(fieldSeedsByMethod[name] ?? [])
+        fieldSeedsRef.seeds = effectiveSeeds
+        if !effectiveSeeds.isEmpty {
+            for f in effectiveSeeds where !f.contains(".") { tainted.insert(f) }
         }
 
         // C# parameters often arrive as `out`/`ref` (write-through seeds) and the
@@ -414,6 +440,7 @@ struct AstSecurityDetector {
         }
         if isJava {
             applyJavaSuppressions(fn: fn, findings: &findings)
+            checkJavaNumeric(fn: fn, function: name, tainted: tainted, findings: &findings, reachable: reachable)
         }
         if isGo {
             applyGoSuppressions(fn: fn, findings: &findings)
@@ -588,7 +615,8 @@ struct AstSecurityDetector {
             }
         case .expr(let e):
             scanExpr(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
-        case .declaration(let d):            if case .variable(_, let name, let initExpr?) = d.kind {
+        case .declaration(let d):
+            if case .variable(_, let name, let initExpr?) = d.kind {
                 if exprTainted(initExpr, tainted: tainted) != nil {
                     tainted.insert(name)
                 } else if plainSourceCall(initExpr) != nil {
@@ -1476,6 +1504,15 @@ struct AstSecurityDetector {
     }
     let goZeroIVRef = GoZeroIVBox()
 
+    /// Per-function effective Java field seeds (global `fieldSeeds` unless the
+    /// current method has a per-method override from `fieldSeedsByMethod`).
+    /// Boxed so `exprTainted` can consult the current function's seeds without a
+    /// full plumbing change.
+    final class FieldSeedsBox {
+        var seeds: Set<String> = []
+    }
+    let fieldSeedsRef = FieldSeedsBox()
+
     private func constantStringVars(in body: CStmt) -> Set<String> {
         var literalAssigns = Set<String>()
         var otherAssigns = Set<String>()
@@ -1973,6 +2010,23 @@ struct AstSecurityDetector {
                                                    "System.Text.Encodings.Web.HtmlEncoder.Encode"].contains(q) {
                 return nil
             }
+            // Java encoding/escaping helpers neutralize the taint of their
+            // input, so a variable reassigned from one of these is clean
+            // (e.g. `data = URLEncoder.encode(data, "UTF-8")`).
+            if isJava, let q = callQualifiedName(callee),
+               ["URLEncoder.encode", "StringEscapeUtils.escapeHtml", "StringEscapeUtils.escapeHtml4",
+                "StringEscapeUtils.escapeXml", "StringEscapeUtils.escapeJavaScript", "StringEscapeUtils.escapeJava",
+                "HtmlUtils.htmlEscape", "Encode.forHtml", "Encode.forHtmlAttribute",
+                "Encode.forHtmlContent", "Encode.forJavaScript", "Encode.forUriComponent"].contains(q) {
+                return nil
+            }
+            if isJava, let m = callName(callee),
+               ["encodeForHTML", "encodeForJavaScript", "encodeForURL", "encodeForHTMLAttribute",
+                "encodeForCSS", "escapeHtml", "escapeHtml4", "escapeJavaScript",
+                "escapeSql", "htmlEscape", "forHtml", "forHtmlAttribute", "forHtmlContent",
+                "forJavaScript", "forUriComponent"].contains(m) {
+                return nil
+            }
             for a in args {
                 if let t = exprTainted(a, tainted: tainted) { return t }
             }
@@ -1980,8 +2034,8 @@ struct AstSecurityDetector {
         case .member(let b, let m, _, _):
             // Cross-file field flow: a `Class.field` written untrusted data in
             // another file is tainted wherever it is read.
-            if !fieldSeeds.isEmpty, case .identifier(let baseName, _) = b,
-               fieldSeeds.contains("\(baseName).\(m)") { return m }
+            if !fieldSeedsRef.seeds.isEmpty, case .identifier(let baseName, _) = b,
+               fieldSeedsRef.seeds.contains("\(baseName).\(m)") { return m }
             return exprTainted(b, tainted: tainted)
         case .index(let b, let idx, _):
             return exprTainted(b, tainted: tainted) ?? exprTainted(idx, tainted: tainted)
