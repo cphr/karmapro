@@ -203,6 +203,22 @@ extension AstSecurityDetector {
 
     // MARK: - Userspace memory safety (double free / use after free / leak)
 
+    /// Function names declared with a prototype in this file but defined in a
+    /// sibling translation unit. A pointer passed to one may be released or
+    /// stored there, so it must not be reported as a function-local leak.
+    private var cPrototypeNames: Set<String> {
+        guard let re = try? NSRegularExpression(
+            pattern: "(?m)^[ \\t]*(?:static[ \\t]+|extern[ \\t]+|inline[ \\t]+|virtual[ \\t]+)*(?:[A-Za-z_][\\w:]*[ \\t]+)+[\\*&]*[ \\t]*([A-Za-z_]\\w*)[ \\t]*\\([^;{}]*\\)[ \\t]*;") else { return [] }
+        let ns = source as NSString
+        var out = Set<String>()
+        for m in re.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length)) {
+            if m.numberOfRanges >= 2, let r = Range(m.range(at: 1), in: source) {
+                out.insert(String(source[r]))
+            }
+        }
+        return out
+    }
+
     /// Linear per-function walk that tracks heap pointers in execution order to
     /// report (a) double `free`/`delete`, (b) use of a freed pointer, and (c)
     /// allocations that never escape and are never released. Kernel-shaped
@@ -228,12 +244,35 @@ extension AstSecurityDetector {
         // Names already reported as leaking (branch leak + fallthrough guard), so
         // one path-specific leak is not reported twice per allocation.
         var leakReported = Set<String>()
+        // Pointer aliases recorded as a union-find: `p = q` links the two names,
+        // and a release of any alias releases the group.
+        var aliasRoot: [String: String] = [:]
+        func root(_ x: String) -> String {
+            var r = x, chain: [String] = []
+            while let p = aliasRoot[r], p != r { chain.append(r); r = p }
+            for c in chain { aliasRoot[c] = r }
+            return r
+        }
+        func linkAlias(_ a: String, _ b: String) {
+            let ra = root(a), rb = root(b)
+            if ra != rb { aliasRoot[ra] = rb }
+        }
+        // Out-parameters (C++ references, or double pointers) hand any value
+        // assigned to them to the caller, so a write there is an escape, not a leak.
+        let outParams: Set<String> = Set(fn.params.compactMap { p in
+            guard let n = p.name, let t = p.type else { return nil }
+            return t.contains("&") || t.filter({ $0 == "*" }).count >= 2 ? n : nil
+        })
 
         func markAlloc(_ name: String, _ offset: Int, _ kind: CAllocKind) {
             allocs[name] = offset
             allocKind[name] = kind
             freed[name] = nil
             paramFreed[name] = nil
+            aliasRoot[name] = name
+        }
+        func noteEscape(_ name: String) {
+            escapedVars.insert(name)
         }
 
         // Collect the plain identifiers used inside an expression.
@@ -331,6 +370,17 @@ extension AstSecurityDetector {
             }
         }
 
+        // Bare pointer identifier on the RHS of a copy (`data = dataBuffer`),
+        // used to alias the two names so releasing either releases both.
+        func aliasedSource(_ e: CExpr) -> String? {
+            switch e {
+            case .identifier(let n, _):
+                return (n == "NULL" || n == "nullptr" || n == "null") ? nil : n
+            case .cast(let x, _), .paren(let x, _): return aliasedSource(x)
+            default: return nil
+            }
+        }
+
         // Stable text key for a structured assignment target / free argument
         // (`outerArray[i]`, `p->innerArray`, `arr[k].field`). Two occurrences of
         // the same key are the same memory object; a free only releases its exact
@@ -364,6 +414,7 @@ extension AstSecurityDetector {
                 if op == "=" {
                     if plainAssignedName(lhs) != nil, let kind = heapAllocKind(rhs) {
                         markAlloc(name, rhs.offset, kind)
+                        if outParams.contains(name) { noteEscape(name) }
                     } else {
                         // Reassignment breaks the freed state (free→NULL idiom or
                         // fresh ownership); the old pointer is no longer readable.
@@ -371,9 +422,20 @@ extension AstSecurityDetector {
                         paramFreed[name] = nil
                         allocs[name] = nil
                         allocKind[name] = nil
+                        aliasRoot[name] = name
+                        if let rn = aliasedSource(rhs), rn != name {
+                            linkAlias(name, rn)
+                            // A bare pointer copy keeps the allocation reachable
+                            // through another name; it is no longer a dropped
+                            // allocation (offset copies stay tracked as leaks).
+                            if allocs[rn] != nil { escapedVars.insert(rn) }
+                        }
                     }
                 }
-                if case .newExpr = rhs { markAlloc(name, rhs.offset, .cppNew) }
+                if case .newExpr = rhs {
+                    markAlloc(name, rhs.offset, .cppNew)
+                    if outParams.contains(name) { noteEscape(name) }
+                }
             } else {
                 // Storing into a member/global transfers or consumes values —
                 // treat reads of freed pointers there as uses (already covered
@@ -442,9 +504,14 @@ extension AstSecurityDetector {
         func reportBranchLeaks(allocs: [String: Int], freed: [String: Int],
                                escaped: Set<String>, nullChecked: String?,
                                reported: inout Set<String>) {
+            var freedRoots = Set<String>()
+            for (n, _) in freed { freedRoots.insert(root(n)) }
+            var escapedRoots = Set<String>()
+            for n in escaped { escapedRoots.insert(root(n)) }
             for (name, off) in allocs.sorted(by: { $0.value < $1.value }) {
-                guard freed[name] == nil, !escaped.contains(name),
-                      name != nullChecked, reported.insert(name).inserted else { continue }
+                let r = root(name)
+                guard !freedRoots.contains(r), !escapedRoots.contains(r),
+                      name != nullChecked, reported.insert(r).inserted else { continue }
                 findings.append(AstFinding(function: function, offset: off,
                                            category: "Memory Leak",
                                            severity: .medium,
@@ -501,15 +568,18 @@ extension AstSecurityDetector {
                         for a in args { checkUses(a) }
                         // Ownership hand-off: passing an allocation to another
                         // function escapes it (conservative for leak reporting).
-                        // Only in-file callees count — libc-style helpers
-                        // (puts/printf/strlen/…) never take ownership.
-                        var calleeIsLocal = false
-                        if case .identifier(let cn, _) = callee, astFns[cn] != nil { calleeIsLocal = true }
-                        if calleeIsLocal {
-                            for a in args {
-                                var ids: [(String, Int)] = []
-                                usedIdents(a, into: &ids)
-                                for (n, _) in ids where allocs[n] != nil { escapedVars.insert(n) }
+                        // In-file helpers and locally-prototyped helpers (defined
+                        // in a sibling translation unit) may release or store it;
+                        // libc-style helpers never appear as local prototypes.
+                        if case .identifier(let cn, _) = callee {
+                            let unq = cn.split(separator: ":").last.map(String.init) ?? cn
+                            if astFns[cn] != nil || astFns[unq] != nil
+                                || cPrototypeNames.contains(cn) || cPrototypeNames.contains(unq) {
+                                for a in args {
+                                    var ids: [(String, Int)] = []
+                                    usedIdents(a, into: &ids)
+                                    for (n, _) in ids where allocs[n] != nil { escapedVars.insert(n) }
+                                }
                             }
                         }
                     }
@@ -538,6 +608,10 @@ extension AstSecurityDetector {
                                                                message: "\(name) is initialized from freed pointer \(n).",
                                                                taintPath: nil, reachable: reachable, crossFile: false))
                                 }
+                            }
+                            if let rn = aliasedSource(initE), rn != name {
+                                linkAlias(name, rn)
+                                if allocs[rn] != nil { escapedVars.insert(rn) }
                             }
                         }
                     }
@@ -604,10 +678,19 @@ extension AstSecurityDetector {
         walk(fn.body)
 
         // Leak report: allocations that never escaped (return/store/call) and
-        // were never freed inside the function.
+        // were never freed inside the function. Aliases are grouped, so a
+        // release or escape of any alias covers the whole group.
+        var freedRoots = Set<String>()
+        for n in freed.keys where freed[n] != nil { freedRoots.insert(root(n)) }
+        for n in paramFreed.keys where paramFreed[n] != nil { freedRoots.insert(root(n)) }
+        var escapedRoots = Set<String>()
+        for n in escapedVars { escapedRoots.insert(root(n)) }
+        var reportedRoots = Set<String>()
         for (name, offset) in allocs.sorted(by: { $0.value < $1.value }) {
-            guard freed[name] == nil, !escapedVars.contains(name),
-                  leakReported.insert(name).inserted else { continue }
+            let r = root(name)
+            guard !freedRoots.contains(r), !escapedRoots.contains(r),
+                  !reportedRoots.contains(r), !leakReported.contains(r) else { continue }
+            reportedRoots.insert(r)
             findings.append(AstFinding(function: function, offset: offset,
                                        category: "Memory Leak",
                                        severity: .medium,

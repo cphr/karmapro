@@ -169,6 +169,23 @@ struct CFamilyWalkDetector {
                   let v = Int(vs) else { continue }
             out[name] = v
         }
+        // A file-scope non-`const` `static int name = literal;` is a constant as
+        // long as the file never reassigns it (the staticTrue/staticFalse idiom).
+        guard let sre = try? NSRegularExpression(
+            pattern: "(?m)^[ \\t]*static[ \\t]+(?:unsigned[ \\t]+|signed[ \\t]+)?(?:int|long|short|char|size_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t)[ \\t\\*]*(\\w+)[ \\t]*=[ \\t]*(-?\\d+)") else {
+            return out
+        }
+        let full = NSRange(location: 0, length: ns.length)
+        for m in sre.matches(in: source, options: [], range: full) {
+            guard m.numberOfRanges >= 3,
+                  let name = Range(m.range(at: 1), in: source).map({ String(source[$0]) }),
+                  let vs = Range(m.range(at: 2), in: source).map({ String(source[$0]) }),
+                  let v = Int(vs) else { continue }
+            let esc = NSRegularExpression.escapedPattern(for: name)
+            let assignCount = (try? NSRegularExpression(pattern: "\\b\(esc)[ \\t]*=(?!=)"))
+                .map { $0.numberOfMatches(in: source, options: [], range: full) } ?? 0
+            if assignCount <= 1 { out[name] = v }
+        }
         return out
     }
 
@@ -1613,8 +1630,11 @@ struct CFamilyWalkDetector {
     }
 
     private func integerLiteralValue(_ e: CExpr) -> Int? {
-        if case .integerLiteral(let v, _) = unwrap(e) { return Int(v) }
-        return nil
+        switch unwrap(e) {
+        case .integerLiteral(let v, _): return Int(v)
+        case .identifier(let n, _): return fileScopeConstInts[n]
+        default: return nil
+        }
     }
 
     /// Narrows the tracked nullness of pointers using a branch condition.
