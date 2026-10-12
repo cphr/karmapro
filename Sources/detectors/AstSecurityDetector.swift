@@ -1514,15 +1514,26 @@ struct AstSecurityDetector {
     let fieldSeedsRef = FieldSeedsBox()
 
     private func constantStringVars(in body: CStmt) -> Set<String> {
-        var literalAssigns = Set<String>()
-        var otherAssigns = Set<String>()
+        // Track the *last* write to each name (source order, best-effort across
+        // branches). A variable is a constant string only if nothing later
+        // overwrites it with a non-literal — otherwise `strcpy(p, "lit"); use(p)`
+        // followed by any later `p = q` would wrongly make `p` constant, and the
+        // reverse order (`data = buf; ...; strcpy(data, "lit")`) would wrongly be
+        // treated as non-constant.
+        var order: [String] = []
+        var isLiteral: [String: Bool] = [:]
+
+        func record(_ name: String, literal: Bool) {
+            if isLiteral[name] == nil { order.append(name) }
+            isLiteral[name] = literal
+        }
 
         func walkExpr(_ e: CExpr) {
             switch e {
             case .assign(_, let lhs, let rhs, _):
                 if let n = simpleIdentifier(lhs) {
-                    if case .stringLiteral = rhs { literalAssigns.insert(n) }
-                    else { otherAssigns.insert(n) }
+                    if case .stringLiteral = rhs { record(n, literal: true) }
+                    else { record(n, literal: false) }
                 }
                 walkExpr(rhs)
             case .call(let callee, let args, _):
@@ -1533,7 +1544,7 @@ struct AstSecurityDetector {
                    ["strcpy", "strncpy", "strlcpy", "strscpy", "stpcpy"].contains(fn),
                    args.count >= 2, let dst = simpleIdentifier(args[0]),
                    case .stringLiteral = args[1] {
-                    literalAssigns.insert(dst)
+                    record(dst, literal: true)
                 }
                 for a in args { walkExpr(a) }
             case .binary(_, let l, let r, _), .comma(let l, let r, _):
@@ -1562,8 +1573,8 @@ struct AstSecurityDetector {
                 walkExpr(e)
             case .declaration(let d):
                 if case .variable(_, let declName, let ie?) = d.kind {
-                    if case .stringLiteral = ie { literalAssigns.insert(declName) }
-                    else { otherAssigns.insert(declName) }
+                    if case .stringLiteral = ie { record(declName, literal: true) }
+                    else { record(declName, literal: false) }
                     walkExpr(ie)
                 }
             case .ifStmt(let cond, let t, let e, _):
@@ -1589,7 +1600,121 @@ struct AstSecurityDetector {
             }
         }
         walkStmt(body)
-        return literalAssigns.subtracting(otherAssigns)
+        return Set(order.filter { isLiteral[$0] == true })
+    }
+
+    /// Type-limit macros that bound an integer when a comparison against them
+    /// (or an expression derived from them, e.g. `CHAR_MAX / 2`) holds.
+    private static let overflowGuardMaxNames: Set<String> = [
+        "INT_MAX", "LONG_MAX", "LLONG_MAX", "INT64_MAX", "INT32_MAX", "SIZE_MAX",
+        "UINT_MAX", "ULONG_MAX", "UINT64_MAX", "UINT32_MAX", "UINT16_MAX",
+        "UINT8_MAX", "USHORT_MAX", "CHAR_MAX", "SCHAR_MAX", "SHRT_MAX",
+        "INT16_MAX", "INT8_MAX", "INTMAX_MAX", "PTRDIFF_MAX",
+        "__INT_MAX__", "__LONG_MAX__", "__SIZE_MAX__", "__LONG_LONG_MAX__",
+    ]
+    private static let overflowGuardMaxLiterals: Set<String> = [
+        "2147483647", "0x7fffffff", "4294967295", "0xffffffff",
+        "9223372036854775807", "0x7fffffffffffffff",
+    ]
+
+    /// True when the expression mentions a type-limit macro/literal anywhere.
+    private func mentionsTypeMax(_ e: CExpr) -> Bool {
+        switch e {
+        case .identifier(let n, _):
+            return Self.overflowGuardMaxNames.contains(n)
+        case .integerLiteral(let v, _):
+            return Self.overflowGuardMaxLiterals.contains(v)
+        case .paren(let x, _), .cast(let x, _), .unary(_, let x, _):
+            return mentionsTypeMax(x)
+        case .binary(_, let l, let r, _), .comma(let l, let r, _):
+            return mentionsTypeMax(l) || mentionsTypeMax(r)
+        case .call(let callee, let args, _):
+            return mentionsTypeMax(callee) || args.contains(where: mentionsTypeMax)
+        case .member(let b, _, _, _):
+            return mentionsTypeMax(b)
+        case .index(let b, let i, _):
+            return mentionsTypeMax(b) || mentionsTypeMax(i)
+        case .ternary(let c, let t, let f, _):
+            return mentionsTypeMax(c) || mentionsTypeMax(t) || mentionsTypeMax(f)
+        case .arrayInit(let arr, _):
+            return arr.contains(where: mentionsTypeMax)
+        case .newExpr(_, let args, _):
+            return args.contains(where: mentionsTypeMax)
+        default:
+            return false
+        }
+    }
+
+    /// True when the expression *is* a bare type-limit macro/literal, rather
+    /// than an expression derived from one (`CHAR_MAX / 2`, `sqrt(CHAR_MAX)`).
+    /// A bare `data < CHAR_MAX` test is too weak to bound a later square, so it
+    /// is left to the dedicated extreme-constant rule.
+    private func isBareTypeMax(_ e: CExpr) -> Bool {
+        switch e {
+        case .identifier(let n, _):
+            return Self.overflowGuardMaxNames.contains(n)
+        case .integerLiteral(let v, _):
+            return Self.overflowGuardMaxLiterals.contains(v)
+        case .paren(let x, _), .cast(let x, _):
+            return isBareTypeMax(x)
+        default:
+            return false
+        }
+    }
+
+    /// Identifier names appearing anywhere in an expression.
+    private func identifiersInside(_ e: CExpr) -> [String] {
+        var out: [String] = []
+        func walk(_ e: CExpr) {
+            switch e {
+            case .identifier(let n, _):
+                if !n.isEmpty { out.append(n) }
+            case .paren(let x, _), .cast(let x, _), .unary(_, let x, _):
+                walk(x)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                walk(l); walk(r)
+            case .call(let callee, let args, _):
+                walk(callee); for a in args { walk(a) }
+            case .member(let b, _, _, _):
+                walk(b)
+            case .index(let b, let i, _):
+                walk(b); walk(i)
+            case .ternary(let c, let t, let f, _):
+                walk(c); walk(t); walk(f)
+            case .arrayInit(let arr, _):
+                for x in arr { walk(x) }
+            case .newExpr(_, let args, _):
+                for a in args { walk(a) }
+            default:
+                break
+            }
+        }
+        walk(e)
+        return out
+    }
+
+    /// Variables a condition proves bounded above via a type-limit expression:
+    /// `data < (CHAR_MAX / 2)` or `abs((long)data) <= (long)sqrt((double)CHAR_MAX)`.
+    private func extremeBoundVariables(in cond: CExpr) -> Set<String> {
+        var out = Set<String>()
+        switch cond {
+        case .binary(let op, let l, let r, _):
+            if op == "&&" || op == "||" {
+                out.formUnion(extremeBoundVariables(in: l))
+                out.formUnion(extremeBoundVariables(in: r))
+                return out
+            }
+            if op == "<" || op == "<=" {
+                if mentionsTypeMax(r) && !isBareTypeMax(r) { out.formUnion(identifiersInside(l)) }
+            } else if op == ">" || op == ">=" {
+                if mentionsTypeMax(l) && !isBareTypeMax(l) { out.formUnion(identifiersInside(r)) }
+            }
+        case .paren(let x, _), .cast(let x, _):
+            return extremeBoundVariables(in: x)
+        default:
+            break
+        }
+        return out
     }
 
     private func sizeBoundsWalk(_ stmt: CStmt, into bounded: inout Set<String>) {
@@ -1599,6 +1724,12 @@ struct AstSecurityDetector {
         case .ifStmt(let cond, let thenBranch, let elseBranch, _):
             let thenReturns = definitelyReturns(thenBranch)
             let elseReturns = elseBranch.map(definitelyReturns) ?? false
+            // Upper bounds expressed against a type limit rather than a stored
+            // capacity: `if (data < (CHAR_MAX / 2))` and
+            // `if (abs((long)data) <= (long)sqrt((double)CHAR_MAX))` prove the
+            // checked variable small on the surviving arm, so a later
+            // `data * data` cannot overflow.
+            for v in extremeBoundVariables(in: cond) { bounded.insert(v) }
             for (varName, effOp) in sizeComparisons(in: cond) {
                 // `if (len > cap) return;` — overlarge values are rejected, so
                 // `len` is bounded for code that follows.

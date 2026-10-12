@@ -86,6 +86,10 @@ struct CFamilyWalkDetector {
     /// File-scope fixed-size array capacities (`int table[8];`), so index checks
     /// apply to globals as well as locals.
     private let globalCapacities: [String: Int]
+    /// File-scope integral constants with an in-file initializer
+    /// (`static const int STATIC_CONST_FALSE = 0;`), so constant conditions that
+    /// read them through a name still fold to one live arm.
+    private let fileScopeConstInts: [String: Int]
 
     /// Fixpoint context for Walk 3 (boundary).
     private struct Walk3Context {
@@ -144,6 +148,28 @@ struct CFamilyWalkDetector {
         self.taintReturning = taintReturning
         self.crossFileSources = crossFileSources
         self.globalCapacities = Self.fileScopeArrayCapacities(in: source)
+        self.fileScopeConstInts = Self.fileScopeConstInts(in: source)
+    }
+
+    /// Anchored scan for file-scope `const` integral definitions whose value is
+    /// a literal (`static const int STATIC_CONST_FALSE = 0;`). Header-declared
+    /// `extern const` values have no in-file initializer and are resolved by the
+    /// well-known-name fallback in `constantBool`.
+    private static func fileScopeConstInts(in source: String) -> [String: Int] {
+        var out: [String: Int] = [:]
+        guard let re = try? NSRegularExpression(
+            pattern: "(?m)^[ \\t]*(?:static[ \\t]+)?(?:const|constexpr)[ \\t]+(?:unsigned[ \\t]+|signed[ \\t]+)?(?:int|long|short|char|size_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t)[ \\t\\*]*(\\w+)[ \\t]*=[ \\t]*(-?\\d+)") else {
+            return out
+        }
+        let ns = source as NSString
+        for m in re.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length)) {
+            guard m.numberOfRanges >= 3,
+                  let name = Range(m.range(at: 1), in: source).map({ String(source[$0]) }),
+                  let vs = Range(m.range(at: 2), in: source).map({ String(source[$0]) }),
+                  let v = Int(vs) else { continue }
+            out[name] = v
+        }
+        return out
     }
 
     /// Anchored scan for file-scope `type name[N]` declarations. Lines with a
@@ -1362,6 +1388,17 @@ struct CFamilyWalkDetector {
             detectNullDerefs(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             detectConstantOverflow(in: cond, fn: fn, reached: reached, state: state, findings: &findings)
             updateState(from: cond, state: &state)
+            // A condition that is provably constant (`if (1)`, `if (5 != 5)`)
+            // has exactly one live arm. Walking the dead arm would both emit
+            // phantom findings and union its state — e.g. a `data = NULL` in a
+            // dead block — into the join, making pointers look NULL on paths
+            // that cannot execute. Follow only the live arm instead.
+            if let truth = constantBool(cond) {
+                guard let live = truth ? thenBranch : elseBranch else { return .fellThrough }
+                return extraWalk(live, fn: fn, reached: reached, state: &state,
+                                 findings: &findings, localArrays: localArrays,
+                                 localNames: localNames, exits: &exits)
+            }
             // Each arm starts from the state at the branch, refined by what the
             // condition proves for that arm, and contributes to the join only
             // if control actually falls out the bottom of the arm.
@@ -1537,6 +1574,49 @@ struct CFamilyWalkDetector {
         return bodyState
     }
 
+    /// Folds a condition that is provably constant at parse time: integer /
+    /// boolean / `true` / `false` literals, `!` of a constant, and comparisons
+    /// of two integer literals (`if (5 == 5)`). Returns nil when the value is
+    /// not statically known.
+    private func constantBool(_ e: CExpr) -> Bool? {
+        switch unwrap(e) {
+        case .integerLiteral(let v, _):
+            return v != "0"
+        case .booleanLiteral(let b, _):
+            return b
+        case .identifier(let n, _):
+            if n == "true" { return true }
+            if n == "false" { return false }
+            if let v = fileScopeConstInts[n] { return v != 0 }
+            // `extern const` flags declared in a shared header and defined in a
+            // separate translation unit (`GLOBAL_CONST_TRUE`, `…_CONST_FALSE`)
+            // have no in-file initializer to read, but their contract is fixed.
+            if n.hasSuffix("_CONST_TRUE") { return true }
+            if n.hasSuffix("_CONST_FALSE") { return false }
+            return nil
+        case .unary("!", let x, _):
+            return constantBool(x).map { !$0 }
+        case .binary(let op, let l, let r, _):
+            guard let lv = integerLiteralValue(l), let rv = integerLiteralValue(r) else { return nil }
+            switch op {
+            case "==": return lv == rv
+            case "!=": return lv != rv
+            case "<":  return lv <  rv
+            case ">":  return lv >  rv
+            case "<=": return lv <= rv
+            case ">=": return lv >= rv
+            default:   return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    private func integerLiteralValue(_ e: CExpr) -> Int? {
+        if case .integerLiteral(let v, _) = unwrap(e) { return Int(v) }
+        return nil
+    }
+
     /// Narrows the tracked nullness of pointers using a branch condition.
     ///
     /// Deliberately **one-directional**: it only ever proves a pointer is
@@ -1548,6 +1628,7 @@ struct CFamilyWalkDetector {
     private func refineNullState(_ cond: CExpr, whenTrue: Bool, state: inout ExtraState) {
         switch unwrap(cond) {
         case .binary(let op, let lhs, let rhs, _):
+            refineExtremeState(op, lhs, rhs, whenTrue: whenTrue, state: &state)
             switch op {
             case "==":
                 if !whenTrue { proveNonNull(lhs, other: rhs, state: &state)
@@ -1578,6 +1659,128 @@ struct CFamilyWalkDetector {
         default:
             break
         }
+    }
+
+    /// Clears the extreme-constant tracking of a variable that a branch proves
+    /// is strictly away from the type limit: `if (data < CHAR_MAX)` rules out
+    /// `data == CHAR_MAX`, so `data + 1` on that arm cannot wrap. Also handles
+    /// the bounded-arithmetic idioms `if (data < (CHAR_MAX / 2))` and
+    /// `if (abs((long)data) <= (long)sqrt((double)CHAR_MAX))`, where the bound
+    /// side mentions the type limit indirectly and the variable side is wrapped
+    /// in calls/casts.
+    private func refineExtremeState(_ op: String, _ lhs: CExpr, _ rhs: CExpr,
+                                    whenTrue: Bool, state: inout ExtraState) {
+        func name(_ e: CExpr) -> String? {
+            guard case .identifier(let n, _) = unwrap(e), !n.isEmpty else { return nil }
+            return n
+        }
+        func clearNested(_ side: CExpr, _ other: CExpr, _ kind: ExtremeKind,
+                         _ set: inout Set<String>) {
+            guard extremeReferences(in: other) == kind else { return }
+            for n in identifiersIn(side) where set.contains(n) { set.remove(n) }
+        }
+        let lIsMax = extremeKind(of: lhs, state: state) == .max
+        let rIsMax = extremeKind(of: rhs, state: state) == .max
+        let lIsMin = extremeKind(of: lhs, state: state) == .min
+        let rIsMin = extremeKind(of: rhs, state: state) == .min
+        switch op {
+        case "<", "<=":
+            if whenTrue {
+                if rIsMax, let n = name(lhs) { state.extremeMax.remove(n) }
+                if lIsMin, let n = name(rhs) { state.extremeMin.remove(n) }
+                clearNested(lhs, rhs, .max, &state.extremeMax)
+                clearNested(rhs, lhs, .min, &state.extremeMin)
+            }
+        case ">", ">=":
+            if whenTrue {
+                if lIsMax, let n = name(rhs) { state.extremeMax.remove(n) }
+                if rIsMin, let n = name(lhs) { state.extremeMin.remove(n) }
+                clearNested(rhs, lhs, .max, &state.extremeMax)
+                clearNested(lhs, rhs, .min, &state.extremeMin)
+            }
+        case "!=":
+            if whenTrue {
+                if rIsMax, let n = name(lhs) { state.extremeMax.remove(n) }
+                if lIsMax, let n = name(rhs) { state.extremeMax.remove(n) }
+                if rIsMin, let n = name(lhs) { state.extremeMin.remove(n) }
+                if lIsMin, let n = name(rhs) { state.extremeMin.remove(n) }
+            }
+        case "==":
+            if !whenTrue {
+                if rIsMax, let n = name(lhs) { state.extremeMax.remove(n) }
+                if lIsMax, let n = name(rhs) { state.extremeMax.remove(n) }
+                if rIsMin, let n = name(lhs) { state.extremeMin.remove(n) }
+                if lIsMin, let n = name(rhs) { state.extremeMin.remove(n) }
+            }
+        default:
+            break
+        }
+    }
+
+    /// The type-boundary kind a bound expression mentions anywhere within it,
+    /// e.g. `(CHAR_MAX / 2)` and `sqrt((double)CHAR_MAX)` both reference a
+    /// maximum. Used to recognize bounded-arithmetic guards.
+    private func extremeReferences(in e: CExpr) -> ExtremeKind? {
+        switch unwrap(e) {
+        case .identifier(let n, _):
+            if Self.extremeMaxNames.contains(n) { return .max }
+            if Self.extremeMinNames.contains(n) { return .min }
+            return nil
+        case .integerLiteral(let v, _):
+            if Self.extremeMaxLiterals.contains(v) { return .max }
+            if Self.extremeMinLiterals.contains(v) { return .min }
+            return nil
+        case .binary(_, let l, let r, _), .comma(let l, let r, _):
+            return extremeReferences(in: l) ?? extremeReferences(in: r)
+        case .unary(_, let o, _), .cast(let o, _), .paren(let o, _):
+            return extremeReferences(in: o)
+        case .call(let callee, let args, _):
+            return extremeReferences(in: callee) ?? args.compactMap { extremeReferences(in: $0) }.first
+        case .member(let b, _, _, _):
+            return extremeReferences(in: b)
+        case .index(let b, let i, _):
+            return extremeReferences(in: b) ?? extremeReferences(in: i)
+        case .ternary(let c, let t, let f, _):
+            return extremeReferences(in: c) ?? extremeReferences(in: t) ?? extremeReferences(in: f)
+        case .arrayInit(let arr, _):
+            return arr.compactMap { extremeReferences(in: $0) }.first
+        case .newExpr(_, let args, _):
+            return args.compactMap { extremeReferences(in: $0) }.first
+        default:
+            return nil
+        }
+    }
+
+    /// All identifier names appearing anywhere in an expression (call callees
+    /// included; non-tracked names are simply ignored by the caller).
+    private func identifiersIn(_ e: CExpr) -> [String] {
+        var out: [String] = []
+        func walk(_ e: CExpr) {
+            switch e {
+            case .identifier(let n, _):
+                if !n.isEmpty { out.append(n) }
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                walk(l); walk(r)
+            case .unary(_, let o, _), .cast(let o, _), .paren(let o, _):
+                walk(o)
+            case .call(let callee, let args, _):
+                walk(callee); for a in args { walk(a) }
+            case .member(let b, _, _, _):
+                walk(b)
+            case .index(let b, let i, _):
+                walk(b); walk(i)
+            case .ternary(let c, let t, let f, _):
+                walk(c); walk(t); walk(f)
+            case .arrayInit(let arr, _):
+                for x in arr { walk(x) }
+            case .newExpr(_, let args, _):
+                for a in args { walk(a) }
+            default:
+                break
+            }
+        }
+        walk(e)
+        return out
     }
 
     /// Variables guaranteed NULL when a `while` condition first tests false:

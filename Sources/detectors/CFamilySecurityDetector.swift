@@ -6,6 +6,10 @@
 
 import Foundation
 
+/// Which family of allocator produced a tracked pointer, so a release with the
+/// other family's deallocator (`malloc`/`free` vs `new`/`delete`) is reported.
+private enum CAllocKind { case cRuntime, cppNew }
+
 extension AstSecurityDetector {
 
     /// C-family sinks (C / C++ / ObjC). Lowercase library functions such as
@@ -209,6 +213,7 @@ extension AstSecurityDetector {
         // yield heap pointers, so `x = heapReturningFn()` seeds an allocation.
         let heapReturners = heapReturningFunctionNames()
         var allocs: [String: Int] = [:]     // local -> allocation offset
+        var allocKind: [String: CAllocKind] = [:] // local -> allocator family
         var freed: [String: Int] = [:]      // local -> free offset
         var reportedUAF = Set<String>()
         var paramFreed: [String: Int] = [:]
@@ -218,13 +223,15 @@ extension AstSecurityDetector {
         // matching `free(outerArray[i])` releases them and a missing release is
         // reported as a leak (the struct outer array is freed, its inner arrays not).
         var keyAllocs: [String: Int] = [:]
+        var keyAllocKind: [String: CAllocKind] = [:]
         var keyFreed = Set<String>()
         // Names already reported as leaking (branch leak + fallthrough guard), so
         // one path-specific leak is not reported twice per allocation.
         var leakReported = Set<String>()
 
-        func markAlloc(_ name: String, _ offset: Int) {
+        func markAlloc(_ name: String, _ offset: Int, _ kind: CAllocKind) {
             allocs[name] = offset
+            allocKind[name] = kind
             freed[name] = nil
             paramFreed[name] = nil
         }
@@ -259,22 +266,24 @@ extension AstSecurityDetector {
             }
         }
 
-        func isHeapAllocCall(_ e: CExpr) -> Bool {
+        /// The allocator family of a heap allocation expression, or nil when the
+        /// expression does not allocate. `malloc`/`calloc`/`realloc`/`strdup`
+        /// (and in-file functions that return an allocated local) are the C
+        /// runtime family; `new` is the C++ family.
+        func heapAllocKind(_ e: CExpr) -> CAllocKind? {
             switch e {
             case .cast(let x, _), .paren(let x, _):
-                return isHeapAllocCall(x)
+                return heapAllocKind(x)
             case .call(let callee, _, _):
                 if case .identifier(let n, _) = callee {
-                    if ["malloc", "calloc", "realloc", "strdup", "strndup"].contains(n) { return true }
-                    // A call to an in-file function that returns a directly
-                    // allocated local also yields a heap pointer.
-                    if heapReturners.contains(n) { return true }
+                    if ["malloc", "calloc", "realloc", "strdup", "strndup"].contains(n) { return .cRuntime }
+                    if heapReturners.contains(n) { return .cRuntime }
                 }
-                return false
+                return nil
             case .newExpr:
-                return true
+                return .cppNew
             default:
-                return false
+                return nil
             }
         }
 
@@ -353,25 +362,27 @@ extension AstSecurityDetector {
             let lhsName = assignedDeclName(lhs)
             if let name = lhsName {
                 if op == "=" {
-                    if plainAssignedName(lhs) != nil, isHeapAllocCall(rhs) {
-                        markAlloc(name, rhs.offset)
+                    if plainAssignedName(lhs) != nil, let kind = heapAllocKind(rhs) {
+                        markAlloc(name, rhs.offset, kind)
                     } else {
                         // Reassignment breaks the freed state (free→NULL idiom or
                         // fresh ownership); the old pointer is no longer readable.
                         freed[name] = nil
                         paramFreed[name] = nil
                         allocs[name] = nil
+                        allocKind[name] = nil
                     }
                 }
-                if case .newExpr = rhs { markAlloc(name, rhs.offset) }
+                if case .newExpr = rhs { markAlloc(name, rhs.offset, .cppNew) }
             } else {
                 // Storing into a member/global transfers or consumes values —
                 // treat reads of freed pointers there as uses (already covered
                 // by checkUses on the RHS above).
                 checkUses(lhs)
-                if op == "=", isHeapAllocCall(rhs), let key = exprKey(lhs) {
+                if op == "=", let kind = heapAllocKind(rhs), let key = exprKey(lhs) {
                     // `outerArray[i] = malloc(...)`, `p->innerArray = malloc(...)`.
                     keyAllocs[key] = rhs.offset
+                    keyAllocKind[key] = kind
                     keyFreed.remove(key)
                 }
             }
@@ -380,6 +391,45 @@ extension AstSecurityDetector {
             usedIdents(rhs, into: &rhsIdents)
             for (n, _) in rhsIdents where allocs[n] != nil {
                 if lhsName == nil { escapedVars.insert(n) }
+            }
+        }
+
+        // Applies a deallocation (`free` or `delete`) of `target` to the tracking
+        // state: flags a mismatched allocator/deallocator pair, a second release
+        // of the same pointer, or records the release so the allocation is no
+        // longer treated as leaked.
+        func release(_ target: CExpr, offset: Int, kind: CAllocKind) {
+            if case .identifier(let t, _) = unwrapExpr(target) {
+                if let alloced = allocKind[t], alloced != kind {
+                    findings.append(AstFinding(function: function, offset: offset,
+                                               category: "Mismatched Memory Management",
+                                               severity: .high,
+                                               message: "\(t) is released with the wrong deallocator; memory allocated by one allocator family must be released by the same family.",
+                                               taintPath: nil, reachable: reachable, crossFile: false))
+                }
+                if freed[t] != nil || paramFreed[t] != nil {
+                    findings.append(AstFinding(function: function, offset: offset,
+                                               category: "Double Free",
+                                               severity: .high,
+                                               message: "\(t) is freed a second time; double free corrupts the heap allocator.",
+                                               taintPath: nil, reachable: reachable, crossFile: false))
+                } else {
+                    freed[t] = offset
+                }
+            } else if let key = exprKey(target) {
+                if let alloced = keyAllocKind[key], alloced != kind {
+                    findings.append(AstFinding(function: function, offset: offset,
+                                               category: "Mismatched Memory Management",
+                                               severity: .high,
+                                               message: "\(key) is released with the wrong deallocator; memory allocated by one allocator family must be released by the same family.",
+                                               taintPath: nil, reachable: reachable, crossFile: false))
+                }
+                // Releases exactly this key (never an inner array stored in it).
+                // Indexes alias across loop iterations/exclusive branches, so the
+                // same spelled key can legitimately be freed on disjoint paths —
+                // track it only for leak math.
+                keyFreed.insert(key)
+                keyAllocs.removeValue(forKey: key)
             }
         }
 
@@ -441,50 +491,11 @@ extension AstSecurityDetector {
             case .expr(let e):
                 if case .call(let callee, let args, let offset) = e {
                     if case .identifier(let n, _) = callee, n == "free", let first = args.first {
-                        if case .identifier(let target, _) = first {
-                            if freed[target] != nil {
-                                findings.append(AstFinding(function: function, offset: offset,
-                                                           category: "Double Free",
-                                                           severity: .high,
-                                                           message: "\(target) is freed a second time; double free corrupts the heap allocator.",
-                                                           taintPath: nil, reachable: reachable, crossFile: false))
-                            } else if paramFreed[target] != nil {
-                                findings.append(AstFinding(function: function, offset: offset,
-                                                           category: "Double Free",
-                                                           severity: .high,
-                                                           message: "\(target) is freed a second time; double free corrupts the heap allocator.",
-                                                           taintPath: nil, reachable: reachable, crossFile: false))
-                            } else {
-                                freed[target] = offset
-                            }
-                        } else if let key = exprKey(first) {
-                            // Structured target: `free(outerArray[i])`. Releases
-                            // exactly this key (never an inner array stored in
-                            // it). No double-free finding here: indexes alias
-                            // across loop iterations/exclusive branches, so the
-                            // same spelled key can legitimately be freed on
-                            // disjoint paths — track it only for leak math.
-                            keyFreed.insert(key)
-                            keyAllocs.removeValue(forKey: key)
-                        }
-                    } else if case .identifier(let n, _) = callee, ["delete"].contains(n) {
-                        // C++ `delete` parsed as a plain call (defensive).
-                        if let first = args.first, case .identifier(let target, _) = first {
-                            if freed[target] != nil || paramFreed[target] != nil {
-                                findings.append(AstFinding(function: function, offset: offset,
-                                                           category: "Double Free",
-                                                           severity: .high,
-                                                           message: "\(target) is deleted a second time; double free corrupts the heap.",
-                                                           taintPath: nil, reachable: reachable, crossFile: false))
-                            } else {
-                                freed[target] = offset
-                            }
-                        } else if let first = args.first, let key = exprKey(first) {
-                            // Structured `delete obj[i]` target — alias-safe
-                            // bookkeeping only (see free above).
-                            keyFreed.insert(key)
-                            keyAllocs.removeValue(forKey: key)
-                        }
+                        release(first, offset: offset, kind: .cRuntime)
+                    } else if case .identifier(let n, _) = callee, n == "delete" || n == "delete[]" {
+                        // `delete` parsed as a plain call (defensive; the parser
+                        // normally produces a unary `delete` expression).
+                        if let first = args.first { release(first, offset: offset, kind: .cppNew) }
                     } else {
                         // Any other call: arguments that read freed pointers are UAF.
                         for a in args { checkUses(a) }
@@ -504,14 +515,16 @@ extension AstSecurityDetector {
                     }
                     // The callee expression itself may read freed memory.
                     checkUses(callee)
+                } else if case .unary(let op, let operand, let offset) = e, op == "delete" || op == "delete[]" {
+                    release(operand, offset: offset, kind: .cppNew)
                 } else {
                     handleAssign(e)
                 }
             case .declaration(let d):
                 if case .variable(_, let name, let initExpr?) = d.kind {
                     let initE = initExpr
-                    if isHeapAllocCall(initE) {
-                        markAlloc(name, initE.offset)
+                    if let kind = heapAllocKind(initE) {
+                        markAlloc(name, initE.offset, kind)
                     } else {
                             checkUses(initE)
                             // `T* x = otherPtr;` after otherPtr was freed → UAF.

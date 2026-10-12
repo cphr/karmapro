@@ -1097,12 +1097,15 @@ public final class CParser {
             }
             if tok.kind == .keyword && (tok.text == "delete") {
                 advance()
-                _ = match("[]")
+                // `delete [] p` — `[` and `]` are separate punctuation tokens,
+                // so consume them individually and tag the array form.
+                var op = "delete"
+                if isPunct("[") { advance(); _ = match("]"); op = "delete[]" }
                 if current.kind == .identifier || isOp("(") {
                     let e = parseUnary()
-                    return .unary(op: "delete", operand: e, tok.offset)
+                    return .unary(op: op, operand: e, tok.offset)
                 }
-                return .unary(op: "delete", operand: .identifier("", tok.offset), tok.offset)
+                return .unary(op: op, operand: .identifier("", tok.offset), tok.offset)
             }
             if tok.kind == .operator {
                 switch tok.text {
