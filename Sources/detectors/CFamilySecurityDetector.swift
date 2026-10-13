@@ -100,7 +100,7 @@ extension AstSecurityDetector {
                !containsUnboundedFormatSpecifier(lit) {
                 return
             }
-            emit(&findings, function, offset, rule, message: "\(name) is unbounded and can overflow the destination buffer.", taint: nil, reachable: reachable, crossFile: false)
+            emit(&findings, function, offset, rule, message: alwaysVulnerableMessage(name: name, category: rule.category), taint: nil, reachable: reachable, crossFile: false)
             return
         }
         if rule.category == "Buffer Overflow" {
@@ -200,6 +200,23 @@ extension AstSecurityDetector {
         return false
     }
 
+    /// Message for an `alwaysVulnerable` sink. Most such sinks are buffer-write
+    /// primitives (`gets`, `sprintf`) that overflow their destination, but
+    /// weak-crypto/randomness and deserialization sinks also report
+    /// unconditionally and need their own wording instead of the buffer text.
+    private func alwaysVulnerableMessage(name: String, category: String) -> String {
+        if category.contains("Cryptography") {
+            return "\(name) uses a broken or weak cryptographic algorithm."
+        }
+        if category.contains("Randomness") {
+            return "\(name) is not a cryptographically secure source of randomness."
+        }
+        if category.contains("Deserialization") {
+            return "\(name) deserializes untrusted data and may allow arbitrary object instantiation."
+        }
+        return "\(name) is unbounded and can overflow the destination buffer."
+    }
+
 
     // MARK: - Userspace memory safety (double free / use after free / leak)
 
@@ -241,6 +258,32 @@ extension AstSecurityDetector {
         var keyAllocs: [String: Int] = [:]
         var keyAllocKind: [String: CAllocKind] = [:]
         var keyFreed = Set<String>()
+        // Local variable names. A call whose callee is a local is a function-
+        // pointer dispatch to an unknown target, so a heap pointer passed to it
+        // may be released or stored there and must count as escaping.
+        var localVars = Set<String>()
+        func collectLocalVars(_ s: CStmt) {
+            switch s {
+            case .block(let arr): arr.forEach(collectLocalVars)
+            case .declaration(let d):
+                if case .variable(_, let n, _) = d.kind, !n.isEmpty { localVars.insert(n) }
+            case .ifStmt(_, let t, let e, _):
+                collectLocalVars(t)
+                if let e = e { collectLocalVars(e) }
+            case .whileStmt(_, let b, _), .doWhileStmt(let b, _, _):
+                collectLocalVars(b)
+            case .forStmt(let i, _, _, let b, _):
+                if let i = i { collectLocalVars(i) }
+                collectLocalVars(b)
+            case .switchStmt(_, let cases, _):
+                for c in cases { c.body.forEach(collectLocalVars) }
+            case .labeledStmt(_, let s, _):
+                collectLocalVars(s)
+            default:
+                break
+            }
+        }
+        collectLocalVars(fn.body)
         // Names already reported as leaking (branch leak + fallthrough guard), so
         // one path-specific leak is not reported twice per allocation.
         var leakReported = Set<String>()
@@ -319,7 +362,12 @@ extension AstSecurityDetector {
                     if heapReturners.contains(n) { return .cRuntime }
                 }
                 return nil
-            case .newExpr:
+            case .newExpr(let typeName, _, _):
+                // Placement new (`new (buf) T`) constructs in already-provided
+                // storage; the parser records it with no type name because the
+                // placement argument leads. It allocates nothing, so it must not
+                // seed a tracked allocation.
+                if typeName.isEmpty { return nil }
                 return .cppNew
             default:
                 return nil
@@ -432,7 +480,7 @@ extension AstSecurityDetector {
                         }
                     }
                 }
-                if case .newExpr = rhs {
+                if heapAllocKind(rhs) == .cppNew {
                     markAlloc(name, rhs.offset, .cppNew)
                     if outParams.contains(name) { noteEscape(name) }
                 }
@@ -565,21 +613,45 @@ extension AstSecurityDetector {
                         if let first = args.first { release(first, offset: offset, kind: .cppNew) }
                     } else {
                         // Any other call: arguments that read freed pointers are UAF.
-                        for a in args { checkUses(a) }
+                        // An argument handed to an in-file helper that never reads
+                        // that parameter is not a use of the pointee.
+                        var ignoredArgs = Set<Int>()
+                        if case .identifier(let cn, _) = callee {
+                            let unq = cn.split(separator: ":").last.map(String.init) ?? cn
+                            if let calleeDef = astFns[cn] ?? astFns[unq] {
+                                for i in 0..<args.count where functionIgnoresParam(calleeDef, i) {
+                                    ignoredArgs.insert(i)
+                                }
+                            }
+                        }
+                        for (i, a) in args.enumerated() where !ignoredArgs.contains(i) {
+                            checkUses(a)
+                        }
                         // Ownership hand-off: passing an allocation to another
                         // function escapes it (conservative for leak reporting).
                         // In-file helpers and locally-prototyped helpers (defined
                         // in a sibling translation unit) may release or store it;
                         // libc-style helpers never appear as local prototypes.
+                        // Storing the value into another object/container
+                        // (`vec.push_back(p)`, `holder.set(p)`) transfers
+                        // ownership out of this function, exactly as a plain
+                        // function call does.
+                        let escapes: Bool
                         if case .identifier(let cn, _) = callee {
                             let unq = cn.split(separator: ":").last.map(String.init) ?? cn
-                            if astFns[cn] != nil || astFns[unq] != nil
-                                || cPrototypeNames.contains(cn) || cPrototypeNames.contains(unq) {
-                                for a in args {
-                                    var ids: [(String, Int)] = []
-                                    usedIdents(a, into: &ids)
-                                    for (n, _) in ids where allocs[n] != nil { escapedVars.insert(n) }
-                                }
+                            escapes = astFns[cn] != nil || astFns[unq] != nil
+                                || cPrototypeNames.contains(cn) || cPrototypeNames.contains(unq)
+                                || localVars.contains(cn)
+                        } else if case .member = callee {
+                            escapes = true
+                        } else {
+                            escapes = false
+                        }
+                        if escapes {
+                            for a in args {
+                                var ids: [(String, Int)] = []
+                                usedIdents(a, into: &ids)
+                                for (n, _) in ids where allocs[n] != nil { escapedVars.insert(n) }
                             }
                         }
                     }
@@ -643,7 +715,17 @@ extension AstSecurityDetector {
                     for k in freed.keys where freedSnap[k] == nil { freed[k] = nil }
                     for k in paramFreed.keys where paramFreedSnap[k] == nil { paramFreed[k] = nil }
                 }
+                let freedAfterThen = freed
+                let paramFreedAfterThen = paramFreed
                 if let e = e {
+                    // The two arms are mutually exclusive, so the else branch is
+                    // walked from the branch-entry release state. Carrying the
+                    // then-branch's releases into it would make the same `free`
+                    // duplicated in both arms look like a double free. The arms
+                    // are joined afterwards: a pointer released on either arm is
+                    // released after the branch.
+                    freed = freedSnap
+                    paramFreed = paramFreedSnap
                     let returnsElse = definitelyReturns(e)
                     walk(e)
                     if returnsElse {
@@ -653,6 +735,17 @@ extension AstSecurityDetector {
                         for k in freed.keys where freedSnap[k] == nil { freed[k] = nil }
                         for k in paramFreed.keys where paramFreedSnap[k] == nil { paramFreed[k] = nil }
                     }
+                    var joined = freedSnap
+                    for (k, v) in freedAfterThen { joined[k] = v }
+                    for (k, v) in freed { joined[k] = v }
+                    freed = joined
+                    var joinedPF = paramFreedSnap
+                    for (k, v) in paramFreedAfterThen { joinedPF[k] = v }
+                    for (k, v) in paramFreed { joinedPF[k] = v }
+                    paramFreed = joinedPF
+                } else {
+                    freed = freedAfterThen
+                    paramFreed = paramFreedAfterThen
                 }
             case .whileStmt(let cond, let body, _):
                 checkUses(cond)
@@ -712,6 +805,82 @@ extension AstSecurityDetector {
 
 
 
+    /// Identifier names that appear anywhere in a statement subtree.
+    private func collectStatementIdents(_ s: CStmt, into out: inout Set<String>) {
+        func exprIds(_ e: CExpr) {
+            switch e {
+            case .identifier(let n, _): out.insert(n)
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _):
+                exprIds(x)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                exprIds(l); exprIds(r)
+            case .ternary(let c, let t, let f, _):
+                exprIds(c); exprIds(t); exprIds(f)
+            case .assign(_, let l, let r, _):
+                exprIds(l); exprIds(r)
+            case .call(let callee, let args, _):
+                exprIds(callee); for a in args { exprIds(a) }
+            case .member(let base, _, _, _):
+                exprIds(base)
+            case .index(let base, let idx, _):
+                exprIds(base); exprIds(idx)
+            case .arrayInit(let els, _):
+                for el in els { exprIds(el) }
+            case .newExpr(_, let args, _):
+                for a in args { exprIds(a) }
+            case .sizeOf, .lambda, .integerLiteral, .floatLiteral,
+                 .stringLiteral, .charLiteral, .booleanLiteral:
+                break
+            }
+        }
+        switch s {
+        case .block(let arr):
+            for x in arr { collectStatementIdents(x, into: &out) }
+        case .expr(let e):
+            exprIds(e)
+        case .declaration(let d):
+            if case .variable(_, let name, let ie) = d.kind {
+                out.insert(name)
+                if let ie = ie { exprIds(ie) }
+            }
+        case .returnStmt(let e, _):
+            if let e = e { exprIds(e) }
+        case .ifStmt(let c, let t, let el, _):
+            exprIds(c)
+            collectStatementIdents(t, into: &out)
+            if let el = el { collectStatementIdents(el, into: &out) }
+        case .whileStmt(let c, let b, _):
+            exprIds(c); collectStatementIdents(b, into: &out)
+        case .doWhileStmt(let b, let c, _):
+            collectStatementIdents(b, into: &out); exprIds(c)
+        case .forStmt(let i, let c, let inc, let b, _):
+            if let i = i { collectStatementIdents(i, into: &out) }
+            if let c = c { exprIds(c) }
+            if let inc = inc { exprIds(inc) }
+            collectStatementIdents(b, into: &out)
+        case .switchStmt(let e, let cases, _):
+            exprIds(e)
+            for cs in cases { for x in cs.body { collectStatementIdents(x, into: &out) } }
+        case .labeledStmt(_, let inner, _):
+            collectStatementIdents(inner, into: &out)
+        case .breakStmt, .continueStmt, .gotoStmt, .empty:
+            break
+        }
+    }
+
+    /// True when in-file function `f` never reads its `index`-th parameter: the
+    /// name is absent from the body (or the parameter is unnamed). Passing a
+    /// pointer to such a helper cannot use the pointee, so handing it a freed
+    /// pointer is not a use-after-free.
+    private func functionIgnoresParam(_ f: CFunctionDef, _ index: Int) -> Bool {
+        guard index < f.params.count, let name = f.params[index].name, !name.isEmpty else {
+            return true
+        }
+        var used = Set<String>()
+        collectStatementIdents(f.body, into: &used)
+        return !used.contains(name)
+    }
+
     /// Names of in-file functions that `return` a directly-allocated local
     /// (`malloc`/`calloc`/`strdup`/`new`). Calls to them produce heap pointers.
     private func heapReturningFunctionNames() -> Set<String> {
@@ -743,6 +912,17 @@ extension AstSecurityDetector {
                 if case .assign(_, let lhs, let rhs, _) = e,
                    case .identifier(let n, _) = lhs, isAllocCall(rhs) {
                     allocs.insert(n)
+                } else if case .call(let callee, let args, _) = e,
+                          case .identifier(let cn, _) = callee,
+                          ["free", "cfree"].contains(cn),
+                          let first = args.first, case .identifier(let rn, _) = first {
+                    // The function releases the allocation itself, so returning
+                    // the (now-dangling) pointer is not handing back ownership.
+                    allocs.remove(rn)
+                } else if case .unary(let op, let operand, _) = e,
+                          op == "delete" || op == "delete[]",
+                          case .identifier(let rn, _) = operand {
+                    allocs.remove(rn)
                 }
             case .declaration(let d):
                 if case .variable(_, let name, let ie?) = d.kind,

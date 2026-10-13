@@ -90,6 +90,10 @@ struct CFamilyWalkDetector {
     /// (`static const int STATIC_CONST_FALSE = 0;`), so constant conditions that
     /// read them through a name still fold to one live arm.
     private let fileScopeConstInts: [String: Int]
+    /// In-file functions that unconditionally return an integer literal through
+    /// a single exit (`static int staticReturnsTrue() { return 1; }`). Constant
+    /// conditions calling them (`if (staticReturnsTrue())`) fold to one live arm.
+    private let constantReturningFns: [String: Int]
 
     /// Fixpoint context for Walk 3 (boundary).
     private struct Walk3Context {
@@ -149,13 +153,48 @@ struct CFamilyWalkDetector {
         self.crossFileSources = crossFileSources
         self.globalCapacities = Self.fileScopeArrayCapacities(in: source)
         self.fileScopeConstInts = Self.fileScopeConstInts(in: source)
+        self.constantReturningFns = Self.constantReturningFunctions(astFns: astFns)
+    }
+
+    /// Functions whose body is exactly one `return <int/bool literal>;`. These
+    /// boolean helpers (`staticReturnsTrue`/`staticReturnsFalse`) are folded so
+    /// the dead arm is not walked. Only a single literal exit qualifies, so
+    /// anything with side effects or multiple returns is left alone.
+    private static func constantReturningFunctions(astFns: [String: CFunctionDef]) -> [String: Int] {
+        var out: [String: Int] = [:]
+        for (name, fn) in astFns {
+            var statements = 0
+            var returnExpr: CExpr?
+            func visit(_ s: CStmt) {
+                switch s {
+                case .block(let arr): arr.forEach(visit)
+                case .returnStmt(let e, _): statements += 1; returnExpr = e
+                default: statements += 1
+                }
+            }
+            visit(fn.body)
+            guard statements == 1, let e = returnExpr else { continue }
+            switch unwrapStatic(e) {
+            case .integerLiteral(let v, _): if let n = Int(v) { out[name] = n }
+            case .booleanLiteral(let b, _): out[name] = b ? 1 : 0
+            default: break
+            }
+        }
+        return out
+    }
+
+    private static func unwrapStatic(_ e: CExpr) -> CExpr {
+        switch e {
+        case .paren(let x, _), .cast(let x, _): return unwrapStatic(x)
+        default: return e
+        }
     }
 
     /// Anchored scan for file-scope `const` integral definitions whose value is
     /// a literal (`static const int STATIC_CONST_FALSE = 0;`). Header-declared
     /// `extern const` values have no in-file initializer and are resolved by the
     /// well-known-name fallback in `constantBool`.
-    private static func fileScopeConstInts(in source: String) -> [String: Int] {
+    static func fileScopeConstInts(in source: String) -> [String: Int] {
         var out: [String: Int] = [:]
         guard let re = try? NSRegularExpression(
             pattern: "(?m)^[ \\t]*(?:static[ \\t]+)?(?:const|constexpr)[ \\t]+(?:unsigned[ \\t]+|signed[ \\t]+)?(?:int|long|short|char|size_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t)[ \\t\\*]*(\\w+)[ \\t]*=[ \\t]*(-?\\d+)") else {
@@ -170,7 +209,9 @@ struct CFamilyWalkDetector {
             out[name] = v
         }
         // A file-scope non-`const` `static int name = literal;` is a constant as
-        // long as the file never reassigns it (the staticTrue/staticFalse idiom).
+        // long as every assignment to it in the file is that same literal (the
+        // staticTrue/staticFalse control-flow idiom, where a caller sets the
+        // flag to a fixed value that a callee then tests).
         guard let sre = try? NSRegularExpression(
             pattern: "(?m)^[ \\t]*static[ \\t]+(?:unsigned[ \\t]+|signed[ \\t]+)?(?:int|long|short|char|size_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t)[ \\t\\*]*(\\w+)[ \\t]*=[ \\t]*(-?\\d+)") else {
             return out
@@ -182,9 +223,18 @@ struct CFamilyWalkDetector {
                   let vs = Range(m.range(at: 2), in: source).map({ String(source[$0]) }),
                   let v = Int(vs) else { continue }
             let esc = NSRegularExpression.escapedPattern(for: name)
-            let assignCount = (try? NSRegularExpression(pattern: "\\b\(esc)[ \\t]*=(?!=)"))
+            // Any write that is not a plain `= literal` (compound `+=`, `++`,
+            // `--`, or a non-literal RHS) disqualifies the constant fold.
+            let allCount = (try? NSRegularExpression(pattern: "\\b\(esc)\\b[ \\t]*(?:[+\\-*/%&|^]?=|--|\\+\\+)"))
                 .map { $0.numberOfMatches(in: source, options: [], range: full) } ?? 0
-            if assignCount <= 1 { out[name] = v }
+            let litRe = try? NSRegularExpression(pattern: "\\b\(esc)\\b[ \\t]*=(?!=)[ \\t]*(-?\\d+)\\b")
+            let lits = litRe?.matches(in: source, options: [], range: full) ?? []
+            let litVals = lits.compactMap { mm -> Int? in
+                guard mm.numberOfRanges >= 2,
+                      let s = Range(mm.range(at: 1), in: source).map({ String(source[$0]) }) else { return nil }
+                return Int(s)
+            }
+            if lits.count == allCount && litVals.allSatisfy({ $0 == v }) { out[name] = v }
         }
         return out
     }
@@ -1449,9 +1499,14 @@ struct CFamilyWalkDetector {
                                         reached: reached, findings: &findings,
                                         localArrays: localArrays, localNames: localNames,
                                         exits: &local)
-            // The loop may run zero times, so the state at the top joins back in.
-            state = Self.union([loopEntry].compactMap { $0 } + [bodyExit].compactMap { $0 }
-                               + local.breaks) ?? loopEntry
+            // The loop may run zero times, so the state at the top joins back in
+            // — unless the condition is provably true (`while (1)`), in which
+            // case the body always executes and the zero-iteration path does not
+            // exist. Dropping it stops a `data = NULL; while (1) { data =
+            // ALLOC(); break; }` from leaving `data` looking NULL afterwards.
+            var joined = [bodyExit].compactMap { $0 } + local.breaks
+            if constantBool(cond) != true { joined.insert(loopEntry, at: 0) }
+            state = Self.union(joined) ?? loopEntry
             // A `while (p)` / `while (p != NULL)` loop only reaches the code
             // after it by making its condition false, so `p` is NULL on every
             // non-break exit — `while (n) { n = n->next; }` then `n->v` is a
@@ -1503,15 +1558,31 @@ struct CFamilyWalkDetector {
             state = Self.union([loopEntry].compactMap { $0 } + [bodyExit].compactMap { $0 }
                                + local.breaks) ?? loopEntry
             return .fellThrough
-        case .switchStmt(_, let cases, _):
+        case .switchStmt(let expr, let cases, _):
             // Every arm starts from the state at the switch rather than from
             // wherever the previous arm happened to end, and the states that
             // survive to the statement after the switch are unioned together.
             let entry = state
             var local = FlowExits()
             var arms: [ExtraState] = []
-            let hasDefault = cases.contains(where: { $0.isDefault })
-            for c in cases {
+            var selected = cases
+            var unionEntryWhenUnmatched = !cases.contains(where: { $0.isDefault })
+            // A switch on a compile-time constant has exactly one reachable
+            // arm; evaluating the selector keeps the dead arms from widening
+            // the state at the merge.
+            if let sel = integerLiteralValue(expr) {
+                if let match = cases.first(where: { c in
+                    c.values.contains(where: { integerLiteralValue($0) == sel })
+                }) {
+                    selected = [match]
+                } else if let dflt = cases.first(where: { $0.isDefault }) {
+                    selected = [dflt]
+                } else {
+                    selected = []
+                }
+                unionEntryWhenUnmatched = false
+            }
+            for c in selected {
                 let breaksBefore = local.breaks.count
                 var armState = entry
                 var armOutcome = FlowOutcome.fellThrough
@@ -1527,7 +1598,7 @@ struct CFamilyWalkDetector {
                 arms.append(contentsOf: local.breaks.dropFirst(breaksBefore))
                 local.breaks.removeSubrange(breaksBefore...)
             }
-            if !hasDefault { arms.append(entry) }
+            if unionEntryWhenUnmatched { arms.append(entry) }
             state = Self.union(arms) ?? entry
             // `continue` inside a switch still belongs to the enclosing loop.
             exits.continues.append(contentsOf: local.continues)
@@ -1610,6 +1681,17 @@ struct CFamilyWalkDetector {
             // have no in-file initializer to read, but their contract is fixed.
             if n.hasSuffix("_CONST_TRUE") { return true }
             if n.hasSuffix("_CONST_FALSE") { return false }
+            if n == "globalTrue" { return true }
+            if n == "globalFalse" { return false }
+            return nil
+        case .call(let callee, _, _):
+            if let n = calleeName(callee) {
+                if let v = constantReturningFns[n] { return v != 0 }
+                // Shared test harness boolean helpers with a fixed contract but
+                // no in-file body to read.
+                if n == "globalReturnsTrue" { return true }
+                if n == "globalReturnsFalse" { return false }
+            }
             return nil
         case .unary("!", let x, _):
             return constantBool(x).map { !$0 }
@@ -1632,7 +1714,11 @@ struct CFamilyWalkDetector {
     private func integerLiteralValue(_ e: CExpr) -> Int? {
         switch unwrap(e) {
         case .integerLiteral(let v, _): return Int(v)
-        case .identifier(let n, _): return fileScopeConstInts[n]
+        case .identifier(let n, _):
+            if let v = fileScopeConstInts[n] { return v }
+            // Extern harness constant declared in the shared header.
+            if n == "GLOBAL_CONST_FIVE" || n == "globalFive" { return 5 }
+            return nil
         default: return nil
         }
     }

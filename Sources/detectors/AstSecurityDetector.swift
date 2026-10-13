@@ -130,6 +130,13 @@ struct AstSecurityDetector {
     let javaBoolConst: [String: Bool]
     let javaIntConst: [String: Int]
 
+    /// C/C++ file-scope integral values provably fixed for the whole file (a
+    /// `static int` initializer plus every assignment agreeing on one literal).
+    /// Used to prune arms guarded by `if (FLAG)`/`if (!FLAG)` from the taint
+    /// walk, so a sink body that only runs when a caller-set flag is nonzero is
+    /// not reported when that flag is fixed at zero.
+    private let cConstGlobals: [String: Int]
+
     /// This file's language-specific source APIs only (tiny set). Seed
     /// membership checks consult this *and* the shared project-wide
     /// `taintReturning` set via `isSeedFn(_:)` — materializing their union
@@ -201,6 +208,9 @@ struct AstSecurityDetector {
         let constScalars = isJava ? VulnerabilityScanner.constantScalarFields(source: source) : (bools: [:], ints: [:])
         self.javaBoolConst = constScalars.bools.merging(javaQualifiedConstBools) { a, _ in a }
         self.javaIntConst = constScalars.ints.merging(javaQualifiedConstInts) { a, _ in a }
+        let cFamily = !isKernel && !isJava && !isCSharp && !isGo && !isKotlin && !isPython
+            && !isRuby && !isRust && !isPHP && !isSolidity
+        self.cConstGlobals = cFamily ? CFamilyWalkDetector.fileScopeConstInts(in: source) : [:]
         self.langSourceAPIs = Self.langAPIs(isCSharp: isCSharp, isJava: isJava,
                                             isGo: isGo, isKotlin: isKotlin,
                                             isPython: isPython, isRuby: isRuby,
@@ -628,6 +638,17 @@ struct AstSecurityDetector {
                 scanExpr(initExpr, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
             }
         case .ifStmt(let cond, let t, let e, _):
+            // An arm guarded by a provably-constant condition never runs, so its
+            // sinks are not reachable and are not reported. Only the live arm's
+            // effects carry forward.
+            if let truth = constantCond(cond) {
+                if truth {
+                    scanStmt(t, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+                } else if let e = e {
+                    scanStmt(e, function: function, params: params, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
+                }
+                break
+            }
             // Branch-scoped positive guards: `if (validator(x)) { sink(x) }`
             // proves `x` valid only on the then path; the else path (if any) is
             // left unguarded so a raw use there is still reported.
@@ -810,6 +831,29 @@ struct AstSecurityDetector {
     var isCArithmeticTarget: Bool {
         !isKernel && !isJava && !isCSharp && !isGo && !isKotlin && !isPython
             && !isRuby && !isRust && !isPHP && !isSolidity
+    }
+
+    /// Folds a condition that is provably constant for this file: integer /
+    /// boolean literals, `true`/`false`, `!` of a constant, and a C/C++
+    /// file-scope flag whose value is fixed for the whole file.
+    private func constantCond(_ e: CExpr) -> Bool? {
+        switch e {
+        case .paren(let x, _):
+            return constantCond(x)
+        case .integerLiteral(let v, _):
+            return v != "0"
+        case .booleanLiteral(let b, _):
+            return b
+        case .identifier(let n, _):
+            if n == "true" { return true }
+            if n == "false" { return false }
+            if let v = cConstGlobals[n] { return v != 0 }
+            return nil
+        case .unary("!", let x, _):
+            return constantCond(x).map { !$0 }
+        default:
+            return nil
+        }
     }
 
     // MARK: - Sink handling
@@ -1124,6 +1168,8 @@ struct AstSecurityDetector {
             if op == "<=", let c = intLiteral(l), c >= 1, let n = simpleIdentifier(r), !n.isEmpty { out.insert(n) }
             if op == "!=", isZero(r), let n = simpleIdentifier(l), !n.isEmpty { out.insert(n) }
             if op == "!=", isZero(l), let n = simpleIdentifier(r), !n.isEmpty { out.insert(n) }
+            if let v = absCallVariable(l), isNonZeroLiteral(r), op == ">" || op == ">=" { out.insert(v) }
+            if let v = absCallVariable(r), isNonZeroLiteral(l), op == "<" || op == "<=" { out.insert(v) }
             return out
         default:
             return out
@@ -1414,6 +1460,54 @@ struct AstSecurityDetector {
         }
     }
 
+    /// The variable wrapped in an absolute-value call (`fabs(x)`, `abs(x)`), or
+    /// nil. A comparison of such a call against a non-zero literal proves the
+    /// variable is bounded away from zero on the guarding path.
+    private func absCallVariable(_ e: CExpr) -> String? {
+        switch e {
+        case .call(let callee, let args, _):
+            guard args.count == 1,
+                  let name = calleeSimpleName(callee),
+                  ["abs", "fabs", "fabsf", "fabsl", "labs", "llabs"].contains(name),
+                  let v = simpleIdentifier(args[0]) else { return nil }
+            return v
+        case .paren(let x, _), .cast(let x, _):
+            return absCallVariable(x)
+        default:
+            return nil
+        }
+    }
+
+    private func calleeSimpleName(_ e: CExpr) -> String? {
+        switch e {
+        case .identifier(let n, _): return n
+        case .member(_, let m, _, _): return m
+        case .call(let inner, _, _): return calleeSimpleName(inner)
+        default: return nil
+        }
+    }
+
+    /// True for an integer or floating literal whose value is not zero.
+    private func isNonZeroLiteral(_ e: CExpr) -> Bool {
+        switch e {
+        case .integerLiteral(let s, _):
+            var v = s.lowercased()
+            while let last = v.last, last == "u" || last == "l" { v.removeLast() }
+            guard !v.isEmpty else { return false }
+            if v.hasPrefix("0x") { return Int(v.dropFirst(2), radix: 16) ?? 0 != 0 }
+            if v.hasPrefix("0b") { return Int(v.dropFirst(2), radix: 2) ?? 0 != 0 }
+            return Int(v) ?? 0 != 0
+        case .floatLiteral(let s, _):
+            var v = s.lowercased()
+            while let last = v.last, "fl".contains(last) { v.removeLast() }
+            return (Double(v) ?? 0) != 0
+        case .paren(let x, _), .cast(let x, _):
+            return isNonZeroLiteral(x)
+        default:
+            return false
+        }
+    }
+
     /// Extracts `(variable, effectiveOp)` pairs where the variable is compared
     /// against literal zero (via `<`, `>`, `==`, `!=`), with the effectiveOp
     /// expressed on the variable (`0 < len` and `len > 0` both yield `>`).
@@ -1429,6 +1523,14 @@ struct AstSecurityDetector {
             let isZero: (CExpr) -> Bool = { e in
                 if case .integerLiteral(let s, _) = e { return s.trimmingCharacters(in: .alphanumerics.inverted) == "0" }
                 return false
+            }
+            // `fabs(x) > 0.000001` / `abs(n) >= 1`: a magnitude test against a
+            // non-zero literal proves the variable is non-zero inside the branch.
+            if let v = absCallVariable(l), isNonZeroLiteral(r), op == ">" || op == ">=" {
+                out.append((v, ">")); return out
+            }
+            if let v = absCallVariable(r), isNonZeroLiteral(l), op == "<" || op == "<=" {
+                out.append((v, ">")); return out
             }
             if isZero(l), let rk = sizePathKey(r) {
                 if op == "!=" { out.append((rk, "!=")) }

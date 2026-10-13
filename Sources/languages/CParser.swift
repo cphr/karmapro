@@ -710,7 +710,9 @@ public final class CParser {
             // But `foo()` or `foo[i]` is an expression. Heuristic: identifier followed by identifier/'*'/'&'/'<' then name.
             // Look ahead one: if next is identifier/*/& or '(' then next-next is identifier or '*' => declaration.
             let n = peek
-            if n.kind == .identifier || isOp("*") || isOp("&") || isOp("&&") || isOp("::") {
+            let nextIsPointer = (n.kind == .operator || n.kind == .punct)
+                && (n.text == "*" || n.text == "&" || n.text == "&&" || n.text == "::")
+            if n.kind == .identifier || nextIsPointer {
                 // Might be a declaration `Type name`. Check two-ahead.
                 // Accept as declaration if after the type identifier we see another identifier (the var name)
                 // possibly with a '=' ',' ';' '[' or '(' following the name.
@@ -870,7 +872,25 @@ public final class CParser {
             // skip leading * & (pointer declarators), and function-pointer parens.
             while isOp("*") || isOp("&") || isOp("&&") { advance() }
             if isPunct("(") {
-                // possible function pointer `(*fp)(...)` — consume balanced.
+                // Function-pointer declarator `(*name)(...)`: capture the name so
+                // calls through the pointer (`name(arg)`) and its initializer are
+                // tracked as ordinary variables rather than discarded.
+                if let fp = parseFunctionPointerName() {
+                    var fpSuffix = ""
+                    while isPunct("[") || isPunct("(") {
+                        if isPunct("[") { fpSuffix += skipSquareBalancedText() }
+                        else { _ = skipRoundBalanced() }
+                    }
+                    var fpInit: CExpr? = nil
+                    if match("=") { fpInit = parseAssignment() }
+                    let fpType = typeParts.joined(separator: " ") + fpSuffix
+                    decls.append(CDecl(kind: .variable(typeName: fpType, name: fp.name, initExpr: fpInit),
+                                       offset: fp.offset))
+                    parsedAny = true
+                    if !match(",") { break }
+                    continue
+                }
+                // Other parenthesized declarators (e.g. `int (*)[3]`) — consume balanced.
                 _ = skipRoundBalanced()
                 continue
             }
@@ -916,6 +936,22 @@ public final class CParser {
             if !match(",") { break }
         }
         return parsedAny
+    }
+
+    /// Recognizes a `(*name)` / `(**name)` / `(* name)` function-pointer
+    /// declarator at the cursor, returning the name and leaving the cursor just
+    /// past the closing `)`. Returns nil (with the cursor unchanged) otherwise.
+    private func parseFunctionPointerName() -> (name: String, offset: Int)? {
+        let save = pos
+        guard match("(") else { return nil }
+        var stars = 0
+        while isOp("*") { advance(); stars += 1 }
+        guard stars >= 1, current.kind == .identifier else { restore(save); return nil }
+        let name = current.text
+        let offset = current.offset
+        advance()
+        guard match(")") else { restore(save); return nil }
+        return (name, offset)
     }
 
     private func skipSquareBalanced() {
