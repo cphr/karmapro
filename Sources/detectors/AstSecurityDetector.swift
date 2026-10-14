@@ -386,6 +386,14 @@ struct AstSecurityDetector {
             // pointer-dispatched): conservatively treat every parameter as input.
             for p in fn.params where p.name != nil { tainted.insert(p.name!) }
         }
+        // A parameter this function itself fills with attacker data (a
+        // write-through source like `recv(fd, buf, ...)`) is tainted from the
+        // point of the write onward regardless of what any caller passes, so it
+        // must stay seeded even when every call site looked clean.
+        let writeThroughIdxs = (writeThroughParam[name] ?? []).union(globalWriteThroughParam[name] ?? [])
+        for idx in writeThroughIdxs where idx < fn.params.count {
+            if let pname = fn.params[idx].name { tainted.insert(pname) }
+        }
 
         // PHP superglobals arrive in the AST as bare identifiers (`_GET`, `_POST`,
         // etc., the `$` being a tokenizer artifact). Seed them as tainted sources so
@@ -916,7 +924,17 @@ struct AstSecurityDetector {
         // C/C++, Java, C#: C-family sinks plus language-specific tables. The
         // C-sink table (lowercase C * functions) does not apply to the script
         // languages.
-        checkCSinks(name: name, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable, calleeIsMember: isMemberCall(callee))
+        // Parameters proven fixed by every visible call site: not seeded as
+        // tainted, and not filled by a write-through source inside this
+        // function. A format argument naming one of these is caller-fixed.
+        var constantParams = Set<String>()
+        if let seeds = paramTaintSeeds[function], let def = astFns[function] {
+            let wt = (writeThroughParam[function] ?? []).union(globalWriteThroughParam[function] ?? [])
+            for (idx, p) in def.params.enumerated() {
+                if let pn = p.name, !seeds.contains(idx), !wt.contains(idx) { constantParams.insert(pn) }
+            }
+        }
+        checkCSinks(name: name, args: args, offset: offset, function: function, constantParams: constantParams, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable, calleeIsMember: isMemberCall(callee))
         if isJava {
             checkJavaSinks(name: name, qualified: qualified, args: args, offset: offset, function: function, tainted: tainted, crossTainted: crossTainted, guarded: guarded, sizeBounded: sizeBounded, findings: &findings, reachable: reachable)
         }

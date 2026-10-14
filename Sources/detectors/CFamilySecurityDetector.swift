@@ -65,7 +65,7 @@ extension AstSecurityDetector {
 
     /// C-family sink evaluation. Also shared by the Java/C# paths (their
     /// detector files layer the language-specific tables on top of this one).
-    func checkCSinks(name: String, args: [CExpr], offset: Int, function: String, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool, calleeIsMember: Bool) {
+    func checkCSinks(name: String, args: [CExpr], offset: Int, function: String, constantParams: Set<String>, tainted: Set<String>, crossTainted: Set<String>, guarded: Set<String>, sizeBounded: Set<String>, findings: inout [AstFinding], reachable: Bool, calleeIsMember: Bool) {
 
         guard let rule = Self.cSinks[name] else { return }
         // C/C++/ObjC: a bare-name free-function sink reached through a member
@@ -128,6 +128,12 @@ extension AstSecurityDetector {
                 // literals, an object-like macro expanding to a string literal,
                 // or a project-wide global `const char*` constant — a constant
                 // format string in all three cases.
+            } else if case .identifier(let fmtVar, _) = args[fmt],
+                      constantParams.contains(fmtVar) {
+                // The format argument is this function's own parameter, and
+                // every visible call site passes a value that is not attacker
+                // controlled (the parameter is not among the tainted call-site
+                // seeds) — the format is fixed by the callers.
             } else {
                 emit(&findings, function, offset, rule, message: "Non-constant \(name) format string.", taint: nil, reachable: reachable, crossFile: false)
                 return

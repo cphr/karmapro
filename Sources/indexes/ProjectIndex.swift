@@ -12,6 +12,9 @@ struct FileAnalysis {
     /// Per-file parameter-taint seeds: which parameters of each function are
     /// tainted at some call site in this file (cross-file parameter provenance).
     let paramTaintSeeds: [String: Set<Int>]
+    /// File-local parameter-taint seeds for internal-linkage (`static`) callees,
+    /// which can only be called from within this file.
+    let fileLocalParamTaintSeeds: [String: Set<Int>]
     /// JS helpers that always escape (sanitizerReturning) or host-validate
     /// (validatedReturning) their argument before returning.
     let jsSanitizerReturning: Set<String>
@@ -35,6 +38,7 @@ struct FileAnalysis {
     init(url: URL, taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
          astFns: [String: CFunctionDef], callees: [String: [String]],
          phpSanitizers: Set<String>, paramTaintSeeds: [String: Set<Int>],
+         fileLocalParamTaintSeeds: [String: Set<Int>] = [:],
          jsSanitizerReturning: Set<String> = [], jsValidatedReturning: Set<String> = [],
          paramWrites: VulnerabilityScanner.ParamSummaries = [:],
          javaTaintedFields: Set<String> = [],
@@ -47,6 +51,7 @@ struct FileAnalysis {
         self.callees = callees
         self.phpSanitizers = phpSanitizers
         self.paramTaintSeeds = paramTaintSeeds
+        self.fileLocalParamTaintSeeds = fileLocalParamTaintSeeds
         self.jsSanitizerReturning = jsSanitizerReturning
         self.jsValidatedReturning = jsValidatedReturning
         self.paramWrites = paramWrites
@@ -1248,6 +1253,8 @@ walk(fn.body)
             }
             var taintRet = cAnalysis.taintReturning
             var wt = cAnalysis.writeThroughParam
+            let seeds = cAnalysis.paramTaintSeeds
+            let fileLocalSeeds = cAnalysis.fileLocalParamTaintSeeds
             var ast = cAnalyzer.astFunctions
             if isObjC {
                 let objcAnalyzer = ObjCAnalyzer(source: source)
@@ -1274,7 +1281,8 @@ walk(fn.body)
             return FileAnalysis(url: url, taintReturning: taintRet,
                                 writeThroughParam: wt, astFns: ast, callees: calleesMap,
                                 phpSanitizers: [],
-                                paramTaintSeeds: [:],
+                                paramTaintSeeds: seeds,
+                                fileLocalParamTaintSeeds: fileLocalSeeds,
                                 paramWrites: paramWrites)
         }
 
@@ -1589,6 +1597,29 @@ return FileAnalysis(url: url, taintReturning: swiftAnalysis.taintReturning,
             }
         }
         return merged
+    }
+
+    /// Project-wide parameter-taint seeds for `url`, combining the global
+    /// (external-linkage) union with this file's own internal-linkage seeds.
+    /// A `static` function is only callable from within its own translation
+    /// unit, so its seed must come solely from this file (or, when absent, stay
+    /// unset to seed every parameter) — never from a same-named external symbol
+    /// in another file.
+    func paramTaintSeeds(for url: URL) -> [String: Set<Int>] {
+        var merged = globalParamTaintSeeds
+        guard let fa = fileAnalysis(for: url) else { return merged }
+        let staticNames = Set(fa.astFns.compactMap { $0.value.qualifiers.contains("static") ? $0.key : nil })
+        for n in staticNames { merged.removeValue(forKey: n) }
+        for (fn, idxs) in fa.fileLocalParamTaintSeeds { merged[fn] = idxs }
+        return merged
+    }
+
+    private func fileAnalysis(for url: URL) -> FileAnalysis? {
+        if let fa = fileAnalyses[url] { return fa }
+        if let fa = fileAnalyses[url.standardizedFileURL] { return fa }
+        let name = url.lastPathComponent
+        for (u, fa) in fileAnalyses where u.lastPathComponent == name { return fa }
+        return nil
     }
 
     // MARK: - Helpers

@@ -21,6 +21,18 @@ public struct CAnalysis {
     /// analysis that prevents false positives for functions whose parameters are
     /// only ever passed sanitized values.
     public let paramTaintSeeds: [String: Set<Int>]
+    /// Per-file parameter-taint seeds for internal-linkage (`static`) callees.
+    /// A static function is only callable inside its own translation unit, so
+    /// its seeds must not be merged with a same-named helper in another file.
+    public let fileLocalParamTaintSeeds: [String: Set<Int>]
+
+    public init(taintReturning: Set<String>, writeThroughParam: [String: Set<Int>],
+                paramTaintSeeds: [String: Set<Int>], fileLocalParamTaintSeeds: [String: Set<Int>] = [:]) {
+        self.taintReturning = taintReturning
+        self.writeThroughParam = writeThroughParam
+        self.paramTaintSeeds = paramTaintSeeds
+        self.fileLocalParamTaintSeeds = fileLocalParamTaintSeeds
+    }
 }
 
 /// Functions that return attacker-controlled data from the environment, network,
@@ -110,7 +122,9 @@ public struct CAnalyzer {
     public func analyze() -> CAnalysis {
         let returning = computeTaintReturning()
         let writeThrough = computeWriteThrough(taintReturning: returning)
-        return CAnalysis(taintReturning: returning, writeThroughParam: writeThrough, paramTaintSeeds: [:])
+        let (seeds, fileLocal) = computeParamTaintSeeds(taintReturning: returning)
+        return CAnalysis(taintReturning: returning, writeThroughParam: writeThrough,
+                         paramTaintSeeds: seeds, fileLocalParamTaintSeeds: fileLocal)
     }
 
     /// The parsed AST for each defined function (preferring the first body-bearing
@@ -146,38 +160,180 @@ public struct CAnalyzer {
     private func functionReturnsTaint(_ fn: CFunctionDef, taintReturning: Set<String>) -> Bool {
         let params = Set(fn.params.compactMap { $0.name })
         let seedFns = sourceAPIs.union(taintReturning)
-        return stmtReturnsTaint(fn.body, params: params, seedFns: seedFns)
+        var state = params
+        var returned = false
+        walkTaint(fn.body, state: &state, seedFns: seedFns, onReturn: { expr, st in
+            if let expr, exprReferencesTaint(expr, params: st, seedFns: seedFns) { returned = true }
+        })
+        return returned
     }
 
-    private func stmtReturnsTaint(_ stmt: CStmt, params: Set<String>, seedFns: Set<String>) -> Bool {
+    /// Parameters of every defined function that are tainted at a call site the
+    /// file can see, keyed by callee. Split by linkage: seeds for internal
+    /// (`static`) callees are file-local (their only callers are in this file),
+    /// while seeds for external-linkage callees are unioned project-wide, since
+    /// a same-named external symbol is the same function everywhere.
+    private func computeParamTaintSeeds(taintReturning: Set<String>) -> ([String: Set<Int>], [String: Set<Int>]) {
+        let seedFns = sourceAPIs.union(taintReturning)
+        var global: [String: Set<Int>] = [:]
+        var local: [String: Set<Int>] = [:]
+        for fn in astFns.values {
+            let params = Set(fn.params.compactMap { $0.name })
+            var state = params
+            walkTaint(fn.body, state: &state, seedFns: seedFns, onCall: { callee, taintedArgs in
+                if self.astFns[callee]?.qualifiers.contains("static") == true {
+                    local[callee, default: Set<Int>()].formUnion(taintedArgs)
+                } else {
+                    global[callee, default: Set<Int>()].formUnion(taintedArgs)
+                }
+            })
+        }
+        return (global, local)
+    }
+
+    /// Ordered intra-procedural taint walk with strong updates: a plain
+    /// assignment from a clean expression clears a variable's taint (so a helper
+    /// that overwrites an incoming pointer with a constant stops being
+    /// taint-returning). Branches and loops merge conservatively.
+    private func walkTaint(_ stmt: CStmt, state: inout Set<String>, seedFns: Set<String>,
+                           onCall: ((String, Set<Int>) -> Void)? = nil,
+                           onReturn: ((CExpr?, Set<String>) -> Void)? = nil) {
         switch stmt {
         case .block(let arr):
-            for s in arr where stmtReturnsTaint(s, params: params, seedFns: seedFns) { return true }
+            for s in arr { walkTaint(s, state: &state, seedFns: seedFns, onCall: onCall, onReturn: onReturn) }
         case .expr(let e):
-            return exprReferencesTaint(e, params: params, seedFns: seedFns)
+            walkTaintExpr(e, state: &state, seedFns: seedFns, onCall: onCall)
         case .declaration(let d):
-            if case .variable(_, _, let ie?) = d.kind {
-                return exprReferencesTaint(ie, params: params, seedFns: seedFns)
+            if case .variable(_, let name, let ie?) = d.kind {
+                let t = exprReferencesTaint(ie, params: state, seedFns: seedFns)
+                walkTaintExpr(ie, state: &state, seedFns: seedFns, onCall: onCall)
+                if t { state.insert(name) } else { state.remove(name) }
             }
-        case .ifStmt(_, let t, let e, _):
-            return stmtReturnsTaint(t, params: params, seedFns: seedFns)
-                || (e.map { stmtReturnsTaint($0, params: params, seedFns: seedFns) } ?? false)
-        case .whileStmt(_, let b, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
-        case .doWhileStmt(let b, _, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
-        case .forStmt(_, _, _, let b, _):
-            return stmtReturnsTaint(b, params: params, seedFns: seedFns)
-        case .switchStmt(_, let cases, _):
-            for c in cases where c.body.contains(where: { stmtReturnsTaint($0, params: params, seedFns: seedFns) }) { return true }
+        case .ifStmt(let cond, let thenB, let elseB, _):
+            walkTaintExpr(cond, state: &state, seedFns: seedFns, onCall: onCall)
+            var t = state
+            walkTaint(thenB, state: &t, seedFns: seedFns, onCall: onCall, onReturn: onReturn)
+            var e = state
+            if let elseB { walkTaint(elseB, state: &e, seedFns: seedFns, onCall: onCall, onReturn: onReturn) }
+            state.formUnion(t); state.formUnion(e)
+        case .whileStmt(let cond, let body, _):
+            walkTaintExpr(cond, state: &state, seedFns: seedFns, onCall: onCall)
+            var b = state
+            walkTaint(body, state: &b, seedFns: seedFns, onCall: onCall, onReturn: onReturn)
+            state.formUnion(b)
+        case .doWhileStmt(let body, let cond, _):
+            walkTaint(body, state: &state, seedFns: seedFns, onCall: onCall, onReturn: onReturn)
+            walkTaintExpr(cond, state: &state, seedFns: seedFns, onCall: onCall)
+        case .forStmt(let initS, let cond, let incr, let body, _):
+            if let initS { walkTaint(initS, state: &state, seedFns: seedFns, onCall: onCall, onReturn: onReturn) }
+            if let cond { walkTaintExpr(cond, state: &state, seedFns: seedFns, onCall: onCall) }
+            if let incr { walkTaintExpr(incr, state: &state, seedFns: seedFns, onCall: onCall) }
+            var b = state
+            walkTaint(body, state: &b, seedFns: seedFns, onCall: onCall, onReturn: onReturn)
+            state.formUnion(b)
         case .returnStmt(let e, _):
-            if let e = e { return exprReferencesTaint(e, params: params, seedFns: seedFns) }
+            if let e { walkTaintExpr(e, state: &state, seedFns: seedFns, onCall: onCall) }
+            onReturn?(e, state)
+        case .switchStmt(let subj, let cases, _):
+            walkTaintExpr(subj, state: &state, seedFns: seedFns, onCall: onCall)
+            var merged = state
+            for c in cases {
+                var cs = state
+                for s in c.body { walkTaint(s, state: &cs, seedFns: seedFns, onCall: onCall, onReturn: onReturn) }
+                merged.formUnion(cs)
+            }
+            state = merged
         case .labeledStmt(_, let s, _):
-            return stmtReturnsTaint(s, params: params, seedFns: seedFns)
+            walkTaint(s, state: &state, seedFns: seedFns, onCall: onCall, onReturn: onReturn)
+        case .breakStmt, .continueStmt, .gotoStmt, .empty:
+            break
+        }
+    }
+
+    private func walkTaintExpr(_ e: CExpr, state: inout Set<String>, seedFns: Set<String>,
+                               onCall: ((String, Set<Int>) -> Void)? = nil) {
+        switch e {
+        case .assign(let op, let lhs, let rhs, _):
+            let t = exprReferencesTaint(rhs, params: state, seedFns: seedFns)
+            walkTaintExpr(rhs, state: &state, seedFns: seedFns, onCall: onCall)
+            walkTaintExpr(lhs, state: &state, seedFns: seedFns, onCall: onCall)
+            if let name = simpleIdentifier(lhs) {
+                if op == "=" {
+                    if t { state.insert(name) } else { state.remove(name) }
+                } else if t || state.contains(name) {
+                    state.insert(name)
+                }
+            }
+        case .call(let callee, let args, _):
+            if let cn = cExprTrailingName(callee) {
+                if let onCall {
+                    var idxs = Set<Int>()
+                    for (i, a) in args.enumerated() where exprReferencesTaint(a, params: state, seedFns: seedFns) {
+                        idxs.insert(i)
+                    }
+                    onCall(cn, idxs)
+                }
+                if writeThroughSinks.contains(cn) {
+                    for i in writeThroughBufferIndices(cn, args.count) where i < args.count {
+                        if let bn = baseIdentifier(args[i]) { state.insert(bn) }
+                    }
+                }
+            }
+            walkTaintExpr(callee, state: &state, seedFns: seedFns, onCall: onCall)
+            for a in args { walkTaintExpr(a, state: &state, seedFns: seedFns, onCall: onCall) }
+        case .binary(_, let l, let r, _), .comma(let l, let r, _):
+            walkTaintExpr(l, state: &state, seedFns: seedFns, onCall: onCall)
+            walkTaintExpr(r, state: &state, seedFns: seedFns, onCall: onCall)
+        case .unary(_, let o, _), .cast(let o, _), .paren(let o, _):
+            walkTaintExpr(o, state: &state, seedFns: seedFns, onCall: onCall)
+        case .member(let b, _, _, _):
+            walkTaintExpr(b, state: &state, seedFns: seedFns, onCall: onCall)
+        case .index(let b, let idx, _):
+            walkTaintExpr(b, state: &state, seedFns: seedFns, onCall: onCall)
+            walkTaintExpr(idx, state: &state, seedFns: seedFns, onCall: onCall)
+        case .ternary(let c, let t, let f, _):
+            walkTaintExpr(c, state: &state, seedFns: seedFns, onCall: onCall)
+            walkTaintExpr(t, state: &state, seedFns: seedFns, onCall: onCall)
+            walkTaintExpr(f, state: &state, seedFns: seedFns, onCall: onCall)
+        case .sizeOf(let x, _, _):
+            if let x { walkTaintExpr(x, state: &state, seedFns: seedFns, onCall: onCall) }
+        case .arrayInit(let els, _):
+            for el in els { walkTaintExpr(el, state: &state, seedFns: seedFns, onCall: onCall) }
+        case .newExpr(_, let args, _):
+            for a in args { walkTaintExpr(a, state: &state, seedFns: seedFns, onCall: onCall) }
         default:
             break
         }
-        return false
+    }
+
+    /// Buffer positions a write-through source fills with attacker data.
+    private func writeThroughBufferIndices(_ name: String, _ argCount: Int) -> [Int] {
+        switch name {
+        case "fgets", "gets":
+            return argCount > 0 ? [0] : []
+        case "read", "recv", "recvfrom", "fread":
+            return argCount > 1 ? [1] : []
+        case "scanf":
+            return argCount > 1 ? Array(1..<argCount) : []
+        case "fscanf", "sscanf":
+            return argCount > 2 ? Array(2..<argCount) : []
+        default:
+            return []
+        }
+    }
+
+    /// The named storage an lvalue ultimately refers to (`*p`, `arr[i]`,
+    /// `data + off` and `s.field` all resolve to their base identifier).
+    private func baseIdentifier(_ e: CExpr) -> String? {
+        switch e {
+        case .identifier(let n, _): return n
+        case .paren(let x, _), .cast(let x, _): return baseIdentifier(x)
+        case .member(let b, _, _, _): return baseIdentifier(b)
+        case .index(let b, _, _): return baseIdentifier(b)
+        case .unary(_, let o, _): return baseIdentifier(o)
+        case .binary(_, let l, _, _): return baseIdentifier(l)
+        default: return nil
+        }
     }
 
     private func exprReferencesTaint(_ e: CExpr, params: Set<String>, seedFns: Set<String>) -> Bool {
@@ -287,7 +443,7 @@ public struct CAnalyzer {
         case .call(let callee, let args, _):
             if case .identifier(let cname, _) = callee, writeThroughSinks.contains(cname) {
                 // The param is a buffer the sink writes into (first buffer arg).
-                if args.contains(where: { simpleIdentifier($0) == paramName }) {
+                if args.contains(where: { baseIdentifier($0) == paramName }) {
                     // Only consider true writes: the sink writes from an external/taint source.
                     return true
                 }
