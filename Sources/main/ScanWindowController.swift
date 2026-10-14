@@ -26,11 +26,19 @@ final class ScanWindowController: NSWindowController {
     /// Verdict per finding key (path#line): true = valid, false = invalid.
     private var triageVerdicts: [String: Bool] = [:]
     private var triageRows: [ScanFinding] = []
+    /// Index of the next finding to dispatch (not the number completed).
     private var triageIndex = 0
+    /// Findings whose request has finished (success or failure), for progress.
+    private var triageChecked = 0
+    /// Requests currently in flight; triage keeps up to `maxConcurrentTriage`.
+    private var triageInFlight = 0
     private var triageFailed = 0
     private var triageRunning = false
     private var triageCancelled = false
     private var triageColumn: NSTableColumn?
+
+    /// Number of triage requests kept in flight at once.
+    private static let maxConcurrentTriage = 3
 
     private var findings: [ScanFinding] = [] {
         // Export is available exactly when the table has rows to export, so
@@ -609,6 +617,8 @@ final class ScanWindowController: NSWindowController {
         triageRunning = true
         triageCancelled = false
         triageIndex = 0
+        triageChecked = 0
+        triageInFlight = 0
         triageFailed = 0
         triageVerdicts.removeAll()
         refreshAutoTriageButton()
@@ -624,43 +634,50 @@ final class ScanWindowController: NSWindowController {
 
     private func triageNext() {
         guard triageRunning, !triageCancelled else { return }
-        guard triageIndex < triageRows.count else {
-            finishAutoTriage()
-            return
-        }
-        let f = triageRows[triageIndex]
         let model = OpenRouterClient.shared.selectedModel
-        OpenRouterClient.shared.sendChat(
-            systemPrompt: Self.triageSystemPrompt,
-            userPrompt: Self.triagePrompt(for: f),
-            model: model) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self, self.triageRunning else { return }
-                switch result {
-                case .success(let text):
-                    if let verdict = Self.parseTriageVerdict(text) {
-                        self.triageVerdicts[self.ignoredKey(for: f)] = verdict
-                    } else {
+        // Keep several requests in flight; each completion re-enters here to
+        // either dispatch the next finding or finish once the queue drains.
+        while triageInFlight < Self.maxConcurrentTriage && triageIndex < triageRows.count {
+            let f = triageRows[triageIndex]
+            triageIndex += 1
+            triageInFlight += 1
+            OpenRouterClient.shared.sendChat(
+                systemPrompt: Self.triageSystemPrompt,
+                userPrompt: Self.triagePrompt(for: f),
+                model: model) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self = self, self.triageRunning else { return }
+                    self.triageInFlight -= 1
+                    self.triageChecked += 1
+                    switch result {
+                    case .success(let text):
+                        if let verdict = Self.parseTriageVerdict(text) {
+                            self.triageVerdicts[self.ignoredKey(for: f)] = verdict
+                        } else {
+                            self.triageFailed += 1
+                        }
+                    case .failure:
                         self.triageFailed += 1
                     }
-                case .failure:
-                    self.triageFailed += 1
+                    self.progressBar.doubleValue = Double(self.triageChecked) / Double(self.triageRows.count)
+                    self.statusLabel.stringValue = "Triage: \(self.triageChecked)/\(self.triageRows.count) checked…"
+                    self.tableView.reloadData()
+                    self.triageNext()
                 }
-                self.triageIndex += 1
-                self.progressBar.doubleValue = Double(self.triageIndex) / Double(self.triageRows.count)
-                self.statusLabel.stringValue = "Triage: \(self.triageIndex)/\(self.triageRows.count) checked…"
-                self.tableView.reloadData()
-                self.triageNext()
             }
+        }
+        if triageInFlight == 0 && triageIndex >= triageRows.count {
+            finishAutoTriage()
         }
     }
 
     private func finishAutoTriage() {
         let wasCancelled = triageCancelled
         let total = triageRows.count
-        let checked = triageIndex
+        let checked = triageChecked
         triageRunning = false
         triageCancelled = false
+        triageInFlight = 0
         refreshAutoTriageButton()
         rescanButton.isEnabled = true
         progressBar.doubleValue = 1

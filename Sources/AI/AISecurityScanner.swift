@@ -69,11 +69,41 @@ final class AISecurityScanner {
     }
 
     /// Reference-type box for mutable state so it can be captured by the
-    /// escaping per-batch completion closures.
+    /// escaping per-batch completion closures. Batches run concurrently, so
+    /// every access is guarded by a lock.
     private final class BatchState {
-        var findings: [ScanFinding] = []
-        var errors: [String] = []
-        var processedCards = 0
+        private let lock = NSLock()
+        private var storedFindings: [ScanFinding] = []
+        private var storedErrors: [String] = []
+        private var storedProcessedCards = 0
+
+        var findings: [ScanFinding] {
+            lock.lock(); defer { lock.unlock() }
+            return storedFindings
+        }
+
+        var errors: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return storedErrors
+        }
+
+        var processedCards: Int {
+            lock.lock(); defer { lock.unlock() }
+            return storedProcessedCards
+        }
+
+        func addFindings(_ items: [ScanFinding]) {
+            guard !items.isEmpty else { return }
+            lock.lock(); storedFindings.append(contentsOf: items); lock.unlock()
+        }
+
+        func addError(_ message: String) {
+            lock.lock(); storedErrors.append(message); lock.unlock()
+        }
+
+        func completedBatch(_ count: Int) {
+            lock.lock(); storedProcessedCards += count; lock.unlock()
+        }
     }
 
     /// Accumulates a single batch's findings across continuation requests.
@@ -84,6 +114,11 @@ final class AISecurityScanner {
     /// When a model stops mid-answer we push a "continue" prompt (keeping the
     /// conversation history) up to this many times before giving up on a batch.
     private static let maxContinuations = 2
+
+    /// Number of batch requests kept in flight at once. Batches are independent
+    /// (each carries its own cards and prompt), so several can be answered
+    /// concurrently to cut wall-clock time on large projects.
+    private static let maxConcurrentBatches = 3
 
     /// Categories the model may choose from. Mirrors the labels the built-in
     /// scanner produces so the Category column stays consistent; anything else
@@ -192,101 +227,184 @@ final class AISecurityScanner {
                                    cancelled: cancelled))
         }
 
-        processBatches(index: 0,
-                       batches: batches,
-                       cardRanges: cardRanges,
-                       model: model,
-                       provider: provider,
-                       state: state,
-                       progress: progress,
-                       isCancelled: isCancelled,
-                       onPhase: onPhase,
-                       finish: finish)
+        let scheduler = BatchScheduler(batches: batches,
+                                       cardRanges: cardRanges,
+                                       model: model,
+                                       provider: provider,
+                                       state: state,
+                                       totalCards: totalCards,
+                                       progress: progress,
+                                       isCancelled: isCancelled,
+                                       onPhase: onPhase,
+                                       finish: finish,
+                                       maxConcurrent: Self.maxConcurrentBatches)
+        scheduler.start()
     }
 
-    // MARK: - Sequential batch runner
+    // MARK: - Concurrent batch runner
 
-    private static func processBatches(index: Int,
-                                       batches: [[Card]],
-                                       cardRanges: [CardRange],
-                                       model: String,
-                                       provider: String,
-                                       state: BatchState,
-                                       progress: @escaping (Double) -> Void,
-                                       isCancelled: @escaping () -> Bool,
-                                       onPhase: @escaping (AIReviewPhase) -> Void,
-                                       finish: @escaping (Bool) -> Void) {
-        if isCancelled() {
-            OpenRouterClient.shared.cancelActiveStream()
-            finish(true)
-            return
+    /// Runs the independent batch requests with a bounded number of concurrent
+    /// in-flight calls, dispatching the next batch as soon as one finishes. All
+    /// coordination happens on a private serial queue, so the shared
+    /// `BatchState` and the launch cursor need no additional locking.
+    private final class BatchScheduler {
+        private let batches: [[Card]]
+        private let cardRanges: [CardRange]
+        private let model: String
+        private let provider: String
+        private let state: BatchState
+        private let totalCards: Int
+        private let progress: (Double) -> Void
+        private let isCancelled: () -> Bool
+        private let onPhase: (AIReviewPhase) -> Void
+        private let finish: (Bool) -> Void
+        private let maxConcurrent: Int
+
+        private let queue = DispatchQueue(label: "app.karmapro.ai.security-scan")
+        private var nextIndex = 0
+        private var inFlight = 0
+        private var finished = false
+        private var sawCancellation = false
+        private var requestedCancellation = false
+
+        init(batches: [[Card]], cardRanges: [CardRange], model: String, provider: String,
+             state: BatchState, totalCards: Int, progress: @escaping (Double) -> Void,
+             isCancelled: @escaping () -> Bool, onPhase: @escaping (AIReviewPhase) -> Void,
+             finish: @escaping (Bool) -> Void, maxConcurrent: Int) {
+            self.batches = batches
+            self.cardRanges = cardRanges
+            self.model = model
+            self.provider = provider
+            self.state = state
+            self.totalCards = totalCards
+            self.progress = progress
+            self.isCancelled = isCancelled
+            self.onPhase = onPhase
+            self.finish = finish
+            self.maxConcurrent = max(1, min(maxConcurrent, max(batches.count, 1)))
         }
-        guard index < batches.count else {
+
+        func start() {
+            queue.async { self.pump() }
+        }
+
+        /// Fills free slots with new batches and finalises once every batch has
+        /// completed. Runs only on `queue`.
+        private func pump() {
+            guard !finished else { return }
+            if isCancelled() { sawCancellation = true }
+            if sawCancellation {
+                abortIfNeeded()
+                // Stop launching and finish once the running requests drain.
+                guard inFlight == 0 else { return }
+                finished = true
+                finish(true)
+                return
+            }
+            while inFlight < maxConcurrent && nextIndex < batches.count {
+                let index = nextIndex
+                nextIndex += 1
+                inFlight += 1
+                runBatch(index)
+            }
+            guard inFlight == 0, nextIndex >= batches.count else { return }
+            finished = true
             finish(false)
-            return
-        }
-        let batch = batches[index]
-        let totalCards = batches.reduce(0) { $0 + $1.count }
-
-        // Honour the on-disk cache first so unchanged code is not billed twice.
-        if let cached = loadCachedFindings(for: batch, provider: provider, model: model) {
-            appendValidated(findings: &state.findings, from: cached, batch: batch, cardRanges: cardRanges)
-            state.processedCards += batch.count
-            progress(Double(state.processedCards) / Double(totalCards))
-            processBatches(index: index + 1, batches: batches, cardRanges: cardRanges,
-                           model: model, provider: provider, state: state,
-                           progress: progress, isCancelled: isCancelled, onPhase: onPhase, finish: finish)
-            return
         }
 
-        let batchText = batch.map { card in
-            let end = card.startLine + cardLineCount(card) - 1
-            return "### FILE: \(card.relativePath) (absolute lines \(card.startLine)-\(end))\n\(card.numberedText)"
-        }.joined(separator: "\n\n")
+        /// Cancels the requests still running once, so a Stop aborts them
+        /// immediately instead of waiting for them to finish.
+        private func abortIfNeeded() {
+            guard !requestedCancellation else { return }
+            requestedCancellation = true
+            OpenRouterClient.shared.cancelActiveStream()
+        }
 
-        // Rough token estimate for the reply, used to map streamed character
-        // deltas onto intra-batch progress so the bar moves as the model types.
-        let expectedOutputChars = max(600, batchText.count / 3)
-        let collector = BatchCollector()
-        let batchLabel = "Batch \(index + 1)/\(batches.count)"
+        /// Called once a batch — including any continuation requests — has fully
+        /// completed. The accounting is done inline, but the next pump is hopped
+        /// onto `queue` so a cache-hit batch (which completes synchronously
+        /// inside the launch loop) can never re-enter `pump`.
+        private func batchFinished() {
+            inFlight -= 1
+            if isCancelled() { sawCancellation = true }
+            queue.async { self.pump() }
+        }
 
-        requestBatch(messages: [["role": "system", "content": Self.systemPrompt],
-                                ["role": "user", "content": batchText]],
-                     batch: batch,
-                     cardRanges: cardRanges,
-                     model: model,
-                     provider: provider,
-                     state: state,
-                     totalCards: totalCards,
-                     expectedOutputChars: expectedOutputChars,
-                     collector: collector,
-                     progress: progress,
-                     isCancelled: isCancelled,
-                     onPhase: onPhase,
-                     continuation: 0,
-                     batchLabel: batchLabel,
-                     onDone: {
-            // Resolve every finding to its real card BEFORE caching: the cache
-            // must remember which file a finding belongs to, because absolute
-            // line numbers alone match every file's first chunk (all files
-            // start at line 1) and would re-attribute cached findings to the
-            // wrong file on the next scan.
-            let resolved = collector.valid.compactMap {
-                resolveValidated($0, batch: batch, cardRanges: cardRanges)
+        /// Queues an error message from a background callback so it is recorded
+        /// on `queue`, in order, before the run finalises.
+        private func recordError(_ message: String) {
+            queue.async { self.state.addError(message) }
+        }
+
+        private func runBatch(_ index: Int) {
+            let batch = batches[index]
+
+            // Honour the on-disk cache first so unchanged code is not billed twice.
+            if let cached = AISecurityScanner.loadCachedFindings(for: batch, provider: provider, model: model) {
+                var collected: [ScanFinding] = []
+                AISecurityScanner.appendValidated(findings: &collected, from: cached,
+                                                  batch: batch, cardRanges: cardRanges)
+                state.addFindings(collected)
+                state.completedBatch(batch.count)
+                progress(Double(state.processedCards) / Double(totalCards))
+                batchFinished()
+                return
             }
-            if !resolved.isEmpty {
-                storeCachedFindings(resolved, for: batch, provider: provider, model: model)
-                appendValidated(findings: &state.findings, from: resolved,
-                                batch: batch, cardRanges: cardRanges)
-            }
-            state.processedCards += batch.count
-            progress(Double(state.processedCards) / Double(totalCards))
-            processBatches(index: index + 1, batches: batches, cardRanges: cardRanges,
-                           model: model, provider: provider, state: state,
-                           progress: progress, isCancelled: isCancelled, onPhase: onPhase, finish: finish)
-        }, onCancel: {
-            finish(true)
-        })
+
+            let batchText = batch.map { card in
+                let end = card.startLine + AISecurityScanner.cardLineCount(card) - 1
+                return "### FILE: \(card.relativePath) (absolute lines \(card.startLine)-\(end))\n\(card.numberedText)"
+            }.joined(separator: "\n\n")
+
+            // Rough token estimate for the reply, used to map streamed character
+            // deltas onto intra-batch progress so the bar moves as the model types.
+            let expectedOutputChars = max(600, batchText.count / 3)
+            let collector = BatchCollector()
+            let batchLabel = "Batch \(index + 1)/\(batches.count)"
+
+            AISecurityScanner.requestBatch(
+                messages: [["role": "system", "content": AISecurityScanner.systemPrompt],
+                           ["role": "user", "content": batchText]],
+                batch: batch,
+                cardRanges: cardRanges,
+                model: model,
+                provider: provider,
+                state: state,
+                totalCards: totalCards,
+                expectedOutputChars: expectedOutputChars,
+                collector: collector,
+                progress: progress,
+                isCancelled: isCancelled,
+                onPhase: onPhase,
+                recordError: { message in self.recordError(message) },
+                continuation: 0,
+                batchLabel: batchLabel,
+                onDone: {
+                    self.queue.async {
+                        // Resolve every finding to its real card BEFORE caching:
+                        // absolute line numbers alone match every file's first
+                        // chunk, so the resolved path is what keeps cached
+                        // findings attributed to the right file next time.
+                        let resolved = collector.valid.compactMap {
+                            AISecurityScanner.resolveValidated($0, batch: batch, cardRanges: self.cardRanges)
+                        }
+                        if !resolved.isEmpty {
+                            AISecurityScanner.storeCachedFindings(resolved, for: batch,
+                                                                  provider: self.provider, model: self.model)
+                            var collected: [ScanFinding] = []
+                            AISecurityScanner.appendValidated(findings: &collected, from: resolved,
+                                                              batch: batch, cardRanges: self.cardRanges)
+                            self.state.addFindings(collected)
+                        }
+                        self.state.completedBatch(batch.count)
+                        self.progress(Double(self.state.processedCards) / Double(self.totalCards))
+                        self.batchFinished()
+                    }
+                },
+                onCancel: {
+                    self.queue.async { self.batchFinished() }
+                })
+        }
     }
 
     /// Sends one batch via the streaming endpoint. `onPart` maps each content
@@ -305,6 +423,7 @@ final class AISecurityScanner {
                                      progress: @escaping (Double) -> Void,
                                      isCancelled: @escaping () -> Bool,
                                      onPhase: @escaping (AIReviewPhase) -> Void,
+                                     recordError: @escaping (String) -> Void,
                                      continuation: Int,
                                      batchLabel: String,
                                      onDone: @escaping () -> Void,
@@ -346,7 +465,7 @@ final class AISecurityScanner {
             completion: { result in
                 switch result {
                 case .failure(let error):
-                    state.errors.append(Self.classifyFailure(error, batchLabel: batchLabel))
+                    recordError(Self.classifyFailure(error, batchLabel: batchLabel))
                     onDone()
                 case .success(let stream):
                     let content = stream.content
@@ -354,7 +473,7 @@ final class AISecurityScanner {
                     collector.valid.append(contentsOf: parsed.valid)
                     if !parsed.invalid.isEmpty {
                         let dropped = parsed.invalid.map { "\($0.file): \($0.error)" }
-                        state.errors.append("\(batchLabel): dropped \(dropped.count) invalid AI finding(s): \(dropped.prefix(3).joined(separator: ", "))")
+                        recordError("\(batchLabel): dropped \(dropped.count) invalid AI finding(s): \(dropped.prefix(3).joined(separator: ", "))")
                     }
                     if quickLooksComplete(content) {
                         onDone()
@@ -374,12 +493,13 @@ final class AISecurityScanner {
                                      progress: progress,
                                      isCancelled: isCancelled,
                                      onPhase: onPhase,
+                                     recordError: recordError,
                                      continuation: continuation + 1,
                                      batchLabel: batchLabel,
                                      onDone: onDone,
                                      onCancel: onCancel)
                     } else {
-                        state.errors.append("\(batchLabel) stayed incomplete after \(Self.maxContinuations) continuation(s); keeping the partial results.")
+                        recordError("\(batchLabel) stayed incomplete after \(Self.maxContinuations) continuation(s); keeping the partial results.")
                         onDone()
                     }
                 }

@@ -401,13 +401,47 @@ final class OpenRouterClient {
         return true
     }
 
-    private var activeStream: OpenRouterStreamDelegate?
+    /// In-flight streaming requests, keyed by a per-request token so several can
+    /// run concurrently (the AI scanner issues three at a time) without one
+    /// request's completion clearing another's slot.
+    private var activeStreams: [UUID: OpenRouterStreamDelegate] = [:]
     /// Non-streaming requests (`sendChat` fallback) are plain `URLSession`
     /// tasks with no delegate; they are tracked here so Stop can cancel them.
-    private var activeChatTask: URLSessionDataTask?
+    private var activeChatTasks: [UUID: URLSessionDataTask] = [:]
+    /// Guards the two dictionaries above: requests are started from the main
+    /// thread but completed from background URLSession callbacks.
+    private let activeRequestLock = NSLock()
 
     /// True while any request (streaming or fallback) is in flight.
-    var hasActiveRequest: Bool { activeStream != nil || activeChatTask != nil }
+    var hasActiveRequest: Bool {
+        activeRequestLock.lock()
+        defer { activeRequestLock.unlock() }
+        return !activeStreams.isEmpty || !activeChatTasks.isEmpty
+    }
+
+    private func registerStream(_ key: UUID, _ delegate: OpenRouterStreamDelegate) {
+        activeRequestLock.lock()
+        activeStreams[key] = delegate
+        activeRequestLock.unlock()
+    }
+
+    private func unregisterStream(_ key: UUID) {
+        activeRequestLock.lock()
+        activeStreams.removeValue(forKey: key)
+        activeRequestLock.unlock()
+    }
+
+    private func registerChatTask(_ key: UUID, _ task: URLSessionDataTask) {
+        activeRequestLock.lock()
+        activeChatTasks[key] = task
+        activeRequestLock.unlock()
+    }
+
+    private func unregisterChatTask(_ key: UUID) {
+        activeRequestLock.lock()
+        activeChatTasks.removeValue(forKey: key)
+        activeRequestLock.unlock()
+    }
 
     /// Applies the endpoint-appropriate auth/identity headers: OpenRouter
     /// requires the bearer key plus its attribution headers, local servers
@@ -469,13 +503,14 @@ final class OpenRouterClient {
         // The delegate MUST be attached here — a plain
         // `URLSession(configuration:)` has no delegate and its callbacks are
         // never delivered (the root cause of responses never appearing).
+        let key = UUID()
         let delegate = OpenRouterStreamDelegate(onPart: onPart) { [weak self] result in
-            self?.activeStream = nil
+            self?.unregisterStream(key)
             completion(result)
         }
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         delegate.session = session
-        activeStream = delegate
+        registerStream(key, delegate)
         let task = session.dataTask(with: request)
         delegate.task = task
         task.resume()
@@ -497,8 +532,12 @@ final class OpenRouterClient {
     /// Cancels an in-flight response — the streaming delegate and the
     /// non-streaming fallback task alike (e.g. Stop button, window close).
     func cancelActiveStream() {
-        activeStream?.cancel()
-        activeChatTask?.cancel()
+        activeRequestLock.lock()
+        let streams = Array(activeStreams.values)
+        let tasks = Array(activeChatTasks.values)
+        activeRequestLock.unlock()
+        for stream in streams { stream.cancel() }
+        for task in tasks { task.cancel() }
     }
 
     /// Sends a (non-streaming) chat completion request and returns the
@@ -538,8 +577,9 @@ final class OpenRouterClient {
             return
         }
 
+        let key = UUID()
         let task = URLSession.shared.dataTask(with: request) { data, _, error in
-            self.activeChatTask = nil
+            self.unregisterChatTask(key)
             if let error = error {
                 completion(.failure(error))
                 return
@@ -561,7 +601,7 @@ final class OpenRouterClient {
             let raw = String(data: data, encoding: .utf8) ?? "(unreadable response)"
             completion(.failure(AIError("Unexpected response from the AI endpoint: \(String(raw.prefix(400)))")))
         }
-        activeChatTask = task
+        registerChatTask(key, task)
         task.resume()
     }
 
