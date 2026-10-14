@@ -149,15 +149,6 @@ public struct SolidityAnalyzer {
         Self.computeReturning(astFns: astFns, seed: soliditySourceAPIs)
     }
 
-    /// Functions whose return value derives from block-level entropy
-    /// (`block.timestamp`/`block.number`/...). Distinct from `taintReturning`
-    /// (which also covers msg.data): this is the predictable-randomness source
-    /// set, consulted cross-file so a helper returning `block.timestamp` marks a
-    /// caller's keccak seed as predictable.
-    public static func entropyReturning(astFns: [String: CFunctionDef]) -> Set<String> {
-        computeReturning(astFns: astFns, seed: solidityEntropyAPIs)
-    }
-
     private static func computeReturning(astFns: [String: CFunctionDef], seed: Set<String>) -> Set<String> {
         var returning = Set<String>()
         for _ in 0..<6 {

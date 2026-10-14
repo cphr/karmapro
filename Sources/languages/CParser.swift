@@ -1284,6 +1284,7 @@ public final class CParser {
             _ = match("}")
             args.append(.arrayInit(elements: elems, off))
         }
+        if arrayForm { typeName += "[]" }
         return .newExpr(typeName: typeName, args: args, off)
     }
 

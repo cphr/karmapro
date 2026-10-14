@@ -55,12 +55,9 @@ struct AstSecurityDetector {
     private let isPHP: Bool
     let isSolidity: Bool
     let solidityPre08: Bool
+    let solidityPre05: Bool
     private let isKernel: Bool
     private let taintReturning: Set<String>
-    /// Functions (unqualified names) whose return value derives from block-level
-    /// entropy (`block.timestamp`/`block.number`/...). A cross-file helper in
-    /// this set makes a caller's `keccak256` seed predictable.
-    let entropyReturning: Set<String>
     private let crossFileSources: Set<String>
     /// Java field names that stay tainted across methods: bare names seeded for
     /// same-class flow, plus `Class.field` qualified names for cross-file flow.
@@ -104,6 +101,19 @@ struct AstSecurityDetector {
         for key in astFns.keys {
             names.insert(key)
             if let last = key.split(separator: ":").last { names.insert(String(last)) }
+        }
+        return names
+    }
+    /// Contract/interface/library names declared in this file. On a pre-0.5
+    /// compiler a real constructor is just a function named after its contract,
+    /// so this set separates the deploy-time initializer from a same-shaped
+    /// function that anyone may call.
+    var solidityContainerNames: Set<String> {
+        var names = Set<String>()
+        let re = try! NSRegularExpression(pattern: "(?:abstract\\s+contract|contract|interface|library)\\s+([A-Za-z_][A-Za-z0-9_]*)")
+        let ns = source as NSString
+        for m in re.matches(in: source, options: [], range: NSRange(location: 0, length: ns.length)) {
+            names.insert(ns.substring(with: m.range(at: 1)))
         }
         return names
     }
@@ -155,9 +165,9 @@ struct AstSecurityDetector {
                 isPHP: Bool = false,
                 isSolidity: Bool = false,
                 solidityPre08: Bool = false,
+                solidityPre05: Bool = false,
                 isKernel: Bool = false,
                 taintReturning: Set<String>,
-                entropyReturning: Set<String> = [],
                 crossFileSources: Set<String>,
                 fieldSeeds: Set<String> = [],
                 fieldSeedsByMethod: [String: Set<String>] = [:],
@@ -187,9 +197,9 @@ struct AstSecurityDetector {
         self.isPHP = isPHP
         self.isSolidity = isSolidity
         self.solidityPre08 = solidityPre08
+        self.solidityPre05 = solidityPre05
         self.isKernel = isKernel
         self.taintReturning = taintReturning
-        self.entropyReturning = entropyReturning
         self.crossFileSources = crossFileSources
         self.fieldSeeds = fieldSeeds
         self.fieldSeedsByMethod = fieldSeedsByMethod
