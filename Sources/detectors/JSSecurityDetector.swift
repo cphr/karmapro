@@ -138,6 +138,35 @@ struct JSSecurityDetector {
          "date", "error", "map", "set", "weakmap", "weakset", "symbol", "bigint",
          "promise", "reflect", "math", "window", "global", "globalthis", "self"]
 
+    /// Filesystem entry points whose first (path) argument, when not a
+    /// compile-time literal, is resolved from computed or request-derived input.
+    private static let fsPathSinks: Set<String> = [
+        "readFile", "readFileSync", "writeFile", "writeFileSync", "appendFile",
+        "appendFileSync", "open", "openSync", "readdir", "readdirSync", "stat",
+        "statSync", "lstat", "lstatSync", "unlink", "unlinkSync", "mkdir",
+        "mkdirSync", "rmdir", "rmdirSync", "rename", "renameSync", "copyFile",
+        "copyFileSync", "access", "accessSync", "createReadStream",
+        "createWriteStream", "watch", "watchFile", "realpath", "realpathSync",
+        "truncate", "truncateSync", "chmod", "chmodSync", "chown", "chownSync",
+        "link", "linkSync", "symlink", "symlinkSync", "readlink", "readlinkSync",
+        "exists", "existsSync", "rm", "rmSync", "utimes", "utimesSync",
+    ]
+
+    /// Identifier/member names that surface attacker-controlled request data.
+    private static let requestSurfaceNames: Set<String> =
+        ["req", "res", "request", "response", "query", "body", "params", "param",
+         "cookies", "headers", "searchparams", "argv", "input", "data", "user",
+         "url", "pathname", "qs", "payload"]
+
+    /// Credential-shaped operand names used by the constant-time comparison rule.
+    private static let secretNamePattern =
+        "(?i)(password|passwd|pwd|secret|token|apikey|api[_-]?key|access[_-]?key|private[_-]?key|hmac|signature|credential)"
+
+    /// Matches a quantified group that is itself quantified — the classic
+    /// catastrophic-backtracking shape (`(a+)+`, `(\\w*)*`).
+    private static let nestedQuantifierPattern =
+        "\\([^()]{0,60}[+*][^()]{0,60}\\)\\s*[+*{]"
+
     init(source: String, defs: [JSDef], tokens: [CAstToken]? = nil,
          reachableNames: Set<String> = [],
          taintReturning: Set<String> = [],
@@ -565,6 +594,21 @@ struct JSSecurityDetector {
                                         message: "Division by '\(r.dottedName.isEmpty ? "unchecked expression" : r.dottedName)' without a zero check produces Infinity/NaN.",
                                         taint: nil))
             }
+            // Walk 3: an attacker-provided value compared against a stored
+            // credential with a short-circuiting operator leaks length/prefix.
+            if ["==", "===", "!=", "!=="].contains(op) {
+                func comparable(_ x: JSExpr) -> Bool {
+                    switch x { case .ident, .member: return true; default: return false }
+                }
+                if (looksSensitive(l) && comparable(r) && rv.tainted)
+                    || (looksSensitive(r) && comparable(l) && lv.tainted) {
+                    findings.append(finding(def: def, offset: e.offset,
+                                            category: "Timing Attack",
+                                            severity: .low, reachable: isReachable(def),
+                                            message: "Credential-shaped value compared with '\(op)'; the short-circuiting comparison leaks length or prefix through timing.",
+                                            taint: nil))
+                }
+            }
             return lv.union(rv)
 
         case .assign(let op, let lhs, let rhs, _):
@@ -575,6 +619,17 @@ struct JSSecurityDetector {
             }
             if case .ident(let n, _) = lhs {
                 ctx.vars[n] = val
+            }
+            // Object injection: an attacker-chosen computed key writes outside
+            // the intended own-property set (prototype or foreign object state).
+            if case .index(_, let idx, let io) = lhs, !isLiteralValue(idx) {
+                let idxVal = evalExpr(idx, ctx: ctx, def: def, into: &findings)
+                if idxVal.tainted {
+                    findings.append(finding(def: def, offset: io, category: "Prototype Pollution",
+                                            severity: .high, reachable: isReachable(def),
+                                            message: "Untrusted value used as a property key on write; an attacker-chosen key can overwrite inherited or out-of-scope state.",
+                                            taint: "\(taintPath(idxVal) ?? "?") → \(assignmentTargetText(lhs))"))
+                }
             }
             applyAssignmentRules(target: lhs, value: rhs, valueTaint: rhsVal,
                                  ctx: ctx, def: def, into: &findings)
@@ -685,6 +740,41 @@ struct JSSecurityDetector {
                                     severity: .critical, reachable: reachable,
                                     message: "eval() executes arbitrary code; a tainted argument enables RCE.",
                                     taint: taintPath(argVals.first) ?? "eval()"))
+        case "RegExp":
+            if let first = args.first {
+                if argVals.first?.tainted == true {
+                    findings.append(finding(def: def, offset: offset, category: "Unsafe Regular Expression",
+                                            severity: .high, reachable: reachable,
+                                            message: "Regular expression compiled from untrusted input; a crafted pattern can mis-match or backtrack catastrophically.",
+                                            taint: "\(taintPath(argVals.first) ?? "?") → RegExp"))
+                } else if case .literal(let text, _) = first {
+                    if hasNestedQuantifier(text) {
+                        findings.append(finding(def: def, offset: offset, category: "Unsafe Regular Expression",
+                                                severity: .medium, reachable: reachable,
+                                                message: "Regular expression with nested quantifiers can backtrack catastrophically on crafted input (ReDoS).",
+                                                taint: nil))
+                    }
+                } else if !isLiteralValue(first) {
+                    findings.append(finding(def: def, offset: offset, category: "Unsafe Regular Expression",
+                                            severity: .medium, reachable: reachable,
+                                            message: "Regular expression compiled from a non-literal pattern; validate or escape the source.",
+                                            taint: nil))
+                }
+            }
+        case "require":
+            if let first = args.first, !isLiteralValue(first) {
+                findings.append(finding(def: def, offset: offset, category: "Untrusted Module Load",
+                                        severity: .high, reachable: reachable,
+                                        message: "require() called with a non-literal path; an attacker-influenced value can load arbitrary modules.",
+                                        taint: taintPath(argVals.first).map { "\($0) → require" }))
+            }
+        case "Buffer" where isNew:
+            if let first = args.first, argVals.first?.tainted == true || !isLiteralValue(first) {
+                findings.append(finding(def: def, offset: offset, category: "Unsafe Buffer Allocation",
+                                        severity: .medium, reachable: reachable,
+                                        message: "new Buffer() built from a non-literal size/value; deprecated constructor can expose uninitialized or attacker-sized memory.",
+                                        taint: taintPath(argVals.first).map { "\($0) → new Buffer" }))
+            }
         case "Function" where isNew:
             findings.append(finding(def: def, offset: offset, category: "Function Constructor Injection",
                                     severity: .critical, reachable: reachable,
@@ -755,26 +845,50 @@ struct JSSecurityDetector {
                 }
             }
         case "exec", "execSync":
-            if isNodeSinkCall, argVals.first?.tainted == true {
-                findings.append(finding(def: def, offset: offset, category: "Command Injection",
-                                        severity: .critical, reachable: reachable,
-                                        message: "child_process.\(leaf) runs a shell; tainted input enables RCE.",
-                                        taint: taintPath(argVals.first) ?? "child_process.\(leaf)"))
+            // A non-literal command string is shell-interpreted even without a
+            // traced flow, so a computed command is flagged at lower severity.
+            if isNodeSinkCall, let first = args.first {
+                if argVals.first?.tainted == true {
+                    findings.append(finding(def: def, offset: offset, category: "Command Injection",
+                                            severity: .critical, reachable: reachable,
+                                            message: "child_process.\(leaf) runs a shell; tainted input enables RCE.",
+                                            taint: taintPath(argVals.first) ?? "child_process.\(leaf)"))
+                } else if !isLiteralValue(first), attackerInfluenced(first) {
+                    findings.append(finding(def: def, offset: offset, category: "Command Injection",
+                                            severity: .medium, reachable: reachable,
+                                            message: "child_process.\(leaf) runs a shell command built from a non-literal value.",
+                                            taint: nil))
+                }
             }
         case "spawn", "spawnSync", "execFile", "execFileSync":
-            if isNodeSinkCall, argVals.first?.tainted == true {
-                findings.append(finding(def: def, offset: offset, category: "Command Injection",
-                                        severity: .high, reachable: reachable,
-                                        message: "Tainted argument to child_process.\(leaf).",
-                                        taint: "\(taintPath(argVals.first) ?? "?") → child_process.\(leaf)"))
+            if isNodeSinkCall, let first = args.first {
+                if argVals.first?.tainted == true {
+                    findings.append(finding(def: def, offset: offset, category: "Command Injection",
+                                            severity: .high, reachable: reachable,
+                                            message: "Tainted argument to child_process.\(leaf).",
+                                            taint: "\(taintPath(argVals.first) ?? "?") → child_process.\(leaf)"))
+                } else if !isLiteralValue(first), attackerInfluenced(first) {
+                    findings.append(finding(def: def, offset: offset, category: "Command Injection",
+                                            severity: .medium, reachable: reachable,
+                                            message: "child_process.\(leaf) launches a program named by a non-literal value.",
+                                            taint: nil))
+                }
             }
-        case "readFile", "readFileSync", "unlink", "unlinkSync", "createReadStream",
-             "createWriteStream", "writeFile", "writeFileSync", "access", "stat":
-            if isNodeSinkCall, argVals.first?.tainted == true {
-                findings.append(finding(def: def, offset: offset, category: "Path Traversal",
-                                        severity: .high, reachable: reachable,
-                                        message: "Tainted path in fs.\(leaf) allows arbitrary file access.",
-                                        taint: "\(taintPath(argVals.first) ?? "?") → fs.\(leaf)"))
+        case let l where Self.fsPathSinks.contains(l):
+            // Request-derived path = arbitrary file access; a merely non-literal
+            // path is resolved from computed input rather than a fixed literal.
+            if isNodeSinkCall, let first = args.first {
+                if argVals.first?.tainted == true {
+                    findings.append(finding(def: def, offset: offset, category: "Path Traversal",
+                                            severity: .high, reachable: reachable,
+                                            message: "Tainted path in fs.\(leaf) allows arbitrary file access.",
+                                            taint: "\(taintPath(argVals.first) ?? "?") → fs.\(leaf)"))
+                } else if !isLiteralValue(first) {
+                    findings.append(finding(def: def, offset: offset, category: "Path Traversal",
+                                            severity: .medium, reachable: reachable,
+                                            message: "fs.\(leaf) path is built from a non-literal value; attacker-influenced input can escape the intended directory.",
+                                            taint: nil))
+                }
             }
         case "fetch":
             // Sink = global Fetch API: a bare `fetch` not bound to a local
@@ -1384,6 +1498,68 @@ struct JSSecurityDetector {
         }
     }
 
+    /// True when the expression is a compile-time literal, i.e. a value fixed
+    /// in source rather than derived from a variable, call or template.
+    private func isLiteralValue(_ e: JSExpr) -> Bool {
+        if case .literal = e { return true }
+        return false
+    }
+
+    /// True when the expression names a credential-shaped value.
+    private func looksSensitive(_ e: JSExpr) -> Bool {
+        let dotted = e.dottedName
+        let text = dotted.isEmpty ? sourceText(from: e) : dotted
+        guard !text.isEmpty, let re = try? NSRegularExpression(pattern: Self.secretNamePattern) else { return false }
+        let ns = text as NSString
+        return re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
+    }
+
+    /// True when the expression reaches into a request/attacker surface
+    /// (`req.body`, `query`, `argv`, …), distinguishing real attacker input from
+    /// a plain function-parameter seed that taint tracking assigns by policy.
+    private func attackerInfluenced(_ e: JSExpr) -> Bool {
+        var hit = false
+        func walk(_ x: JSExpr) {
+            if hit { return }
+            switch x {
+            case .ident(let n, _):
+                if Self.requestSurfaceNames.contains(n.lowercased()) { hit = true }
+            case .member(let b, let m, _):
+                if Self.requestSurfaceNames.contains(m.lowercased()) { hit = true }
+                walk(b)
+            case .index(let b, let i, _):
+                walk(b); walk(i)
+            case .call(let c, let a, _), .new(let c, let a, _):
+                walk(c)
+                for arg in a { walk(arg) }
+            case .binary(_, let l, let r, _), .assign(_, let l, let r, _):
+                walk(l); walk(r)
+            case .arrayLit(let els, _):
+                for el in els { walk(el) }
+            case .template:
+                for interp in x.templateExprs() { walk(interp) }
+            default:
+                break
+            }
+        }
+        walk(e)
+        return hit
+    }
+
+    /// True when a regex body (literal `/…/flags` or quoted source) contains a
+    /// quantified group that is itself quantified.
+    private func hasNestedQuantifier(_ raw: String) -> Bool {
+        var body = raw
+        if body.hasPrefix("/"), let end = body.lastIndex(of: "/"), end > body.startIndex {
+            body = String(body[body.index(after: body.startIndex)..<end])
+        } else if body.hasPrefix("\"") || body.hasPrefix("'") {
+            body = String(body.dropFirst().dropLast())
+        }
+        guard let re = try? NSRegularExpression(pattern: Self.nestedQuantifierPattern) else { return false }
+        let ns = body as NSString
+        return re.firstMatch(in: body, range: NSRange(location: 0, length: ns.length)) != nil
+    }
+
     private func bodyTokens(of def: JSDef) -> [CAstToken] {
         let lo = def.bodyRange.location
         let hi = lo + def.bodyRange.length
@@ -1617,6 +1793,21 @@ struct JSSecurityDetector {
         if lower.contains("multer(") && !lower.contains("limits") && !lower.contains("filefilter") {
             add(0, "Unsafe File Upload", .medium,
                 "Multer upload without size limits or file filter.")
+        }
+        // Catastrophic-backtracking regex literals: a regex literal in a value
+        // context whose quantified group is itself quantified (`/(a+)+$/`).
+        if let litRe = try? NSRegularExpression(pattern: "(?:=|[\\(,\\[:]|\\breturn\\s+)\\s*(/[^/\\n]+/[a-z]*)"),
+           let innerRe = try? NSRegularExpression(pattern: Self.nestedQuantifierPattern) {
+            let textNS = ns as NSString
+            for m in litRe.matches(in: source, range: NSRange(location: 0, length: textNS.length)) {
+                let lit = textNS.substring(with: m.range(at: 1))
+                let body = lit.hasPrefix("/") ? String(lit.dropFirst()) : lit
+                let bns = body as NSString
+                if innerRe.firstMatch(in: body, range: NSRange(location: 0, length: bns.length)) != nil {
+                    add(m.range(at: 1).location, "Unsafe Regular Expression", .medium,
+                        "Regular expression with nested quantifiers can backtrack catastrophically on crafted input (ReDoS).")
+                }
+            }
         }
         return findings
     }

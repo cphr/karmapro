@@ -391,8 +391,11 @@ public final class JSParser {
             }
 
             // Named function declaration: [async] function [*] name ( ... ) { }
+            // Anonymous function expressions carry no name, so
+            // `parseFunctionDecl` declines them. Without a second pass their
+            // bodies never become defs and sinks inside them stay invisible.
             if t.text == "function" {
-                if let def = parseFunctionDecl(from: i) {
+                if let def = parseFunctionDecl(from: i) ?? parseCallbackFunction(from: i) {
                     record(def)
                     i = bodyOpenTokenIndex(of: def) ?? (i + 1)
                     continue
@@ -644,6 +647,33 @@ public final class JSParser {
                      isAsync: isAsync,
                      isGenerator: isGenerator,
                      startOffset: startOffset,
+                     params: params,
+                     bodyOpenOffset: tokens[k].offset,
+                     bodyEndOffset: tokens[closeBrace].offset + tokens[closeBrace].text.count - 1,
+                     hasBraceBody: true)
+    }
+
+    /// Anonymous `function [*] ( … ) { … }` used as a value, e.g.
+    /// `http.createServer(function (req, res) { … })`. Reuses the callback
+    /// naming of arrow callbacks; dedup by name+startOffset is already handled
+    /// in `record(_:)`.
+    private func parseCallbackFunction(from fi: Int) -> JSDef? {
+        var i = fi + 1
+        var isGenerator = false
+        if i < tokens.count, tokens[i].text == "*" { isGenerator = true; i += 1 }
+        if i < tokens.count, tokens[i].kind == .identifier { i += 1 } // optional inner name
+        guard i < tokens.count, tokens[i].text == "(",
+              let (params, closeIdx) = parseParamList(openIndex: i) else { return nil }
+        guard let k = bodyMarkerIndex(after: closeIdx), tokens[k].text == "{",
+              let closeBrace = matchingBrace(openIndex: k) else { return nil }
+        let isAsync = fi > 0 && isAsyncToken(at: fi - 1)
+        let name = callbackName(before: fi - 1) ?? "callback"
+        return JSDef(name: name,
+                     nameOffset: tokens[fi].offset,
+                     kind: .function,
+                     isAsync: isAsync,
+                     isGenerator: isGenerator,
+                     startOffset: isAsync ? tokens[fi - 1].offset : tokens[fi].offset,
                      params: params,
                      bodyOpenOffset: tokens[k].offset,
                      bodyEndOffset: tokens[closeBrace].offset + tokens[closeBrace].text.count - 1,
