@@ -19,10 +19,8 @@ public struct JSAnalyzer {
         let eof = allTokens.last
         var map: [String: CFunctionDef] = [:]
         for d in defs {
-            var slices = allTokens.filter {
-                $0.offset >= d.bodyRange.location &&
-                $0.offset < d.bodyRange.location + d.bodyRange.length
-            }
+            var slices = allTokens.tokens(from: d.bodyRange.location,
+                                          to: d.bodyRange.location + d.bodyRange.length)
             // Expression-bodied arrows have no braces: wrap in synthetic braces
             // so `CParser.parseBlockFromCurrent` (which requires a `{`) works.
             if !d.hasBraceBody {
@@ -118,51 +116,48 @@ public struct JSAnalyzer {
         return false
     }
 
+    // Worklist rather than recursion: a long left-nested expression (e.g. a
+    // chain of `||`) would otherwise recurse once per node and overflow.
     private func exprReferencesTaint(_ e: CExpr, params: Set<String>, seedFns: Set<String>) -> Bool {
-        switch e {
-        case .identifier(let n, _):
-            return params.contains(n)
-        case .call(let callee, let args, _):
-            // A `.replace(...)` / `.replaceAll(...)` call is a transformation
-            // step (e.g. `String(value).replace(/[\u0000-\u001f]/g, …)` escaping
-            // control characters): its OUTPUT is a derived, sanitized value, so
-            // the raw taint of the input does not flow through the return.
-            if case .member(_, let m, _, _) = callee, ["replace", "replaceAll"].contains(m) {
-                return false
+        var stack: [CExpr] = [e]
+        while let cur = stack.popLast() {
+            switch cur {
+            case .identifier(let n, _):
+                if params.contains(n) { return true }
+            case .call(let callee, let args, _):
+                // `.replace(...)`/`.replaceAll(...)` yields a transformed
+                // (sanitized) value, so raw taint does not flow through.
+                if case .member(_, let m, _, _) = callee, ["replace", "replaceAll"].contains(m) { continue }
+                if cExprCalleeIsSeed(callee, seedFns) { return true }
+                stack.append(callee)
+                stack.append(contentsOf: args)
+            case .member(let b, _, _, _):
+                stack.append(b)
+            case .index(let b, let idx, _):
+                stack.append(b); stack.append(idx)
+            case .unary(_, let o, _):
+                stack.append(o)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _):
+                stack.append(l); stack.append(r)
+            case .assign(_, let l, let r, _):
+                stack.append(l); stack.append(r)
+            case .ternary(let c, let t, let f, _):
+                stack.append(c); stack.append(t); stack.append(f)
+            case .cast(let x, _):
+                stack.append(x)
+            case .sizeOf(let x, _, _):
+                if let x = x { stack.append(x) }
+            case .paren(let x, _):
+                stack.append(x)
+            case .arrayInit(let arr, _):
+                stack.append(contentsOf: arr)
+            case .newExpr(_, let args, _):
+                stack.append(contentsOf: args)
+            default:
+                break
             }
-            if cExprCalleeIsSeed(callee, seedFns) { return true }
-            if exprReferencesTaint(callee, params: params, seedFns: seedFns) { return true }
-            return args.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
-        case .member(let b, _, _, _):
-            return exprReferencesTaint(b, params: params, seedFns: seedFns)
-        case .index(let b, let idx, _):
-            return exprReferencesTaint(b, params: params, seedFns: seedFns)
-                || exprReferencesTaint(idx, params: params, seedFns: seedFns)
-        case .unary(_, let o, _):
-            return exprReferencesTaint(o, params: params, seedFns: seedFns)
-        case .binary(_, let l, let r, _), .comma(let l, let r, _):
-            return exprReferencesTaint(l, params: params, seedFns: seedFns)
-                || exprReferencesTaint(r, params: params, seedFns: seedFns)
-        case .assign(_, let l, let r, _):
-            return exprReferencesTaint(l, params: params, seedFns: seedFns)
-                || exprReferencesTaint(r, params: params, seedFns: seedFns)
-        case .ternary(let c, let t, let f, _):
-            return exprReferencesTaint(c, params: params, seedFns: seedFns)
-                || exprReferencesTaint(t, params: params, seedFns: seedFns)
-                || exprReferencesTaint(f, params: params, seedFns: seedFns)
-        case .cast(let x, _):
-            return exprReferencesTaint(x, params: params, seedFns: seedFns)
-        case .sizeOf(let x, _, _):
-            return x.map { exprReferencesTaint($0, params: params, seedFns: seedFns) } ?? false
-        case .paren(let x, _):
-            return exprReferencesTaint(x, params: params, seedFns: seedFns)
-        case .arrayInit(let arr, _):
-            return arr.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
-        case .newExpr(_, let args, _):
-            return args.contains { exprReferencesTaint($0, params: params, seedFns: seedFns) }
-        default:
-            return false
         }
+        return false
     }
 
     // MARK: - Write-through parameters

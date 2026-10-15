@@ -1387,7 +1387,7 @@ struct JSSecurityDetector {
     private func bodyTokens(of def: JSDef) -> [CAstToken] {
         let lo = def.bodyRange.location
         let hi = lo + def.bodyRange.length
-        return tokens.filter { $0.offset >= lo && $0.offset < hi && $0.kind != .eof }
+        return tokens.tokens(from: lo, to: hi).filter { $0.kind != .eof }
     }
 
     private func bodyContainsMutation(of name: String, body: [JSStmt]) -> Bool {
@@ -1641,7 +1641,8 @@ func classifyJsReturningWrappers(defs: [JSDef], tokens: [CAstToken]) -> (sanitiz
     var validated = Set<String>()
     for def in defs {
         let flat = tokens
-            .filter { $0.offset >= def.bodyRange.location && $0.offset < def.bodyRange.location + def.bodyRange.length && $0.kind != .eof }
+            .tokens(from: def.bodyRange.location, to: def.bodyRange.location + def.bodyRange.length)
+            .filter { $0.kind != .eof }
             .map { $0.text }
             .joined(separator: " ")
             .replacingOccurrences(of: " ", with: "")

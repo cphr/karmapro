@@ -1478,7 +1478,7 @@ walk(fn.body)
             for d in jsDefs {
                 let lo = d.bodyRange.location
                 let hi = lo + d.bodyRange.length
-                let bodyTokens = jsTokens.filter { $0.offset >= lo && $0.offset < hi && $0.kind != .eof }
+                let bodyTokens = jsTokens.tokens(from: lo, to: hi).filter { $0.kind != .eof }
                 var calls = Set<String>()
                 var i = 1
                 while i < bodyTokens.count {

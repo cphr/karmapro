@@ -50,6 +50,18 @@ public struct CAstToken {
     }
 }
 
+extension Array where Element == CAstToken {
+    /// Tokens with offset in `[lo, hi)`; two binary searches (offsets ascend).
+    public func tokens(from lo: Int, to hi: Int) -> [CAstToken] {
+        var l = 0, r = count
+        while l < r { let m = (l + r) / 2; if self[m].offset < lo { l = m + 1 } else { r = m } }
+        let start = l
+        var h = l, hr = count
+        while h < hr { let m = (h + hr) / 2; if self[m].offset < hi { h = m + 1 } else { hr = m } }
+        return Array(self[start..<h])
+    }
+}
+
 /// The set of C/C++ operators we keep as single tokens.
 public let cMultiCharOperators: Set<String> = [
     "->", "::", "==", "!=", ">=", "<=", "&&", "||", "++", "--",
