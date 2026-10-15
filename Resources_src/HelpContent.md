@@ -6,7 +6,7 @@ Welcome to **Karma Pro**, an advanced static analysis, machine-learning vulnerab
 ## 1. Getting Started & Project Navigation
 - **Opening Files & Workspaces**: Use **Open...** project directory onto the Karma Pro window to load it into the sidebar file tree.
 - **Language Filtering**: Karma Pro supports 14 primary languages: **C, C++, Java, C#, Go, Kotlin, Ruby, Python, PHP, Cocoa (Objective-C), Rust, Solidity, Javascript and Swift**, plus an **All Languages** option. Use the language dropdown in the toolbar to isolate files by language.
-- **File Search**: Use the built-in file search window (**Find in Files...**) to quickly query filenames and navigate across large codebases with Find in Files and search for text the currently open file.
+- **File Search**: Use the built-in file search window (**Find in Files...**) to quickly query filenames and navigate across large codebases with Find in Files and search for text within the currently open file.
 ## 2. Source Viewer, Syntax Highlighting & Code Navigation
 - **Syntax Highlighting**: Custom tokenisers and highlighters provide distinct color schemes for keywords, strings, comments, and identifiers across all supported languages.
 - **Clickable Functions**: Function names defined in source files are automatically underlined and linked. Clicking a function name jumps directly to its definition and instantly opens its call graph and dataflow in the bottom pane.
