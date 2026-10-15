@@ -469,6 +469,7 @@ struct AstSecurityDetector {
         if isJava {
             applyJavaSuppressions(fn: fn, findings: &findings)
             checkJavaNumeric(fn: fn, function: name, tainted: tainted, findings: &findings, reachable: reachable)
+            checkJavaQuality(fn: fn, function: name, tainted: tainted, findings: &findings, reachable: reachable)
         }
         if isGo {
             applyGoSuppressions(fn: fn, findings: &findings)

@@ -315,13 +315,17 @@ switch e {
     private func updateTaintFromExpr(_ e: CExpr, tainted: inout Set<String>, taintedLocals: inout Set<String>, seededParams: Set<String>, seedFns: Set<String>, taintReturning: Set<String>) {
 switch e {
             case .assign(_, let lhs, let rhs, _):
-                if simpleIdentifier(lhs) != nil {
                 if isSanitizedCall(rhs, seedFns: seedFns, taintReturning: taintReturning) {
                     // clean result
                 } else if exprTainted(rhs, tainted: tainted, seedFns: seedFns, taintReturning: taintReturning) != nil {
-                    if let n = simpleIdentifier(lhs) { tainted.insert(n); taintedLocals.insert(n) }
+                    if let n = simpleIdentifier(lhs) {
+                        tainted.insert(n); taintedLocals.insert(n)
+                    } else if case .index(let base, _, _) = lhs, let bn = simpleIdentifier(base) {
+                        // Storing tainted data into an array taints the array, so
+                        // it carries the taint when passed to another method.
+                        tainted.insert(bn); taintedLocals.insert(bn)
+                    }
                 }
-            }
             updateTaintFromExpr(lhs, tainted: &tainted, taintedLocals: &taintedLocals, seededParams: seededParams, seedFns: seedFns, taintReturning: taintReturning)
             updateTaintFromExpr(rhs, tainted: &tainted, taintedLocals: &taintedLocals, seededParams: seededParams, seedFns: seedFns, taintReturning: taintReturning)
         case .call(let callee, let args, _):

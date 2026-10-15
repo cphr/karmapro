@@ -808,6 +808,423 @@ extension AstSecurityDetector {
         }
         scanResource(fn.body, [])
     }
+
+    // MARK: - Java code-quality and null-safety checks
+
+    /// Structural quality checks (empty branches, switch defects, always-true
+    /// conditions, off-by-one bounds) plus a null-dereference pass, and a small
+    /// amount of comment-stripped source slicing for the try/catch/finally
+    /// shapes the parser flattens away.
+    func checkJavaQuality(fn: CFunctionDef, function: String, tainted: Set<String>,
+                          findings: inout [AstFinding], reachable: Bool) {
+        func emitQ(_ off: Int, _ cat: String, _ sev: ScanFinding.Severity, _ msg: String) {
+            emit(&findings, function, off, rule(cat, sev), message: msg, taint: nil, reachable: reachable, crossFile: false)
+        }
+
+        func stripParen(_ e: CExpr) -> CExpr {
+            switch e {
+            case .paren(let x, _), .cast(let x, _): return stripParen(x)
+            default: return e
+            }
+        }
+        func walkExpr(_ e: CExpr, _ visit: (CExpr) -> Void) {
+            visit(e)
+            switch e {
+            case .call(let c, let args, _): walkExpr(c, visit); for a in args { walkExpr(a, visit) }
+            case .member(let b, _, _, _): walkExpr(b, visit)
+            case .index(let b, let i, _): walkExpr(b, visit); walkExpr(i, visit)
+            case .unary(_, let x, _), .cast(let x, _), .paren(let x, _): walkExpr(x, visit)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _): walkExpr(l, visit); walkExpr(r, visit)
+            case .ternary(let c, let t, let f, _): walkExpr(c, visit); walkExpr(t, visit); walkExpr(f, visit)
+            case .assign(_, let l, let r, _): walkExpr(l, visit); walkExpr(r, visit)
+            case .arrayInit(let a, _): for x in a { walkExpr(x, visit) }
+            case .newExpr(_, let a, _): for x in a { walkExpr(x, visit) }
+            default: break
+            }
+        }
+        func walkAllStmts(_ s: CStmt, _ visit: (CStmt) -> Void) {
+            visit(s)
+            switch s {
+            case .block(let a): for x in a { walkAllStmts(x, visit) }
+            case .ifStmt(_, let t, let e, _): walkAllStmts(t, visit); if let e = e { walkAllStmts(e, visit) }
+            case .whileStmt(_, let b, _): walkAllStmts(b, visit)
+            case .doWhileStmt(let b, _, _): walkAllStmts(b, visit)
+            case .forStmt(let i, _, _, let b, _): if let i = i { walkAllStmts(i, visit) }; walkAllStmts(b, visit)
+            case .switchStmt(_, let cs, _): for c in cs { for x in c.body { walkAllStmts(x, visit) } }
+            case .labeledStmt(_, let st, _): walkAllStmts(st, visit)
+            default: break
+            }
+        }
+        func eachExpr(_ f: (CExpr) -> Void) {
+            walkAllStmts(fn.body) { s in
+                switch s {
+                case .expr(let e): walkExpr(e, f)
+                case .declaration(let d): if case .variable(_, _, let ie?) = d.kind { walkExpr(ie, f) }
+                case .ifStmt(let c, _, _, _): walkExpr(c, f)
+                case .whileStmt(let c, _, _): walkExpr(c, f)
+                case .doWhileStmt(_, let c, _): walkExpr(c, f)
+                case .forStmt(_, let c, _, _, _): if let c = c { walkExpr(c, f) }
+                case .switchStmt(let e, _, _): walkExpr(e, f)
+                case .returnStmt(let e, _): if let e = e { walkExpr(e, f) }
+                default: break
+                }
+            }
+        }
+        var localInt: [String: Int] = [:]
+        var localBool: [String: Bool] = [:]
+        func evalInt(_ e: CExpr) -> Int? {
+            switch stripParen(e) {
+            case .integerLiteral(let s, _): return Int(s)
+            case .identifier(let n, _): return localInt[n] ?? javaIntConst[n]
+            case .member(let b, let m, _, _):
+                if case .identifier(let base, _) = stripParen(b) { return javaIntConst["\(base).\(m)"] }
+                return nil
+            case .unary(let op, let x, _) where op == "-" || op == "+":
+                return evalInt(x).map { op == "-" ? -$0 : $0 }
+            case .binary(let op, let l, let r, _):
+                guard let a = evalInt(l), let b = evalInt(r) else { return nil }
+                switch op {
+                case "+": return a + b
+                case "-": return a - b
+                case "*": return a * b
+                case "/": return b != 0 ? a / b : nil
+                case "%": return b != 0 ? a % b : nil
+                default: return nil
+                }
+            default: return nil
+            }
+        }
+        func evalBool(_ e: CExpr) -> Bool? {
+            switch stripParen(e) {
+            case .booleanLiteral(let b, _): return b
+            case .identifier(let n, _): return localBool[n] ?? javaBoolConst[n]
+            case .member(let b, let m, _, _):
+                if case .identifier(let base, _) = stripParen(b) { return javaBoolConst["\(base).\(m)"] }
+                return nil
+            case .unary("!", let x, _): return evalBool(x).map { !$0 }
+            case .binary(let op, let l, let r, _):
+                guard let a = evalInt(l), let b = evalInt(r) else { return nil }
+                switch op {
+                case "==": return a == b
+                case "!=": return a != b
+                case ">": return a > b
+                case "<": return a < b
+                case ">=": return a >= b
+                case "<=": return a <= b
+                default: return nil
+                }
+            default: return nil
+            }
+        }
+        func isBoolLit(_ e: CExpr) -> Bool { if case .booleanLiteral = stripParen(e) { return true }; return false }
+        // Locals declared final/never-reassigned with a literal initializer act as
+        // compile-time constants for the structural checks below.
+        do {
+            var decls: [(String, CExpr)] = []
+            var reassigned = Set<String>()
+            walkAllStmts(fn.body) { s in
+                switch s {
+                case .declaration(let d):
+                    if case .variable(_, let n, let ie?) = d.kind { decls.append((n, ie)) }
+                case .expr(let e):
+                    if case .assign(_, let l, _, _) = e, let n = simpleIdentifier(l) { reassigned.insert(n) }
+                case .forStmt(_, _, let inc, _, _):
+                    if let inc = inc, case .assign(_, let l, _, _) = inc, let n = simpleIdentifier(l) { reassigned.insert(n) }
+                default: break
+                }
+            }
+            for (n, ie) in decls where !reassigned.contains(n) {
+                switch stripParen(ie) {
+                case .integerLiteral(let s, _): if let v = Int(s) { localInt[n] = v }
+                case .booleanLiteral(let b, _): localBool[n] = b
+                case .unary("-", let x, _):
+                    if case .integerLiteral(let s, _) = stripParen(x), let v = Int(s) { localInt[n] = -v }
+                default: break
+                }
+            }
+        }
+        func isNullLit(_ e: CExpr) -> Bool {
+            if case .identifier(let n, _) = stripParen(e), n == "null" { return true }
+            return false
+        }
+        func isLengthRef(_ e: CExpr) -> Bool {
+            switch stripParen(e) {
+            case .member(_, let m, _, _): return m == "length" || m == "size"
+            case .call(let c, _, _): return callName(c) == "length" || callName(c) == "size"
+            default: return false
+            }
+        }
+        func isEmptyBody(_ s: CStmt) -> Bool {
+            switch s { case .empty: return true; case .block(let a): return a.isEmpty; default: return false }
+        }
+        func containsCall(_ e: CExpr) -> Bool {
+            var found = false
+            walkExpr(e) { x in if case .call = stripParen(x) { found = true } }
+            return found
+        }
+        func isBreak(_ s: CStmt) -> Bool { if case .breakStmt = s { return true }; return false }
+        func isTerminating(_ s: CStmt) -> Bool {
+            switch s { case .breakStmt, .returnStmt, .continueStmt: return true; default: return false }
+        }
+        func bodyHasExit(_ s: CStmt) -> Bool {
+            var found = false
+            func walk(_ s: CStmt) {
+                if found { return }
+                switch s {
+                case .breakStmt, .returnStmt, .continueStmt: found = true
+                case .block(let a): for x in a { walk(x) }
+                case .ifStmt(_, let t, let e, _): walk(t); if let e = e { walk(e) }
+                case .whileStmt(_, let b, _): walk(b)
+                case .doWhileStmt(let b, _, _): walk(b)
+                case .forStmt(_, _, _, let b, _): walk(b)
+                case .switchStmt(_, let cs, _): for c in cs { for x in c.body { walk(x) } }
+                default: break
+                }
+            }
+            walk(s); return found
+        }
+        // A comparison whose result is itself compared to a boolean literal is
+        // the classic "compared where assigned" shape.
+        func compareOfCompare(_ e: CExpr) -> Bool {
+            if case .binary(let op, let l, let r, _) = stripParen(e), op == "==" || op == "!=" {
+                let other = isBoolLit(l) ? r : (isBoolLit(r) ? l : nil)
+                if let o = other, case .binary = stripParen(o) { return true }
+            }
+            return false
+        }
+        func isOffByOne(_ e: CExpr) -> Bool {
+            if case .binary(let op, let l, let r, _) = stripParen(e), op == "<=" {
+                return isLengthRef(r) || isLengthRef(l)
+            }
+            return false
+        }
+
+        walkAllStmts(fn.body) { s in
+            switch s {
+            case .ifStmt(let c, let t, let eb, let off):
+                if isEmptyBody(t) || (eb.map(isEmptyBody) ?? false) {
+                    emitQ(off, "Empty Code Block", .low, "Empty branch body has no effect.")
+                    if containsCall(c) {
+                        emitQ(off, "Error Condition Without Action", .low, "Result of a call is tested but no action is taken on failure.")
+                    }
+                }
+                if case .assign = stripParen(c) {
+                    emitQ(off, "Assigning Instead of Comparing", .medium, "Assignment used as a condition; a comparison was likely intended.")
+                }
+                if evalBool(c) == true {
+                    emitQ(off, "Expression Always True", .low, "Condition always evaluates to true.")
+                }
+                if compareOfCompare(c) {
+                    emitQ(off, "Comparing Instead of Assigning", .low, "Comparison result compared to a boolean literal.")
+                }
+            case .whileStmt(let c, let b, let off):
+                if isEmptyBody(b) { emitQ(off, "Empty Code Block", .low, "Empty loop body has no effect.") }
+                if case .assign = stripParen(c) {
+                    emitQ(off, "Assigning Instead of Comparing", .medium, "Assignment used as a loop condition.")
+                }
+                if evalBool(c) == true && !bodyHasExit(b) {
+                    emitQ(off, "Infinite Loop", .medium, "Loop condition is always true and the body has no exit.")
+                }
+                if isOffByOne(c) {
+                    emitQ(off, "Off-by-One Error", .medium, "Loop bound uses <= against a length/size and can overrun by one.")
+                }
+            case .doWhileStmt(let b, let c, let off):
+                if isEmptyBody(b) { emitQ(off, "Empty Code Block", .low, "Empty loop body has no effect.") }
+                if evalBool(c) == true && !bodyHasExit(b) {
+                    emitQ(off, "Infinite Loop", .medium, "Loop condition is always true and the body has no exit.")
+                }
+                if isOffByOne(c) {
+                    emitQ(off, "Off-by-One Error", .medium, "Loop bound uses <= against a length/size and can overrun by one.")
+                }
+            case .forStmt(_, let c, _, let b, let off):
+                if isEmptyBody(b) { emitQ(off, "Empty Code Block", .low, "Empty loop body has no effect.") }
+                if c == nil || (c.map { evalBool($0) == true } ?? false) {
+                    if !bodyHasExit(b) { emitQ(off, "Infinite Loop", .medium, "Loop has no terminating condition and no exit in the body.") }
+                }
+                if let c = c {
+                    if case .assign = stripParen(c) {
+                        emitQ(off, "Assigning Instead of Comparing", .medium, "Assignment used as a loop condition.")
+                    }
+                    if isOffByOne(c) {
+                        emitQ(off, "Off-by-One Error", .medium, "Loop bound uses <= against a length/size and can overrun by one.")
+                    }
+                }
+            case .switchStmt(_, let cases, let off):
+                if !cases.contains(where: { $0.isDefault }) {
+                    emitQ(off, "Missing Default Case in Switch", .low, "Switch has no default case.")
+                }
+                for (i, cs) in cases.enumerated() {
+                    if cs.body.isEmpty || (cs.body.count == 1 && isBreak(cs.body[0])) {
+                        emitQ(off, "Empty Code Block", .low, "Empty case body has no effect.")
+                        continue
+                    }
+                    if i < cases.count - 1, let last = cs.body.last, !isTerminating(last) {
+                        emitQ(off, "Omitted Break Statement in Switch", .low, "Case falls through into the next case; a break was likely intended.")
+                    }
+                }
+            case .block(let a):
+                if a.isEmpty { emitQ(s.offset, "Empty Code Block", .low, "Empty block has no effect.") }
+            case .empty:
+                emitQ(0, "Empty Code Block", .low, "Empty statement has no effect.")
+            default: break
+            }
+        }
+
+        eachExpr { e in
+            if case .call(let c, _, let off) = e, callName(c) == "printStackTrace" {
+                emitQ(off, "Information Leak Through Error Message", .low, "Stack trace written to output can leak implementation details.")
+            }
+        }
+
+        // Calling Thread.run() executes on the current thread; start() is intended.
+        // The anonymous-subclass form defeats the AST path, so this is checked
+        // against the comment-stripped source slice below.
+
+        let configSinks: Set<String> = ["setCatalog", "setSchema", "setTransactionIsolation", "setNetworkTimeout", "setReadOnly"]
+        eachExpr { e in
+            if case .call(let c, let args, let off) = e, let n = callName(c), configSinks.contains(n),
+               args.contains(where: { exprTainted($0, tainted: tainted) != nil }) {
+                emitQ(off, "External Control of Configuration Setting", .high, "Untrusted data controls a database or configuration setting.")
+            }
+        }
+
+        // Null dereference: a value explicitly set to null, or returned by an
+        // API that may return null, then dereferenced without a null check.
+        let nullableAPIs: Set<String> = ["getProperty", "getenv", "getParameter", "getParameterValues",
+            "getHeader", "getQueryString", "getPathInfo", "getServletPath", "getRequestURI", "getRequestURL",
+            "getRemoteUser", "getUserPrincipal", "getAttribute", "getInitParameter", "getResource",
+            "getResourceAsStream", "getCookies", "getSession", "readLine", "getText", "getRawValue", "getUserInput"]
+        func isNullableCall(_ e: CExpr) -> Bool {
+            if case .call(let c, _, _) = stripParen(e), let n = callName(c) { return nullableAPIs.contains(n) }
+            return false
+        }
+        var nullAssigned = Set<String>()
+        var nullableFrom = Set<String>()
+        var nullGuarded = Set<String>()
+        // Mark `x` guarded when it is the subject of a null comparison. Only a
+        // top-level condition or an operand of a short-circuit `&&` chain
+        // actually prevents the later dereference; a plain `&` evaluates both
+        // sides and does not.
+        func insertNullCheck(_ e: CExpr) -> Bool {
+            guard case .binary(let op, let l, let r, _) = stripParen(e), op == "==" || op == "!=" else { return false }
+            var hit = false
+            if isNullLit(l), let n = simpleIdentifier(stripParen(r)) { nullGuarded.insert(n); hit = true }
+            if isNullLit(r), let n = simpleIdentifier(stripParen(l)) { nullGuarded.insert(n); hit = true }
+            return hit
+        }
+        func collectNullChecks(_ e: CExpr) {
+            if insertNullCheck(e) { return }
+            if case .binary(_, let l, let r, _) = stripParen(e) {
+                collectNullChecks(l); collectNullChecks(r)
+            }
+        }
+        func noteNullGuards(_ e: CExpr, topLevel: Bool) {
+            if topLevel, insertNullCheck(e) { return }
+            if case .binary(let op, let l, let r, _) = stripParen(e) {
+                if op == "&&" { collectNullChecks(l) }
+                noteNullGuards(l, topLevel: false)
+                noteNullGuards(r, topLevel: false)
+            }
+        }
+        func collectNullFacts(_ s: CStmt) {
+            switch s {
+            case .block(let a): for x in a { collectNullFacts(x) }
+            case .declaration(let d):
+                if case .variable(_, let name, let initExpr) = d.kind, let ie = initExpr {
+                    if isNullLit(ie) { nullAssigned.insert(name) }
+                    else if isNullableCall(ie) { nullableFrom.insert(name) }
+                }
+            case .expr(.assign(_, .identifier(let name, _), let rhs, _)):
+                if isNullLit(rhs) { nullAssigned.insert(name) } else { nullAssigned.remove(name) }
+                if isNullableCall(rhs) { nullableFrom.insert(name) }
+            case .ifStmt(let c, let t, let eb, _):
+                noteNullGuards(c, topLevel: true)
+                if let v = evalBool(c) {
+                    if v { collectNullFacts(t) } else if let eb = eb { collectNullFacts(eb) }
+                } else {
+                    // Both paths can run, so a variable is null afterwards only
+                    // if every path leaves it null.
+                    let savedNull = nullAssigned, savedNB = nullableFrom
+                    collectNullFacts(t)
+                    let thenNull = nullAssigned, thenNB = nullableFrom
+                    nullAssigned = savedNull; nullableFrom = savedNB
+                    if let eb = eb { collectNullFacts(eb) }
+                    nullAssigned = thenNull.intersection(nullAssigned)
+                    nullableFrom = thenNB.union(nullableFrom)
+                }
+            case .whileStmt(let c, let b, _): noteNullGuards(c, topLevel: true); collectNullFacts(b)
+            case .doWhileStmt(let b, let c, _): collectNullFacts(b); noteNullGuards(c, topLevel: true)
+            case .forStmt(let i, let c, _, let b, _):
+                if let i = i { collectNullFacts(i) }
+                if let c = c { noteNullGuards(c, topLevel: true) }
+                collectNullFacts(b)
+            case .switchStmt(let e, let cs, _):
+                // A `switch` on a compile-time constant selects a single arm;
+                // the other arms only hold compiler-satisfying initializers.
+                if let v = evalInt(e) {
+                    let match = cs.first { c in
+                        !c.isDefault && c.values.contains { evalInt($0) == v }
+                    }
+                    if let chosen = match ?? cs.first(where: { $0.isDefault }) {
+                        for x in chosen.body { collectNullFacts(x) }
+                    }
+                } else {
+                    let savedNull = nullAssigned, savedNB = nullableFrom
+                    var mergedNull: Set<String>? = nil
+                    var unionNB = savedNB
+                    for c in cs {
+                        nullAssigned = savedNull; nullableFrom = savedNB
+                        for x in c.body { collectNullFacts(x) }
+                        mergedNull = mergedNull.map { $0.intersection(nullAssigned) } ?? nullAssigned
+                        unionNB = unionNB.union(nullableFrom)
+                    }
+                    nullAssigned = mergedNull ?? savedNull
+                    nullableFrom = unionNB
+                }
+            default: break
+            }
+        }
+        collectNullFacts(fn.body)
+        let nullable = nullAssigned.union(nullableFrom).subtracting(nullGuarded)
+        if !nullable.isEmpty {
+            eachExpr { e in
+                switch e {
+                case .member(let base, let m, _, let off):
+                    if let v = simpleIdentifier(stripParen(base)), nullable.contains(v), m != "class" {
+                        emitQ(off, "NULL Pointer Dereference", .high, "Possible null dereference of '\(v)'.")
+                    }
+                case .index(let base, _, let off):
+                    if let v = simpleIdentifier(stripParen(base)), nullable.contains(v) {
+                        emitQ(off, "NULL Pointer Dereference", .high, "Possible null index dereference of '\(v)'.")
+                    }
+                default: break
+                }
+            }
+        }
+
+        // try/catch/finally are flattened by the parser, so their shapes are
+        // read from the comment-stripped source slice of the function body.
+        let ns = source as NSString
+        let lo = fn.bodyOffset, hi = fn.endOffset
+        guard hi > lo, lo >= 0, hi <= ns.length else { return }
+        let body = stripJavaComments(ns.substring(with: NSRange(location: lo, length: hi - lo)))
+        if let r = firstJavaPattern(in: body, pattern: #"catch\s*\(\s*NullPointerException\b"#) {
+            emitQ(lo + r, "Catch of NullPointerException", .low, "Catching NullPointerException hides a null-dereference defect.")
+        }
+        if firstJavaPattern(in: body, pattern: #"catch\s*\(\s*(?:Exception|Throwable)\b"#) != nil {
+            emitQ(lo, "Catch of Generic Exception", .low, "Catching a broad Exception/Throwable class hides failures.")
+        }
+        if firstJavaPattern(in: body, pattern: #"catch\s*\([^)]*\)\s*\{\s*\}"#) != nil {
+            emitQ(lo, "Error Condition Without Action", .low, "Empty catch block silently ignores an error.")
+        }
+        if javaReturnInFinally(body) {
+            emitQ(lo, "Return in Finally Block", .medium, "Return inside finally discards the pending exception or return value.")
+        }
+        if firstJavaPattern(in: body, pattern: #"new\s+Thread\b"#) != nil,
+           firstJavaPattern(in: body, pattern: #"\.\s*run\s*\(\s*\)"#) != nil {
+            emitQ(lo, "Call to Thread.run Instead of start", .medium, "Calling run() executes on the caller thread; use start() to run concurrently.")
+        }
+    }
 }
 
 extension VulnerabilityScanner {
@@ -1011,4 +1428,61 @@ extension VulnerabilityScanner {
         }
         return fields
     }
+}
+
+/// Blanks `//` and `/* */` comments in Java source, preserving string-literal
+/// contents and replacing comment characters with spaces so byte offsets and
+/// line structure stay intact.
+private func stripJavaComments(_ s: String) -> String {
+    var out = Array(s.unicodeScalars)
+    let n = out.count
+    var i = 0
+    func blank(_ j: Int) { if out[j] != "\n" && out[j] != "\r" { out[j] = " " } }
+    while i < n {
+        let c = out[i]
+        if c == "\"" {
+            i += 1
+            while i < n {
+                if out[i] == "\\" { i += 2; continue }
+                if out[i] == "\"" { i += 1; break }
+                i += 1
+            }
+        } else if c == "/" && i + 1 < n && out[i + 1] == "/" {
+            while i < n && out[i] != "\n" { blank(i); i += 1 }
+        } else if c == "/" && i + 1 < n && out[i + 1] == "*" {
+            blank(i); blank(i + 1); i += 2
+            while i + 1 < n && !(out[i] == "*" && out[i + 1] == "/") { blank(i); i += 1 }
+            if i + 1 < n { blank(i); blank(i + 1); i += 2 }
+        } else {
+            i += 1
+        }
+    }
+    return String(String.UnicodeScalarView(out))
+}
+
+private func firstJavaPattern(in s: String, pattern: String) -> Int? {
+    guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let ns = s as NSString
+    return re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length))?.range.location
+}
+
+private func javaReturnInFinally(_ s: String) -> Bool {
+    guard let re = try? NSRegularExpression(pattern: #"finally\s*\{"#) else { return false }
+    let ns = s as NSString
+    let matches = re.matches(in: s, range: NSRange(location: 0, length: ns.length))
+    for m in matches {
+        let brace = m.range.location + m.range.length - 1
+        var depth = 0
+        var i = brace
+        while i < ns.length {
+            let ch = ns.character(at: i)
+            if ch == 123 { depth += 1 }
+            else if ch == 125 { depth -= 1; if depth == 0 { break } }
+            i += 1
+        }
+        if i >= ns.length { continue }
+        let inner = ns.substring(with: NSRange(location: brace + 1, length: max(0, i - brace - 1)))
+        if firstJavaPattern(in: inner, pattern: #"\breturn\b"#) != nil { return true }
+    }
+    return false
 }
