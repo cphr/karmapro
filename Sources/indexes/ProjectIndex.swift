@@ -1726,31 +1726,9 @@ return FileAnalysis(url: url, taintReturning: swiftAnalysis.taintReturning,
 let allTokens = CTokenizer(source: source).tokenize()
         let phpSuperglobals: Set<String> = ["_GET","_POST","_REQUEST","_FILES","_COOKIE","_SERVER","_ENV"]
         let phpTaintReturn: Set<String> = phpSourceAPIs
-        let phpSanitizerSet: Set<String> = ["htmlspecialchars", "htmlentities", "preg_replace",
-                                             "preg_quote", "escapeshellarg", "urlencode", "rawurlencode",
-                                             "strip_tags", "addcslashes", "bin2hex", "clean",
-                                             "strlen", "substr", "trim", "ltrim", "rtrim",
-                                             "strtolower", "strtoupper", "str_replace", "str_ireplace",
-                                             "preg_match", "preg_match_all", "preg_split", "preg_filter",
-                                             "implode", "explode", "join", "sprintf", "number_format",
-                                             "round", "abs", "intval", "floatval", "boolval",
-                                             "bindec", "hexdec", "octdec", "decbin", "dechex", "decoct",
-                                             "wordwrap", "strrev", "strtr", "chunk_split", "str_pad",
-                                             "str_repeat", "strcmp", "strcasecmp", "str_contains",
-                                             "str_starts_with", "str_ends_with",
-                                             "array_filter", "array_map", "array_values", "array_keys",
-                                             "sort", "rsort", "ksort", "asort", "array_unique",
-                                             "array_merge", "array_slice", "array_splice",
-                                             "array_change_key_case", "array_chunk", "array_column",
-                                             "array_combine", "array_count_values", "array_diff",
-                                             "array_fill", "array_fill_keys", "array_flip", "array_intersect",
-                                             "array_key_exists", "array_key_first", "array_key_last",
-                                             "array_merge_recursive", "array_pad", "array_pop", "array_product",
-                                             "array_push", "array_rand", "array_replace", "array_replace_recursive",
-                                             "array_reverse", "array_search", "array_shift", "array_sum",
-                                             "array_udiff", "array_unshift", "array_values", "array_walk",
-                                             "arsort", "asort", "krsort", "ksort", "natcasesort", "natsort",
-                                             "range", "uasort", "uksort", "usort", "sort", "rsort"]
+        // Single source of truth: the same canonical set used by the per-file
+        // PHP classifier, so the two never diverge.
+        let phpSanitizerSet: Set<String> = VulnerabilityScanner.phpSanitizerFunctionSet
         var phpDefParams: [String: Set<String>] = [:]
         for def in phpMethods {
             let params = def.params.compactMap { $0.name }
@@ -1782,6 +1760,10 @@ let allTokens = CTokenizer(source: source).tokenize()
                 let r = def.bodyRange
                 let body = Self.bodyTokens(r.location, r.location + r.length, tokens: allTokens)
                 var onlySanitizers = true
+                // A body with no sanitizer call at all (e.g. a pure
+                // pass-through `function id($v){ return $v; }`) sanitises
+                // nothing and must not be treated as clean.
+                var sawSanitizer = false
                 var i = 0
                 while i < body.count {
                     let tk = body[i]
@@ -1791,7 +1773,12 @@ let allTokens = CTokenizer(source: source).tokenize()
                             i += 2
                             continue
                         }
-                        if defParams.contains(name) || phpSanitizerSet.contains(name) || sanitizerFns.contains(name) {
+                        if defParams.contains(name) {
+                            i += 2
+                            continue
+                        }
+                        if phpSanitizerSet.contains(name) || sanitizerFns.contains(name) {
+                            sawSanitizer = true
                             i += 2
                             continue
                         }
@@ -1800,7 +1787,7 @@ let allTokens = CTokenizer(source: source).tokenize()
                     }
                     i += 1
                 }
-                if onlySanitizers {
+                if onlySanitizers && sawSanitizer {
                     sanitizerFns.insert(def.name)
                     changed = true
                 }

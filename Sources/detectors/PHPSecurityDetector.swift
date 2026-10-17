@@ -10,12 +10,22 @@ extension AstSecurityDetector {
 
     /// Superglobals seeded as tainted when the AST walker processes a PHP file.
     /// They arrive as bare identifiers (`_GET`, `_POST`, ..., the `$` is a
-    /// tokenizer artifact).
-    static let phpSuperglobalSeeds: Set<String> = ["_GET", "_POST", "_REQUEST", "_FILES", "_COOKIE", "_SERVER", "_ENV", "php_input"]
+    /// tokenizer artifact). Session values are typically attacker-written
+    /// (stored request data), so `_SESSION` seeds like the rest.
+    static let phpSuperglobalSeeds: Set<String> = ["_GET", "_POST", "_REQUEST", "_FILES", "_COOKIE", "_SERVER", "_ENV", "_SESSION", "php_input"]
 
     /// PHP superglobal names as they appear in the PHP token stream (the `$`
     /// prefix is a tokenizer artifact and is not part of the identifier).
     static let phpSuperglobalNames: Set<String> = ["_GET", "_POST", "_REQUEST", "_FILES", "_COOKIE", "_SERVER", "_ENV", "_SESSION", "php_input"]
+
+    /// $_SERVER keys the server itself sets (protocol string, software banner,
+    /// docroot). Reading one is configuration data; only HTTP_*/REQUEST_* keys
+    /// are attacker-controlled.
+    static let phpServerSetKeys: Set<String> = [
+        "SERVER_PROTOCOL", "SERVER_SOFTWARE", "SERVER_ADMIN", "SERVER_ADDR",
+        "SERVER_SIGNATURE", "DOCUMENT_ROOT", "SCRIPT_NAME", "SCRIPT_FILENAME",
+        "SCRIPT_URI", "SCRIPT_URL", "GATEWAY_INTERFACE", "SERVER_PORT",
+    ]
 
     /// True when a PHP `header()` value is genuinely attacker-sourced: the taint
     /// label is a superglobal (or `php_input`), a source/taint-returning API call,
@@ -36,6 +46,11 @@ extension AstSecurityDetector {
         case .member(let b, _, _, _):
             return phpHeaderTaintedLabel(b, tainted: tainted)
         case .index(let b, let idx, _):
+            // Server-set $_SERVER keys are configuration, not request data.
+            if case .identifier(let baseName, _) = b, baseName == "_SERVER",
+               serverSetKeyText(idx) != nil {
+                return nil
+            }
             return phpHeaderTaintedLabel(b, tainted: tainted) ?? phpHeaderTaintedLabel(idx, tainted: tainted)
         case .unary(_, let o, _):
             return phpHeaderTaintedLabel(o, tainted: tainted)
@@ -52,7 +67,10 @@ extension AstSecurityDetector {
             return nil
         case .stringLiteral(let s, _):
             for global in Self.phpSuperglobalNames where global != "php_input" {
-                if s.contains("$" + global + "[") || s.contains("${" + global + "[") { return global }
+                if s.contains("$" + global + "[") || s.contains("${" + global + "[") {
+                    if global == "_SERVER", literalServerKeysClean(s) { continue }
+                    return global
+                }
             }
             return nil
         default:
@@ -102,17 +120,26 @@ extension AstSecurityDetector {
         return true
     }
 
+    /// Database write keywords inside a query literal (distinguishes a write
+    /// helper from a read-only `SELECT`).
+    static let phpSQLWriteRegex = try! NSRegularExpression(
+        pattern: "\\b(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|TRUNCATE)\\b",
+        options: [.caseInsensitive])
+
     static let phpSinks: [String: AstSinkRule] = [
-        // SQL Injection (procedural + PDO/mysqli member calls).
-        "mysqli_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "mysqli_multi_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "mysqli_real_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "mysqli_prepare": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "pg_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "pg_exec": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "pg_query_params": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "sqlite_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
-        "sqlite_exec": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        // SQL Injection (procedural + PDO/mysqli member calls). The procedural
+        // family leads with the connection handle, so the query is argument 1
+        // (`mysqli_query($c, $q)`, `pg_query($c, $q)`); the one-arg member
+        // style (`$db->query($q)`) keeps argument 0.
+        "mysqli_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "mysqli_multi_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "mysqli_real_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "mysqli_prepare": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "pg_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "pg_exec": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "pg_query_params": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "sqlite_query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
+        "sqlite_exec": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 1, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
         "query": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
         "prepare": .init(category: "SQL Injection", severity: .high, vulnArgIndex: 0, alwaysVulnerable: false, formatArgIndex: nil, bufferOverflowOnFormat: false),
         // Command / Code Injection.
@@ -249,6 +276,155 @@ extension AstSecurityDetector {
         }
     }
 
+    /// AST-based state-change guard check. A handler that reads form/request
+    /// input and then mutates server state (database write or file mutation)
+    /// must validate a request-forgery token first. When the function performs
+    /// such a mutation with no token / origin check anywhere in its body, the
+    /// state change is reachable cross-site and is reported.
+    func checkPHPAccessControl(fn: CFunctionDef, function: String, findings: inout [AstFinding], reachable: Bool) {
+        // Token/origin identifiers whose presence anywhere in the body counts as
+        // a request-forgery guard, regardless of the framework used.
+        let guardMarkers = ["csrf", "nonce", "form_key", "formkey",
+                            "requesttoken", "request_token", "xsrf",
+                            "hash_equals", "check_admin", "check_ajax",
+                            "verify_nonce", "check_referer", "referer",
+                            "formtoken", "form_token", "captcha", "token"]
+        func nameLooksGuarded(_ name: String) -> Bool {
+            let low = name.lowercased()
+            return guardMarkers.contains { low.contains($0) }
+        }
+        // A token key like `$_POST['token']` / `$_SESSION['csrf']` is a guard
+        // even though the bare identifier `token` is too common to match on.
+        // Single-quoted PHP strings are not always surfaced as string literals
+        // by the shared parser, so accept identifier/char-literal nodes too.
+        let tokenKeyMarkers = ["csrf", "nonce", "token", "xsrf", "form_key"]
+        func keyLooksGuarded(_ e: CExpr) -> Bool {
+            func texts(_ e: CExpr) -> [String] {
+                switch e {
+                case .stringLiteral(let s, _), .charLiteral(let s, _): return [s]
+                case .identifier(let n, _): return [n]
+                case .paren(let x, _), .cast(let x, _): return texts(x)
+                default: return []
+                }
+            }
+            for t in texts(e) {
+                let low = t.lowercased()
+                if tokenKeyMarkers.contains(where: { low.contains($0) }) { return true }
+            }
+            return false
+        }
+        func mentions(_ e: CExpr, _ names: Set<String>) -> Bool {
+            switch e {
+            case .identifier(let n, _): return names.contains(n)
+            case .member(let b, _, _, _): return mentions(b, names)
+            case .index(let b, let i, _): return mentions(b, names) || mentions(i, names)
+            case .unary(_, let o, _): return mentions(o, names)
+            case .binary(_, let l, let r, _), .comma(let l, let r, _): return mentions(l, names) || mentions(r, names)
+            case .ternary(let c, let t, let f, _): return mentions(c, names) || mentions(t, names) || mentions(f, names)
+            case .assign(_, let l, let r, _): return mentions(l, names) || mentions(r, names)
+            case .cast(let x, _), .paren(let x, _): return mentions(x, names)
+            case .arrayInit(let es, _): return es.contains { mentions($0, names) }
+            case .call(_, let args, _): return args.contains { mentions($0, names) }
+            default: return false
+            }
+        }
+        let requestVars: Set<String> = ["_POST", "_GET", "_REQUEST"]
+        let sessionVars: Set<String> = ["_SESSION", "_COOKIE", "_SERVER"]
+        var readsRequest = false
+        var mutates = false
+        var guarded = false
+        var mutateOffset: Int? = nil
+        // Non-SQL state mutators. SQL writes are recognised from the literal
+        // statement passed to a query helper (a SELECT helper is not a write).
+        let mutationCalls: Set<String> = ["file_put_contents", "fwrite", "fputs",
+                                           "move_uploaded_file", "unlink", "rename",
+                                           "mkdir", "rmdir", "chmod", "chown", "touch",
+                                           "truncate", "copy",
+                                           "insert", "update", "delete", "save",
+                                           "replace", "upsert", "store", "persist"]
+        func walkExpr(_ e: CExpr) {
+            switch e {
+            case .identifier(let n, _):
+                if Self.phpSuperglobalNames.contains(n) { readsRequest = true }
+                if nameLooksGuarded(n) { guarded = true }
+            case .call(let callee, let args, let off):
+                let nm = callName(callee) ?? ""
+                let q = callQualifiedName(callee) ?? nm
+                if nameLooksGuarded(nm) || nameLooksGuarded(q) { guarded = true }
+                if mutationCalls.contains(nm) || mutationCalls.contains(q) {
+                    mutates = true
+                    if mutateOffset == nil { mutateOffset = off }
+                }
+                for a in args {
+                    if let s = stringLiteralOf(a), Self.phpSQLWriteRegex.firstMatch(
+                        in: s, options: [], range: NSRange(s.startIndex..., in: s)) != nil {
+                        mutates = true
+                        if mutateOffset == nil { mutateOffset = off }
+                    }
+                }
+                for a in args { walkExpr(a) }
+            case .member(let b, let m, _, _):
+                if nameLooksGuarded(m) { guarded = true }
+                walkExpr(b)
+            case .index(let b, let i, _):
+                if keyLooksGuarded(i) { guarded = true }
+                walkExpr(b); walkExpr(i)
+            case .binary(let op, let l, let r, _):
+                if op == "==" || op == "!=" || op == "===" || op == "!==" {
+                    // Classic token check: a request value compared against a
+                    // session/expected value.
+                    if (mentions(l, requestVars) && mentions(r, sessionVars))
+                        || (mentions(r, requestVars) && mentions(l, sessionVars)) {
+                        guarded = true
+                    }
+                }
+                walkExpr(l); walkExpr(r)
+            case .comma(let l, let r, _): walkExpr(l); walkExpr(r)
+            case .unary(_, let o, _): walkExpr(o)
+            case .ternary(let c, let t, let f, _): walkExpr(c); walkExpr(t); walkExpr(f)
+            case .assign(_, let l, let r, _): walkExpr(l); walkExpr(r)
+            case .cast(let x, _), .paren(let x, _): walkExpr(x)
+            case .arrayInit(let es, _): for x in es { walkExpr(x) }
+            case .newExpr(_, let args, _): for a in args { walkExpr(a) }
+            default: break
+            }
+        }
+        func walkStmt(_ s: CStmt) {
+            switch s {
+            case .block(let arr): for x in arr { walkStmt(x) }
+            case .expr(let e): walkExpr(e)
+            case .declaration(let d):
+                if case .variable(_, _, let ie?) = d.kind { walkExpr(ie) }
+            case .returnStmt(let e?, _): walkExpr(e)
+            case .ifStmt(let c, let t, let eb, _):
+                // Classic token validation: the condition relates request input
+                // to session/server state (e.g. comparing a submitted token to
+                // `$_SESSION[...]`). Robust to the parser mis-shaping the
+                // operand, so it is checked at the guard-statement level.
+                if mentions(c, requestVars) && mentions(c, sessionVars) { guarded = true }
+                walkExpr(c); walkStmt(t); if let eb = eb { walkStmt(eb) }
+            case .whileStmt(let c, let b, _): walkExpr(c); walkStmt(b)
+            case .doWhileStmt(let b, let c, _): walkStmt(b); walkExpr(c)
+            case .forStmt(let i, let c, let inc, let b, _):
+                if let i = i { walkStmt(i) }; if let c = c { walkExpr(c) }
+                if let inc = inc { walkExpr(inc) }; walkStmt(b)
+            case .switchStmt(let e, let cases, _):
+                walkExpr(e); for cs in cases { for x in cs.body { walkStmt(x) } }
+            case .labeledStmt(_, let inner, _): walkStmt(inner)
+            default: break
+            }
+        }
+        walkStmt(fn.body)
+        // Report only a genuine cross-site-reachable state change: form/request
+        // input drives a mutation and no request-forgery guard is present.
+        if readsRequest, mutates, !guarded, let off = mutateOffset {
+            emit(&findings, function, off,
+                 AstSinkRule(category: "Cross-Site Request Forgery", severity: .medium, vulnArgIndex: nil, alwaysVulnerable: true, formatArgIndex: nil, bufferOverflowOnFormat: false),
+                 message: "Request input drives a server state change without any request-forgery token or origin check; the action can be triggered cross-site.",
+                 taint: "request", reachable: reachable, crossFile: false)
+        }
+    }
+
     /// Applies the PHP-specific file-level suppressions: when the file contains
     /// an allowlist / hardening guard for a category, drop that category's
     /// findings (command allowlist + escapeshellarg, path traversal canonical
@@ -318,37 +494,32 @@ extension VulnerabilityScanner {
     /// only taint their result when a call argument is tainted. Also computes the
     /// file-local PHP sanitizer set (functions whose bodies only reference
     /// sanitizer helpers). Returns the conditional set and the sanitizer list.
+    /// Canonical set of PHP functions that themselves transform a value into a
+    /// safe form. Content-preserving reshapers (trim, substr, implode, array_map,
+    /// …) are deliberately excluded: a helper that only trims or re-slices its
+    /// argument still returns attacker-controlled data.
+    static let phpSanitizerFunctionSet: Set<String> = [
+        "htmlspecialchars", "htmlentities",
+        "preg_replace", "preg_quote", "escapeshellarg",
+        // Database escape helpers: they return an escaped copy of their
+        // argument, so a value built from one of these is safe for the engine
+        // when the statement quotes it (unquoted numeric contexts still
+        // evaluate as injectable by the call-site check on the literal).
+        "mysqli_real_escape_string", "mysql_real_escape_string",
+        "mysqli_escape_string", "mysql_escape_string",
+        "pg_escape_string", "pg_escape_literal", "sqlite_escape_string",
+        "urlencode", "rawurlencode", "strip_tags",
+        "addcslashes", "bin2hex", "clean", "sanitize",
+        "intval", "floatval", "boolval",
+        "bindec", "hexdec", "octdec",
+        "round", "abs", "number_format",
+        "strlen", "strcmp", "strcasecmp",
+        "str_contains", "str_starts_with", "str_ends_with",
+        "preg_match", "preg_match_all",
+        "array_key_exists"]
+
     static func phpClassifyFunctions(isPHP: Bool, source: String, tokens: [Token], localTaintReturning: Set<String>, projectIndex: ProjectIndex?) -> (conditionalTaintReturning: Set<String>, phpSanitizersLocal: Set<String>) {
-        let phpSanitizerSet: Set<String> = ["htmlspecialchars", "htmlentities", "preg_replace",
-                                             "preg_quote", "escapeshellarg", "urlencode", "rawurlencode",
-                                             "strip_tags", "addcslashes", "bin2hex", "clean",
-                                             "strlen", "substr", "trim", "ltrim", "rtrim",
-                                             "strtolower", "strtoupper", "str_replace", "str_ireplace",
-                                             "preg_match", "preg_match_all", "preg_split", "preg_filter",
-                                             "implode", "explode", "join", "sprintf", "number_format",
-                                             "round", "abs", "intval", "floatval", "boolval",
-                                             "bindec", "hexdec", "octdec", "decbin", "dechex", "decoct",
-                                             "wordwrap", "strrev", "strtr", "chunk_split", "str_pad",
-                                             "str_repeat", "strcmp", "strcasecmp", "str_contains",
-                                             "str_starts_with", "str_ends_with",
-                                             "array_filter", "array_map", "array_values", "array_keys",
-                                             "sort", "rsort", "ksort", "asort", "array_unique",
-                                             "array_merge", "array_slice", "array_splice",
-                                             "array_change_key_case", "array_chunk", "array_column",
-                                             "array_combine", "array_count_values", "array_diff",
-                                             "array_fill", "array_fill_keys", "array_filter",
-                                             "array_flip", "array_intersect", "array_key_exists",
-                                             "array_key_first", "array_key_last", "array_keys",
-                                             "array_map", "array_merge", "array_merge_recursive",
-                                             "array_pad", "array_pop", "array_product", "array_push",
-                                             "array_rand", "array_replace", "array_replace_recursive",
-                                             "array_reverse", "array_search", "array_shift",
-                                             "array_slice", "array_splice", "array_sum",
-                                             "array_udiff", "array_unique", "array_unshift",
-                                             "array_values", "array_walk", "arsort", "asort",
-                                             "krsort", "ksort", "natcasesort", "natsort",
-                                             "range", "uasort", "uksort", "usort",
-                                             "array_slice", "array_splice"]
+        let phpSanitizerSet = Self.phpSanitizerFunctionSet
         var phpSanitizersLocal = projectIndex?.globalPHPSanitizers ?? []
         var conditionalTaintReturning: Set<String> = []
         if isPHP {
@@ -390,6 +561,11 @@ extension VulnerabilityScanner {
                     let r = def.bodyRange
                     let body = Self.tokens(in: r, tokenList: tokens)
                     var onlySanitizers = true
+                    // A body that merely forwards its own parameters (a pure
+                    // pass-through such as `function id($v){ return $v; }`)
+                    // sanitises nothing, so it must not be treated as clean.
+                    // Require at least one real sanitizer call.
+                    var sawSanitizer = false
                     for tk in body where tk.kind == .identifier {
                         if phpSuperglobals.contains(tk.text) || taintReturnFunctions.contains(tk.text)
                            || sourceReading.contains(tk.text) {
@@ -397,12 +573,14 @@ extension VulnerabilityScanner {
                             break
                         }
                         if defParams.contains(tk.text) { continue }
-                        if !phpSanitizerSet.contains(tk.text), !phpSanitizersLocal.contains(tk.text) {
-                            onlySanitizers = false
-                            break
+                        if phpSanitizerSet.contains(tk.text) || phpSanitizersLocal.contains(tk.text) {
+                            sawSanitizer = true
+                            continue
                         }
+                        onlySanitizers = false
+                        break
                     }
-                    if onlySanitizers {
+                    if onlySanitizers && sawSanitizer {
                         phpSanitizersLocal.insert(def.name)
                         changed = true
                     }

@@ -523,6 +523,7 @@ struct AstSecurityDetector {
         // auth-named function with no strict/hashed comparison is the defect.
         if isPHP {
             checkPHPLooseAuthCompare(fn: fn, function: name, params: Set(fn.params.compactMap { $0.name }), findings: &findings, reachable: reachable)
+            checkPHPAccessControl(fn: fn, function: name, findings: &findings, reachable: reachable)
         }
         return findings
     }
@@ -2259,7 +2260,12 @@ struct AstSecurityDetector {
             // carry the taint of the raw input passed into them.
             if let m = callName(callee), ["basename", "htmlspecialchars", "htmlentities",
                                           "preg_quote", "escapeshellarg", "urlencode",
-                                          "rawurlencode", "HtmlEncode", "HtmlAttributeEncode",
+                                          "rawurlencode", "strip_tags",
+                                          "mysqli_real_escape_string", "mysql_real_escape_string",
+                                          "mysqli_escape_string", "mysql_escape_string",
+                                          "pg_escape_string", "pg_escape_literal",
+                                          "sqlite_escape_string",
+                                          "HtmlEncode", "HtmlAttributeEncode",
                                           "UrlEncode", "UrlPathEncode", "JavaScriptStringEncode"].contains(m) {
                 return nil
             }
@@ -2300,6 +2306,11 @@ struct AstSecurityDetector {
                fieldSeedsRef.seeds.contains("\(baseName).\(m)") { return m }
             return exprTainted(b, tainted: tainted)
         case .index(let b, let idx, _):
+            // Server-set $_SERVER keys are configuration, not request data.
+            if isPHP, case .identifier(let baseName, _) = b, baseName == "_SERVER",
+               serverSetKeyText(idx) != nil {
+                return exprTainted(idx, tainted: tainted)
+            }
             return exprTainted(b, tainted: tainted) ?? exprTainted(idx, tainted: tainted)
         case .unary(_, let o, _):
             return exprTainted(o, tainted: tainted)
@@ -2327,14 +2338,75 @@ struct AstSecurityDetector {
                 for global in phpTaintedGlobals {
                     // Match $GLOBAL[...] or ${GLOBAL[...]} patterns
                     if s.contains("$" + global + "[") || s.contains("${" + global + "[") {
+                        // A literal indexing $_SERVER with only server-set keys
+                        // (protocol string, docroot) is not request data.
+                        if global == "_SERVER", literalServerKeysClean(s) {
+                            continue
+                        }
                         return global
                     }
                 }
+                // Interpolated locals carry the taint of the earliest input that
+                // built them (`"$q"`, `"$row"`, `"...$path..."`), so a query
+                // assembled by string interpolation reaches a sink with the
+                // same flow as an explicit concatenation.
+                if let t = interpolatedLocalTaint(s, tainted: tainted) { return t }
             }
             return nil
         default:
             return nil
         }
+    }
+
+    /// First tainted local interpolated into a PHP double-quoted string
+    /// (`'…WHERE u = $v'`, `'…{$v}…'`), or nil when the string holds no
+    /// tainted interpolation. Only double-quoted strings interpolate in PHP;
+    /// a leading single quote means the text stays literal.
+    private static let localVarRegex = try! NSRegularExpression(
+        pattern: "\\$\\{?([A-Za-z_][A-Za-z0-9_]*)", options: [])
+
+    private static let serverKeyRegex = try! NSRegularExpression(
+        pattern: "\\$_SERVER\\[\\s*['\"]?([A-Za-z_]+)['\"]?\\s*\\]", options: [])
+
+    /// True when every `$_SERVER[key]` in the literal names a server-set key.
+    func literalServerKeysClean(_ s: String) -> Bool {
+        let names = Self.serverKeyRegex.matches(in: s, range: NSRange(s.startIndex..., in: s))
+        guard !names.isEmpty else { return false }
+        return names.allSatisfy { m in
+            guard let r = Range(m.range(at: 1), in: s) else { return false }
+            return Self.phpServerSetKeys.contains(String(s[r]))
+        }
+    }
+
+    /// Server-set key named by a $_SERVER index (`'SERVER_PROTOCOL'` or bare
+    /// `SERVER_PROTOCOL`), or nil for request-controlled keys/expressions.
+    func serverSetKeyText(_ idx: CExpr) -> String? {
+        // Single-quoted PHP strings tokenize as char literals; both quote
+        // kinds may include their quote characters in the token text.
+        let raw: String?
+        switch idx {
+        case .stringLiteral(let s, _), .charLiteral(let s, _): raw = s
+        case .identifier(let n, _): raw = n
+        default: raw = nil
+        }
+        guard var txt = raw else { return nil }
+        if txt.count > 1, (txt.hasPrefix("'") && txt.hasSuffix("'")) || (txt.first == "\"" && txt.last == "\"") {
+            txt = String(txt.dropFirst().dropLast())
+        }
+        return Self.phpServerSetKeys.contains(txt) ? txt : nil
+    }
+
+    func interpolatedLocalTaint(_ s: String, tainted: Set<String>) -> String? {
+        guard s.hasPrefix("\"") else { return nil }
+        var result: String?
+        for r in Self.localVarRegex.matches(in: s, range: NSRange(s.startIndex..., in: s)) {
+            let nameRange = Range(r.range(at: 1), in: s)
+                .map { String(s[$0]) }
+            if let name = nameRange, tainted.contains(name), result == nil {
+                result = name
+            }
+        }
+        return result
     }
 
     func taintLabel(_ e: CExpr, tainted: Set<String>) -> String? {
