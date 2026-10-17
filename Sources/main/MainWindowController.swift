@@ -158,9 +158,19 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         }
     }
 
+    /// Starting window size: three quarters of the screen's usable area. Clamped
+    /// to the screen itself, and never below the minimum so the frame is honoured
+    /// on smaller displays.
+    private static func startupSize(on screen: NSScreen?) -> NSSize {
+        let usable = (screen ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 2048, height: 1250)
+        return NSSize(width: usable.width * 0.75, height: usable.height * 0.75)
+    }
+
     convenience init() {
+        let size = MainWindowController.startupSize(on: NSScreen.main)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1500, height: 820),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -170,7 +180,8 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
         // the source pane.
         window.isRestorable = false
         window.setFrameAutosaveName("")
-        window.minSize = NSSize(width: 1280, height: 640)
+        // Keep the floor below the startup size so 75% is not silently clamped.
+        window.minSize = NSSize(width: min(1280, size.width), height: min(640, size.height))
         window.center()
         self.init(window: window)
         window.delegate = self
@@ -192,17 +203,14 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
     private func forceMainFrame() {
         guard let window = window else { return }
         window.setFrameAutosaveName("")
-        let screenFrame = window.screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1400, height: 800)
-        let width = min(1500, screenFrame.width)
-        let height = min(820, screenFrame.height)
+        let screen = window.screen ?? NSScreen.main
+        let size = MainWindowController.startupSize(on: screen)
         var f = window.frame
-        f.size = NSSize(width: width, height: height)
-        guard let screen = window.screen else {
-            window.setFrame(f, display: true)
-            return
+        f.size = size
+        if let visible = screen?.visibleFrame {
+            f.origin.x = visible.midX - size.width / 2
+            f.origin.y = visible.midY - size.height / 2
         }
-        f.origin.x = screen.visibleFrame.midX - width / 2
-        f.origin.y = screen.visibleFrame.midY - height / 2
         window.setFrame(f, display: true)
     }
 
