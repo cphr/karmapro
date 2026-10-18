@@ -3,7 +3,7 @@ import Foundation
 
 /// A structural security detector that walks the parsed `CStmt`/`CExpr` AST
 /// (produced by `CAnalyzer` for C/C++ and `JAnalyzer` for Java) and reports
-/// sink calls whose dangerous argument is tainted.
+/// sink calls whose dangerous argument is tainted. 
 ///
 /// This is the "AST on top of heuristics" layer: it performs real data-flow
 /// over the expression tree (resolving calls, arguments, assignments and
