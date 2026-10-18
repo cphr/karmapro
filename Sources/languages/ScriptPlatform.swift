@@ -3,7 +3,7 @@ import Foundation
 
 /// Go / Kotlin APIs that return untrusted / attacker-controlled data. These
 /// seed the Go and Kotlin AST taint pass, mirroring the scanner's taint-return
-/// set for the heuristic (non-AST) path of those languages.
+/// set for the heuristic (non-AST) path of those languages. 
 let goSourceAPIs: Set<String> = [
     // Environment / args.
     "os.Getenv", "os.LookupEnv", "os.Getenvs",
