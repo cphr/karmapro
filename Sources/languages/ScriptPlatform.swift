@@ -54,6 +54,13 @@ let pythonSourceAPIs: Set<String> = [
     "request", "request.args", "request.form", "request.json", "request.values",
     "read", "readline", "readlines", "recv", "stdin", "environ",
     "urllib.request", "urlopen", "parse_qs",
+    // Web-framework request accessors where the framework object is held as an
+    // attribute/parameter rather than a bare `request` identifier, so the
+    // member-access taint root above does not reach them (`self.get_argument`,
+    // `handler.get_query_argument`, Tornado / aiohttp / Starlette).
+    "get_argument", "get_arguments", "get_query_argument", "get_query_arguments",
+    "get_body_argument", "get_body_arguments", "get_json", "get_body_json",
+    "get_cookie", "get_secure_cookie",
 ]
 
 /// Write-through sinks for the Python AST pass (reads that fill a parameter).

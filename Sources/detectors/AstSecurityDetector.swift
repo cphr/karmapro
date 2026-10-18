@@ -378,6 +378,17 @@ struct AstSecurityDetector {
 
     // MARK: - Per-function scan
 
+    /// Python methods take the receiver (`self`, or `cls` for classmethods) as
+    /// an explicit first parameter. It is not attacker input: seeding it as
+    /// tainted would make every `self.<field>` read look like untrusted data and
+    /// flag harmless filesystem work on server-owned paths. Flows that stash a
+    /// value on the instance and read it back in another method are tracked only
+    /// where the sink sits in the same function; the cross-method field-seed
+    /// analysis is Java-only.
+    static func isImplicitReceiver(_ name: String, python: Bool) -> Bool {
+        python && (name == "self" || name == "cls")
+    }
+
     private func scanFunction(name: String, fn: CFunctionDef, reachable: Bool) -> [AstFinding] {
         var tainted = Set<String>()
         var crossTainted = Set<String>()
@@ -389,12 +400,15 @@ struct AstSecurityDetector {
             // the parameters that are actually tainted at one of them, so a
             // helper reached solely with safe values stays untainted.
             for idx in seeds where idx < fn.params.count {
-                if let pname = fn.params[idx].name { tainted.insert(pname) }
+                if let pname = fn.params[idx].name, !Self.isImplicitReceiver(pname, python: isPython) { tainted.insert(pname) }
             }
         } else {
             // No call site is visible (entry point, externally invoked, or
             // pointer-dispatched): conservatively treat every parameter as input.
-            for p in fn.params where p.name != nil { tainted.insert(p.name!) }
+            for p in fn.params where p.name != nil {
+                if Self.isImplicitReceiver(p.name!, python: isPython) { continue }
+                tainted.insert(p.name!)
+            }
         }
         // A parameter this function itself fills with attacker data (a
         // write-through source like `recv(fd, buf, ...)`) is tainted from the
@@ -442,7 +456,8 @@ struct AstSecurityDetector {
         }
 
         var findings: [AstFinding] = []
-        scanStmt(fn.body, function: name, params: Set(fn.params.compactMap { $0.name }), tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeB, findings: &findings, reachable: reachable)
+        let paramSet = Set(fn.params.compactMap { $0.name }.filter { !Self.isImplicitReceiver($0, python: isPython) })
+        scanStmt(fn.body, function: name, params: paramSet, tainted: &tainted, crossTainted: &crossTainted, guarded: guarded, sizeBounded: sizeB, findings: &findings, reachable: reachable)
         // POSIX check-then-use race: `access()`/`stat()` on a path followed by
         // opening/using the same path is a TOCTOU. The check itself is not a
         // finding; the *use* is the race, and a check without a pairing use
