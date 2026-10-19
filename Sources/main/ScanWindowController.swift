@@ -37,8 +37,36 @@ final class ScanWindowController: NSWindowController {
     private var triageCancelled = false
     private var triageColumn: NSTableColumn?
 
-    /// Number of triage requests kept in flight at once.
+    /// Number of triage requests kept in flight at once. Ollama serves one
+    /// request per model at a time, so extra workers only queue there.
     private static let maxConcurrentTriage = 3
+    private static let maxConcurrentTriageLocal = 1
+
+    /// Extra attempts for a triage request that failed transiently.
+    private static let maxTriageRetries = 2
+
+    /// Delay before each triage retry (index = retry number - 1).
+    private static let triageRetryDelays: [Double] = [2, 8]
+
+    /// True when a failed triage request may succeed on a retry (rate limit,
+    /// upstream 5xx, dropped/timed-out connection). A bad key or model is not.
+    private static func isTransientTriageFailure(_ error: Error) -> Bool {
+        let lower = error.localizedDescription.lowercased()
+        if lower.contains("credit") || lower.contains("insufficient") || lower.contains("balance")
+            || lower.contains("402") || lower.contains("unauthorized") || lower.contains("401")
+            || lower.contains("not found") || lower.contains("no api key") {
+            return false
+        }
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many")
+            || lower.contains("quota") {
+            return true
+        }
+        return lower.contains("500") || lower.contains("502") || lower.contains("503")
+            || lower.contains("504") || lower.contains("timeout") || lower.contains("timed out")
+            || lower.contains("connection") || lower.contains("network")
+            || lower.contains("empty response") || lower.contains("overloaded")
+            || lower.contains("temporarily") || lower.contains("unavailable")
+    }
 
     private var findings: [ScanFinding] = [] {
         // Export is available exactly when the table has rows to export, so
@@ -634,40 +662,60 @@ final class ScanWindowController: NSWindowController {
 
     private func triageNext() {
         guard triageRunning, !triageCancelled else { return }
-        let model = OpenRouterClient.shared.selectedModel
+        let client = OpenRouterClient.shared
+        let model = client.selectedModel
+        let limit = client.isOllama ? Self.maxConcurrentTriageLocal : Self.maxConcurrentTriage
         // Keep several requests in flight; each completion re-enters here to
         // either dispatch the next finding or finish once the queue drains.
-        while triageInFlight < Self.maxConcurrentTriage && triageIndex < triageRows.count {
+        while triageInFlight < limit && triageIndex < triageRows.count {
             let f = triageRows[triageIndex]
             triageIndex += 1
             triageInFlight += 1
-            OpenRouterClient.shared.sendChat(
-                systemPrompt: Self.triageSystemPrompt,
-                userPrompt: Self.triagePrompt(for: f),
-                model: model) { [weak self] result in
-                DispatchQueue.main.async {
-                    guard let self = self, self.triageRunning else { return }
-                    self.triageInFlight -= 1
-                    self.triageChecked += 1
-                    switch result {
-                    case .success(let text):
-                        if let verdict = Self.parseTriageVerdict(text) {
-                            self.triageVerdicts[self.ignoredKey(for: f)] = verdict
-                        } else {
-                            self.triageFailed += 1
-                        }
-                    case .failure:
-                        self.triageFailed += 1
-                    }
-                    self.progressBar.doubleValue = Double(self.triageChecked) / Double(self.triageRows.count)
-                    self.statusLabel.stringValue = "Triage: \(self.triageChecked)/\(self.triageRows.count) checked…"
-                    self.tableView.reloadData()
-                    self.triageNext()
-                }
-            }
+            triageOne(f, model: model, attempt: 0)
         }
         if triageInFlight == 0 && triageIndex >= triageRows.count {
             finishAutoTriage()
+        }
+    }
+
+    /// Checks one finding. A transient transport failure is retried (up to
+    /// `maxTriageRetries`); a model that answered something other than
+    /// VALID/INVALID is not retried, since a re-ask would likely repeat it.
+    private func triageOne(_ f: ScanFinding, model: String, attempt: Int) {
+        OpenRouterClient.shared.sendChat(
+            systemPrompt: Self.triageSystemPrompt,
+            userPrompt: Self.triagePrompt(for: f),
+            model: model) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self, self.triageRunning else { return }
+                switch result {
+                case .success(let text):
+                    self.triageInFlight -= 1
+                    self.triageChecked += 1
+                    if let verdict = Self.parseTriageVerdict(text) {
+                        self.triageVerdicts[self.ignoredKey(for: f)] = verdict
+                    } else {
+                        self.triageFailed += 1
+                    }
+                case .failure(let error):
+                    if Self.isTransientTriageFailure(error), attempt < Self.maxTriageRetries {
+                        // Slot stays occupied: the row is still being checked.
+                        let delay = Self.triageRetryDelays[min(attempt, Self.triageRetryDelays.count - 1)]
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            guard self.triageRunning, !self.triageCancelled else { return }
+                            self.triageOne(f, model: model, attempt: attempt + 1)
+                        }
+                        return
+                    }
+                    self.triageInFlight -= 1
+                    self.triageChecked += 1
+                    self.triageFailed += 1
+                }
+                self.progressBar.doubleValue = Double(self.triageChecked) / Double(self.triageRows.count)
+                self.statusLabel.stringValue = "Triage: \(self.triageChecked)/\(self.triageRows.count) checked…"
+                self.tableView.reloadData()
+                self.triageNext()
+            }
         }
     }
 

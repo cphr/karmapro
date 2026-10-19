@@ -115,10 +115,21 @@ final class AISecurityScanner {
     /// conversation history) up to this many times before giving up on a batch.
     private static let maxContinuations = 2
 
+    /// Extra attempts for a batch whose request failed with a transient
+    /// transport/provider error. The batch is otherwise dropped for the run.
+    private static let maxTransportRetries = 2
+
+    /// Delay before each transport retry (index = retry number - 1).
+    private static let transportRetryDelays: [Double] = [2, 8]
+
     /// Number of batch requests kept in flight at once. Batches are independent
     /// (each carries its own cards and prompt), so several can be answered
     /// concurrently to cut wall-clock time on large projects.
     private static let maxConcurrentBatches = 3
+
+    /// Ollama serves one request per model at a time unless the user raised
+    /// `OLLAMA_NUM_PARALLEL`, so extra workers only queue and risk timing out.
+    private static let maxConcurrentBatchesLocal = 1
 
     /// Categories the model may choose from. Mirrors the labels the built-in
     /// scanner produces so the Category column stays consistent; anything else
@@ -237,7 +248,8 @@ final class AISecurityScanner {
                                        isCancelled: isCancelled,
                                        onPhase: onPhase,
                                        finish: finish,
-                                       maxConcurrent: Self.maxConcurrentBatches)
+                                       maxConcurrent: client.isOllama ? Self.maxConcurrentBatchesLocal
+                                                                     : Self.maxConcurrentBatches)
         scheduler.start()
     }
 
@@ -378,6 +390,7 @@ final class AISecurityScanner {
                 onPhase: onPhase,
                 recordError: { message in self.recordError(message) },
                 continuation: 0,
+                attempt: 0,
                 batchLabel: batchLabel,
                 onDone: {
                     self.queue.async {
@@ -425,6 +438,7 @@ final class AISecurityScanner {
                                      onPhase: @escaping (AIReviewPhase) -> Void,
                                      recordError: @escaping (String) -> Void,
                                      continuation: Int,
+                                     attempt: Int,
                                      batchLabel: String,
                                      onDone: @escaping () -> Void,
                                      onCancel: @escaping () -> Void) {
@@ -465,6 +479,34 @@ final class AISecurityScanner {
             completion: { result in
                 switch result {
                 case .failure(let error):
+                    // A transient refusal (rate limit, upstream 5xx, dropped
+                    // connection) is retried with backoff rather than dropping
+                    // the batch; a permanent error is reported immediately.
+                    if Self.isTransientFailure(error), attempt < Self.maxTransportRetries {
+                        let delay = Self.transportRetryDelays[min(attempt, Self.transportRetryDelays.count - 1)]
+                        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                            if isCancelled() { onCancel(); return }
+                            requestBatch(messages: messages,
+                                         batch: batch,
+                                         cardRanges: cardRanges,
+                                         model: model,
+                                         provider: provider,
+                                         state: state,
+                                         totalCards: totalCards,
+                                         expectedOutputChars: expectedOutputChars,
+                                         collector: collector,
+                                         progress: progress,
+                                         isCancelled: isCancelled,
+                                         onPhase: onPhase,
+                                         recordError: recordError,
+                                         continuation: continuation,
+                                         attempt: attempt + 1,
+                                         batchLabel: batchLabel,
+                                         onDone: onDone,
+                                         onCancel: onCancel)
+                        }
+                        return
+                    }
                     recordError(Self.classifyFailure(error, batchLabel: batchLabel))
                     onDone()
                 case .success(let stream):
@@ -495,6 +537,7 @@ final class AISecurityScanner {
                                      onPhase: onPhase,
                                      recordError: recordError,
                                      continuation: continuation + 1,
+                                     attempt: attempt,
                                      batchLabel: batchLabel,
                                      onDone: onDone,
                                      onCancel: onCancel)
@@ -516,14 +559,43 @@ final class AISecurityScanner {
         return cleaned.hasSuffix("]")
     }
 
-    /// Translates transport/model failures into user-friendly messages, calling
-    /// out the common "ran out of credits" case so the user knows to top up.
+    /// True when a failed request may succeed on a retry: rate limiting,
+    /// upstream 5xx, a dropped/timed-out connection, or an empty stream.
+    /// A missing/unauthorised key, a bad model name or exhausted credits are
+    /// permanent and are not retried.
+    private static func isTransientFailure(_ error: Error) -> Bool {
+        let lower = error.localizedDescription.lowercased()
+        if lower.contains("credit") || lower.contains("insufficient") || lower.contains("balance")
+            || lower.contains("402") || lower.contains("unauthorized") || lower.contains("401")
+            || lower.contains("not found") || lower.contains("no api key") {
+            return false
+        }
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many")
+            || lower.contains("quota") {
+            return true
+        }
+        if lower.contains("500") || lower.contains("502") || lower.contains("503") || lower.contains("504")
+            || lower.contains("timeout") || lower.contains("timed out")
+            || lower.contains("connection") || lower.contains("network")
+            || lower.contains("empty response") || lower.contains("overloaded")
+            || lower.contains("temporarily") || lower.contains("unavailable") {
+            return true
+        }
+        return false
+    }
+
+    /// Turns transport/model failures into user-facing messages. A rate limit
+    /// (HTTP 429) is retried before this runs, so what is left here is either a
+    /// permanent refusal or a retried-and-still-failing transient error.
     private static func classifyFailure(_ error: Error, batchLabel: String) -> String {
         let message = error.localizedDescription
         let lower = message.lowercased()
         if lower.contains("credit") || lower.contains("insufficient") || lower.contains("balance")
-            || lower.contains("402") || lower.contains("429") || lower.contains("quota") {
+            || lower.contains("402") || lower.contains("quota") {
             return "\(batchLabel): it looks like you are out of AI credits/quota — the provider refused the request (\(message)). Top up your account or switch model/provider in the AI Assistant window and run the scan again."
+        }
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many") {
+            return "\(batchLabel): the provider rate-limited the request (\(message)). The scan will be faster if you retry when the limit resets, or switch provider/model in the AI Assistant window."
         }
         return "\(batchLabel) failed: \(message)"
     }
@@ -670,30 +742,80 @@ final class AISecurityScanner {
         return ParseOutcome(valid: valid, invalid: invalid)
     }
 
+    /// Extracts the JSON array from a model answer, tolerating markdown fences
+    /// and prose around it. Candidates are tried in order and the first one that
+    /// decodes wins, so a stray bracket in the surrounding prose cannot swallow
+    /// the real array.
     private static func extractJSONArray(from content: String) -> Data? {
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let start = trimmed.firstIndex(of: "["), let end = trimmed.lastIndex(of: "]"), start < end {
-            // Prefer the outer-most bracket region (handles code-fence noise).
-            let slice = trimmed[start...end]
-            return Data(slice.utf8)
-        }
-        // Fenced form fallback: ```json … ``` or ``` … ```.
-        let lines = content.components(separatedBy: "\n")
-        var jsonLines: [String] = []
-        var inFence = false
-        for line in lines {
-            let stripped = line.trimmingCharacters(in: .whitespaces)
-            if stripped.hasPrefix("```") {
-                if inFence { break }
-                inFence = true
-                continue
+        for candidate in jsonCandidates(from: content) {
+            if (try? JSONDecoder().decode([ParsedFinding].self, from: candidate)) != nil {
+                return candidate
             }
-            if inFence { jsonLines.append(line) }
-        }
-        if inFence && !jsonLines.isEmpty {
-            return Data(jsonLines.joined(separator: "\n").utf8)
         }
         return nil
+    }
+
+    /// Bracket regions to consider, outermost first: each fenced block, then
+    /// every balanced `[` … `]` span at progressively deeper starts.
+    private static func jsonCandidates(from content: String) -> [Data] {
+        var out: [Data] = []
+        for block in fencedBlocks(in: content) {
+            out.append(Data(block.utf8))
+        }
+        out.append(contentsOf: balancedArraySlices(in: content))
+        return out
+    }
+
+    /// Bodies of ```…``` fenced blocks, in order.
+    private static func fencedBlocks(in content: String) -> [String] {
+        var blocks: [String] = []
+        var current: [String] = []
+        var inFence = false
+        for line in content.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if inFence {
+                    blocks.append(current.joined(separator: "\n"))
+                    current = []
+                }
+                inFence.toggle()
+                continue
+            }
+            if inFence { current.append(line) }
+        }
+        return blocks
+    }
+
+    /// Every balanced top-level `[` … `]` span, tried at each `[` so an array
+    /// preceded by prose brackets is still found.
+    private static func balancedArraySlices(in content: String) -> [Data] {
+        let chars = Array(content)
+        var slices: [Data] = []
+        for start in chars.indices where chars[start] == "[" {
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var i = start
+            while i < chars.count {
+                let c = chars[i]
+                if inString {
+                    if escaped { escaped = false }
+                    else if c == "\\" { escaped = true }
+                    else if c == "\"" { inString = false }
+                } else if c == "\"" {
+                    inString = true
+                } else if c == "[" {
+                    depth += 1
+                } else if c == "]" {
+                    depth -= 1
+                    if depth == 0 {
+                        slices.append(Data(String(chars[start...i]).utf8))
+                        break
+                    }
+                }
+                i += 1
+            }
+        }
+        return slices
     }
 
     /// Maps a model-supplied category on to the canonical ontology label when it
