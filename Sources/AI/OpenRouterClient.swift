@@ -292,14 +292,18 @@ final class OpenRouterStreamDelegate: NSObject, URLSessionDataDelegate {
 enum AIProvider: String {
     case openRouter = "OpenRouter"
     case ollama = "Ollama"
+
+    /// Cloud providers authenticate with a bearer key and send the attribution
+    /// headers; Ollama is a local server and needs neither.
+    var isCloud: Bool { self != .ollama }
 }
 
 /// Minimal OpenRouter API client: chat completions + model listing.
 /// Two providers are supported: the OpenRouter cloud API (API key required)
 /// and a local Ollama server (editable server URL, no key). The provider, the
-/// Ollama server URL, the API key and the user's selected model are persisted
-/// in UserDefaults so they survive relaunches and can be changed at any time
-/// from the AI window.
+/// Ollama server URL, each provider's API key and selected model are persisted
+/// in UserDefaults so they survive relaunches, can be changed at any time from
+/// the AI window, and are kept apart so switching providers never loses a key.
 final class OpenRouterClient {
     static let shared = OpenRouterClient()
     /// Endpoint used for the OpenRouter provider.
@@ -326,19 +330,44 @@ final class OpenRouterClient {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        Self.migrateLegacyKeysIfNeeded(defaults)
     }
 
+    /// Earlier builds stored one key and one model under a fixed provider's
+    /// name, so a second key-bearing provider would have shared them. Move the
+    /// stored values to the per-provider keys once, remembering which provider
+    /// they belonged to, then drop the old entries.
+    private static func migrateLegacyKeysIfNeeded(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: "AI.perProviderStorageMigrated") else { return }
+        let legacyProvider = AIProvider(rawValue: defaults.string(forKey: "AI.provider") ?? "") ?? .openRouter
+        if let key = defaults.string(forKey: "OpenRouter.apiKey"), !key.isEmpty {
+            defaults.set(key, forKey: "AI.\(legacyProvider.rawValue).apiKey")
+        }
+        if let model = defaults.string(forKey: "OpenRouter.model"), !model.isEmpty {
+            defaults.set(model, forKey: "AI.\(legacyProvider.rawValue).model")
+        }
+        if legacyProvider == .ollama, let url = defaults.string(forKey: "AI.baseURL"), !url.isEmpty {
+            defaults.set(url, forKey: "AI.ollama.baseURL")
+        }
+        defaults.removeObject(forKey: "OpenRouter.apiKey")
+        defaults.removeObject(forKey: "OpenRouter.model")
+        defaults.set(true, forKey: "AI.perProviderStorageMigrated")
+    }
+
+    /// The stored key for the current provider, so switching providers keeps
+    /// each one's key instead of overwriting a shared slot.
     var apiKey: String {
-        get { defaults.string(forKey: "OpenRouter.apiKey") ?? "" }
-        set { defaults.set(newValue, forKey: "OpenRouter.apiKey") }
+        get { defaults.string(forKey: "AI.\(provider.rawValue).apiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "AI.\(provider.rawValue).apiKey") }
     }
 
     var selectedModel: String {
         get {
-            let stored = defaults.string(forKey: "OpenRouter.model") ?? ""
-            return stored.isEmpty ? Self.fallbackModels[0] : stored
+            let stored = defaults.string(forKey: "AI.\(provider.rawValue).model") ?? ""
+            if !stored.isEmpty { return stored }
+            return Self.fallbackModels[0]
         }
-        set { defaults.set(newValue, forKey: "OpenRouter.model") }
+        set { defaults.set(newValue, forKey: "AI.\(provider.rawValue).model") }
     }
 
     /// The selected provider ("OpenRouter" or "Ollama"), persisted.
@@ -349,19 +378,18 @@ final class OpenRouterClient {
 
     /// The Ollama server URL shown in the editable "Connect" field, persisted.
     /// Normalises common shortcuts (`localhost:11434` gains the required
-    /// `/v1`); an OpenRouter URL or empty value falls back to the default.
+    /// `/v1`); an empty value falls back to the default.
     var ollamaServerURLString: String {
         get {
-            let stored = defaults.string(forKey: "AI.baseURL") ?? ""
-            if let normalized = Self.normalizeBaseURLString(stored),
-               !normalized.contains("openrouter.ai") {
+            let stored = defaults.string(forKey: "AI.ollama.baseURL") ?? ""
+            if let normalized = Self.normalizeBaseURLString(stored) {
                 return normalized
             }
             return Self.ollamaBaseURLString
         }
         set {
             let normalized = Self.normalizeBaseURLString(newValue) ?? Self.ollamaBaseURLString
-            defaults.set(normalized, forKey: "AI.baseURL")
+            defaults.set(normalized, forKey: "AI.ollama.baseURL")
         }
     }
 
@@ -389,14 +417,14 @@ final class OpenRouterClient {
     /// True when talking to a local Ollama server.
     var isOllama: Bool { provider == .ollama }
 
-    /// Only OpenRouter enforces an API key; Ollama needs none.
-    var requiresAPIKey: Bool { provider == .openRouter }
+    /// Cloud providers require an API key; the local Ollama server needs none.
+    var requiresAPIKey: Bool { provider.isCloud }
 
     /// True when the AI Assistant has a model picked and, for cloud providers,
     /// an API key entered. Reads the raw stored model (not `selectedModel`) so
     /// an untouched AI Assistant window counts as unconfigured.
     var isConfigured: Bool {
-        guard !(defaults.string(forKey: "OpenRouter.model") ?? "").isEmpty else { return false }
+        guard !(defaults.string(forKey: "AI.\(provider.rawValue).model") ?? "").isEmpty else { return false }
         if requiresAPIKey, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         return true
     }
@@ -476,7 +504,7 @@ final class OpenRouterClient {
                                completion: @escaping (Result<OpenRouterStreamResult, Error>) -> Void) -> Bool {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if requiresAPIKey && trimmedKey.isEmpty {
-            completion(.failure(AIError("No API key set. Enter your OpenRouter API key and click Connect.")))
+            completion(.failure(AIError("No API key set. Enter your API key and click Connect.")))
             return false
         }
 
@@ -556,7 +584,7 @@ final class OpenRouterClient {
                           completion: @escaping (Result<String, Error>) -> Void) {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if requiresAPIKey && trimmedKey.isEmpty {
-            completion(.failure(AIError("No API key set. Enter your OpenRouter API key and click Connect.")))
+            completion(.failure(AIError("No API key set. Enter your API key and click Connect.")))
             return
         }
 

@@ -698,9 +698,13 @@ final class AIWindowController: NSWindowController {
               newProvider != client.provider else { return }
         client.provider = newProvider
         updateProviderUI()
+        // Show the newly selected provider's own key and server, not the
+        // previous provider's left-over field contents.
+        apiKeyField.stringValue = client.apiKey
+        serverField.stringValue = client.ollamaServerURLString
         setStatus(newProvider == .ollama
                   ? "Using Ollama at \(client.ollamaServerURLString)"
-                  : "Using OpenRouter",
+                  : "Using \(newProvider.rawValue)",
                   color: .secondaryLabelColor)
         refreshModelList()
     }
@@ -779,7 +783,7 @@ final class AIWindowController: NSWindowController {
         guard syncServer() else { return }
         let key = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if client.requiresAPIKey && key.isEmpty {
-            setStatus("Enter your OpenRouter API key first.", color: .systemRed)
+            setStatus("Enter your \(client.provider.rawValue) API key first.", color: .systemRed)
             return
         }
         client.apiKey = key
@@ -843,7 +847,7 @@ final class AIWindowController: NSWindowController {
         guard syncServer() else { return }
         if OpenRouterClient.shared.requiresAPIKey
             && OpenRouterClient.shared.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setStatus("Enter your OpenRouter API key and click Connect.", color: .systemRed)
+            setStatus("Enter your \(OpenRouterClient.shared.provider.rawValue) API key and click Connect.", color: .systemRed)
             return
         }
 
@@ -877,7 +881,7 @@ final class AIWindowController: NSWindowController {
         guard syncServer() else { return }
         if OpenRouterClient.shared.requiresAPIKey
             && OpenRouterClient.shared.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setStatus("Enter your OpenRouter API key and click Connect.", color: .systemRed)
+            setStatus("Enter your \(OpenRouterClient.shared.provider.rawValue) API key and click Connect.", color: .systemRed)
             return
         }
         runUserTurn(content: "Your previous response was interrupted. Continue exactly where you stopped — do not repeat text you already produced, and complete the remaining work.",
