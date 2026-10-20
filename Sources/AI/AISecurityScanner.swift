@@ -893,10 +893,11 @@ final class AISecurityScanner {
     }
 
     /// Finds the card a validated finding refers to, within the current batch.
-    /// When the model named a file present in the batch that name wins, even if
-    /// the reported line sits outside the file's cards — trusting the line would
-    /// park the finding on an unrelated file. A name matching nothing in the
-    /// batch is unusable, so the finding is rejected rather than guessed at.
+    /// The model names files loosely (usually by bare basename), so a name can
+    /// match several same-named files. Only a name selecting ONE file is
+    /// trustworthy; a name matching several is resolved by the line only if the
+    /// line lands in exactly one of them, and is otherwise dropped rather than
+    /// guessed at — guessing attaches the finding to a file it does not describe.
     private static func resolveRange(for v: ValidatedFinding,
                                      batch: [Card],
                                      cardRanges: [CardRange]) -> CardRange? {
@@ -913,11 +914,22 @@ final class AISecurityScanner {
         let named = batchRanges.filter { matchesName($0.card, hint: hint) }
         guard !named.isEmpty else { return nil }
 
-        // Named file's card that contains the line, else the nearest of its cards.
-        if let covering = named.first(where: { v.line >= $0.card.startLine && v.line <= $0.endLine }) {
-            return covering
+        // The line decides only when it falls inside exactly one candidate file.
+        let covering = named.filter { v.line >= $0.card.startLine && v.line <= $0.endLine }
+        if let only = covering.first, namesOneFile(covering) {
+            return only
         }
+
+        // Otherwise the name alone must pick out one file.
+        guard namesOneFile(named) else { return nil }
         return named.min { distance(from: v.line, to: $0) < distance(from: v.line, to: $1) }
+    }
+
+    /// True when every candidate card belongs to the same file, so the name
+    /// identified one file even though that file may span several cards.
+    private static func namesOneFile(_ ranges: [CardRange]) -> Bool {
+        guard let first = ranges.first?.card.relativePath else { return false }
+        return ranges.allSatisfy { $0.card.relativePath == first }
     }
 
     /// How far the reported line sits outside a card's span (0 when inside).
