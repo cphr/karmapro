@@ -858,7 +858,7 @@ final class AISecurityScanner {
             let function = v.function.isEmpty ? card.fileURL.lastPathComponent : v.function
             findings.append(ScanFinding(
                 fileURL: card.fileURL,
-                line: v.line,
+                line: clampedLine(v.line, to: range),
                 function: function,
                 category: v.category,
                 message: v.summary,
@@ -882,7 +882,7 @@ final class AISecurityScanner {
                                          cardRanges: [CardRange]) -> ValidatedFinding? {
         guard let range = resolveRange(for: v, batch: batch, cardRanges: cardRanges) else { return nil }
         return ValidatedFinding(card: v.card,
-                                line: v.line,
+                                line: clampedLine(v.line, to: range),
                                 category: v.category,
                                 severity: v.severity,
                                 exploitability: v.exploitability,
@@ -892,9 +892,11 @@ final class AISecurityScanner {
                                 resolvedPath: range.card.relativePath)
     }
 
-    /// Finds the card a validated finding refers to: constrained to cards of
-    /// the current batch whose line span covers the reported line, preferring
-    /// whichever also matches the file name the model supplied.
+    /// Finds the card a validated finding refers to, within the current batch.
+    /// When the model named a file present in the batch that name wins, even if
+    /// the reported line sits outside the file's cards — trusting the line would
+    /// park the finding on an unrelated file. A name matching nothing in the
+    /// batch is unusable, so the finding is rejected rather than guessed at.
     private static func resolveRange(for v: ValidatedFinding,
                                      batch: [Card],
                                      cardRanges: [CardRange]) -> CardRange? {
@@ -905,19 +907,38 @@ final class AISecurityScanner {
                     && card.relativePath == range.card.relativePath
             })
         }
-        let lineMatches = batchRanges.filter { v.line >= $0.card.startLine && v.line <= $0.endLine }
         let hint = (v.resolvedPath ?? v.card.relativePath).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !hint.isEmpty {
-            let hintBase = URL(fileURLWithPath: hint).lastPathComponent
-            if let direct = lineMatches.first(where: {
-                $0.card.relativePath == hint
-                    || $0.card.fileURL.lastPathComponent == hintBase
-                    || $0.card.relativePath.contains(hintBase)
-            }) {
-                return direct
-            }
+        guard !hint.isEmpty else { return nil }
+
+        let named = batchRanges.filter { matchesName($0.card, hint: hint) }
+        guard !named.isEmpty else { return nil }
+
+        // Named file's card that contains the line, else the nearest of its cards.
+        if let covering = named.first(where: { v.line >= $0.card.startLine && v.line <= $0.endLine }) {
+            return covering
         }
-        return lineMatches.first
+        return named.min { distance(from: v.line, to: $0) < distance(from: v.line, to: $1) }
+    }
+
+    /// How far the reported line sits outside a card's span (0 when inside).
+    private static func distance(from line: Int, to range: CardRange) -> Int {
+        if line < range.card.startLine { return range.card.startLine - line }
+        if line > range.endLine { return line - range.endLine }
+        return 0
+    }
+
+    /// Pulls the reported line into the resolved card's span, so it never points
+    /// outside the file the finding was placed in.
+    private static func clampedLine(_ line: Int, to range: CardRange) -> Int {
+        min(max(line, range.card.startLine), range.endLine)
+    }
+
+    /// True when a card is the file the model named — same relative path or same
+    /// basename (the model may give only the file name).
+    private static func matchesName(_ card: Card, hint: String) -> Bool {
+        if card.relativePath == hint { return true }
+        let hintBase = URL(fileURLWithPath: hint).lastPathComponent
+        return card.fileURL.lastPathComponent == hintBase || card.relativePath.hasSuffix("/" + hintBase)
     }
 
     // MARK: - De-duplication
