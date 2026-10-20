@@ -168,10 +168,23 @@ final class PRReviewSession {
 
     /// The scratch worktree the base pass reads, needed to interpret the
     /// absolute URLs that pass produces.
+    ///
+    /// The name is a stable digest of the base ref rather than `hashValue`,
+    /// which is seeded per process: an unstable directory name would make the
+    /// base pass miss its cache on every launch.
     private var baseRoot: URL {
         checkout.workspace
             .deletingLastPathComponent()
-            .appendingPathComponent("base-\(checkout.headRef.hashValue)", isDirectory: true)
+            .appendingPathComponent("base-\(Self.stableSlug(checkout.baseRef))", isDirectory: true)
+    }
+
+    /// Short, filesystem-safe digest of a ref, identical across launches.
+    private static func stableSlug(_ value: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in value.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x100000001b3
+        }
+        return String(hash, radix: 16)
     }
 
     /// Scans the base commit.

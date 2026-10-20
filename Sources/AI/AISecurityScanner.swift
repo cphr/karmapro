@@ -176,6 +176,12 @@ final class AISecurityScanner {
         var cardRanges: [CardRange] = []
         var skippedFiles = 0
 
+        // Binds cached results to the tree they were scanned from: two checkouts
+        // sharing a relative path and identical text are still different code,
+        // and the model names files loosely enough that a shared cache entry
+        // could be re-resolved onto the other checkout's copy.
+        let rootKey = sha256(canonicalRootKey(projectRoot))
+
         for url in files {
             guard let source = try? String(contentsOf: url, encoding: .utf8), !source.isEmpty else { continue }
             if source.count > maxFileChars { skippedFiles += 1; continue }
@@ -186,7 +192,7 @@ final class AISecurityScanner {
                 let numbered = chunk.enumerated().map { idx, text in
                     "\(line + idx)|\(text)"
                 }.joined(separator: "\n")
-                let digest = sha256("\(provider)|\(model)|\(rel)\n\(numbered)")
+                let digest = sha256("\(provider)|\(model)|\(rootKey)|\(rel)\n\(numbered)")
                 let card = Card(fileURL: url,
                                 relativePath: rel,
                                 startLine: line,
@@ -620,7 +626,7 @@ final class AISecurityScanner {
         {"line": int, "file": string, "category": string, "severity": "Critical"|"High"|"Medium"|"Low", "exploitability": "Critical"|"High"|"Medium"|"Low", "cross_file": bool, "function": string, "summary": string}
         Rules:
         - "line" must be the EXACT absolute line number of the vulnerable statement/expression, present verbatim in the snippets. Different vulnerabilities in different statements MUST use their own line numbers — never report several distinct issues against the same line unless they are genuinely the very same statement.
-        - "file" must be the relative path or file name of the snippet that line belongs to (exactly one of the "### FILE:" headers).
+        - "file" must be COPIED VERBATIM from the "### FILE:" header that the line belongs to, including any directory path exactly as written there. Never shorten it to just the file name. If two snippets share a file name, only the full path distinguishes them.
         - "category" is a short, descriptive title naming the vulnerability (e.g. "SQL Injection", "Hardcoded Secret", "Command Injection"). Prefer one of these canonical names when it fits: \(ontology). If none fits, invent a concise, specific title that names the problem — never use "Other".
         - "function" is the enclosing function/method/class name, or an empty string if unknown.
         - "summary" is one concrete sentence, specific to this code.
@@ -643,6 +649,12 @@ final class AISecurityScanner {
             return String(path.dropFirst(rootPath.count).trimmingCharacters(in: CharacterSet(charactersIn: "/")))
         }
         return url.lastPathComponent
+    }
+
+    /// Stable identity for a scanned tree, used to scope cache entries. Symlinks
+    /// are resolved so the same directory reached by two paths is one tree.
+    private static func canonicalRootKey(_ root: URL) -> String {
+        root.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     /// Cuts an array of source lines into contiguous chunks, each at most
