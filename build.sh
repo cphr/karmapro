@@ -104,6 +104,8 @@ SOURCES=(
   Sources/tools/NoteStore.swift
   Sources/tools/BugStore.swift
   Sources/AI/PromptStore.swift
+  Sources/AI/ProviderStore.swift
+  Sources/AI/ProviderManagerController.swift
   Sources/AI/OpenRouterClient.swift
   Sources/AI/AIToolRunner.swift
   Sources/AI/AIWindowController.swift
