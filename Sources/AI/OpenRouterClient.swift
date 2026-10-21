@@ -257,13 +257,36 @@ final class OpenRouterStreamDelegate: NSObject, URLSessionDataDelegate {
         }
     }
 
-    /// Materialises the accumulated tool-call fragments.
+    /// Materialises the accumulated tool-call fragments. Some models emit
+    /// arguments that are not JSON (e.g. single-quoted dicts); a strict
+    /// provider rejects the follow-up round echoing that back, so repair it.
     private func assembledToolCalls() -> [OpenRouterToolCall] {
         toolAccums.sorted { $0.key < $1.key }.map {
             OpenRouterToolCall(id: $0.value.id.isEmpty ? "call_\($0.key)" : $0.value.id,
                                name: $0.value.name,
-                               arguments: $0.value.args.isEmpty ? "{}" : $0.value.args)
+                               arguments: Self.sanitizeToolArguments($0.value.args))
         }
+    }
+
+    /// Returns `raw` when it already parses as a JSON object; otherwise tries
+    /// quote repair, then falls back to `{}` so a malformed call degrades to
+    /// "no arguments" instead of a 400 from the provider.
+    static func sanitizeToolArguments(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isJSONObject(s) { return s }
+        // Single-quoted Python-style dict: swap quotes only when no double
+        // quote exists, which would make naive swapping ambiguous.
+        if !s.contains("\"") {
+            let repaired = s.replacingOccurrences(of: "'", with: "\"")
+            if isJSONObject(repaired) { return repaired }
+        }
+        return "{}"
+    }
+
+    private static func isJSONObject(_ s: String) -> Bool {
+        guard let data = s.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) else { return false }
+        return obj is [String: Any]
     }
 
     private func finish(_ result: Result<OpenRouterStreamResult, Error>) {
