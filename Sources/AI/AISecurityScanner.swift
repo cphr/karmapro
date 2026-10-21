@@ -325,7 +325,7 @@ final class AISecurityScanner {
         private func abortIfNeeded() {
             guard !requestedCancellation else { return }
             requestedCancellation = true
-            OpenRouterClient.shared.cancelActiveStream()
+            OpenRouterClient.shared.cancelActiveStream(scope: .scanner)
         }
 
         /// Called once a batch — including any continuation requests — has fully
@@ -439,7 +439,7 @@ final class AISecurityScanner {
                                      onDone: @escaping () -> Void,
                                      onCancel: @escaping () -> Void) {
         if isCancelled() {
-            OpenRouterClient.shared.cancelActiveStream()
+            OpenRouterClient.shared.cancelActiveStream(scope: .scanner)
             onCancel()
             return
         }
@@ -453,6 +453,7 @@ final class AISecurityScanner {
             messages: messages,
             tools: nil,
             model: model,
+            scope: .scanner,
             onPart: { part in
                 switch part {
                 case .reasoning:

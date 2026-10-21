@@ -680,7 +680,8 @@ final class ScanWindowController: NSWindowController {
         OpenRouterClient.shared.sendChat(
             systemPrompt: Self.triageSystemPrompt,
             userPrompt: Self.triagePrompt(for: f),
-            model: model) { [weak self] result in
+            model: model,
+            scope: .scanner) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self, self.triageRunning else { return }
                 switch result {

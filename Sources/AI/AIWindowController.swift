@@ -1270,11 +1270,11 @@ final class AIWindowController: NSWindowController {
     private func stopRequested() {
         cancelRequested = true
         setStatus("Cancelling…", color: .secondaryLabelColor)
-        OpenRouterClient.shared.cancelActiveStream()
+        OpenRouterClient.shared.cancelActiveStream(scope: .assistant)
         // Between streaming rounds (tool execution) there is no network
         // request to cancel and no completion will fire — reset the UI here,
         // otherwise the spinner and the Stop button would stay stuck.
-        guard OpenRouterClient.shared.hasActiveRequest else {
+        guard OpenRouterClient.shared.hasActiveRequest(scope: .assistant) else {
             if !streamAccumulated.isEmpty || modelIsThinking {
                 finishStreamingRound(success: OpenRouterStreamResult(reasoning: "",
                                                                      content: streamAccumulated,
@@ -1747,6 +1747,6 @@ final class AIWindowController: NSWindowController {
 extension AIWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Stop the in-flight stream so background work ends with the window.
-        OpenRouterClient.shared.cancelActiveStream()
+        OpenRouterClient.shared.cancelActiveStream(scope: .assistant)
     }
 }

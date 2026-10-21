@@ -461,25 +461,33 @@ final class OpenRouterClient {
 
     /// In-flight streaming requests, keyed by a per-request token so several can
     /// run concurrently (the AI scanner issues three at a time) without one
-    /// request's completion clearing another's slot.
-    private var activeStreams: [UUID: OpenRouterStreamDelegate] = [:]
+    /// request's completion clearing another's slot. Each request carries the
+    /// scope of its owner, so cancelling the Assistant's requests cannot kill
+    /// the scanner's and vice versa.
+    enum AIRequestScope { case assistant, scanner }
+
+    private var activeStreams: [UUID: (stream: OpenRouterStreamDelegate, scope: AIRequestScope)] = [:]
     /// Non-streaming requests (`sendChat` fallback) are plain `URLSession`
     /// tasks with no delegate; they are tracked here so Stop can cancel them.
-    private var activeChatTasks: [UUID: URLSessionDataTask] = [:]
+    private var activeChatTasks: [UUID: (task: URLSessionDataTask, scope: AIRequestScope)] = [:]
     /// Guards the two dictionaries above: requests are started from the main
     /// thread but completed from background URLSession callbacks.
     private let activeRequestLock = NSLock()
 
-    /// True while any request (streaming or fallback) is in flight.
-    var hasActiveRequest: Bool {
+    /// True while any request of `scope` (or of any owner when nil) is in flight.
+    func hasActiveRequest(scope: AIRequestScope? = nil) -> Bool {
         activeRequestLock.lock()
         defer { activeRequestLock.unlock() }
+        if let scope = scope {
+            return activeStreams.values.contains { $0.scope == scope }
+                || activeChatTasks.values.contains { $0.scope == scope }
+        }
         return !activeStreams.isEmpty || !activeChatTasks.isEmpty
     }
 
-    private func registerStream(_ key: UUID, _ delegate: OpenRouterStreamDelegate) {
+    private func registerStream(_ key: UUID, _ delegate: OpenRouterStreamDelegate, _ scope: AIRequestScope) {
         activeRequestLock.lock()
-        activeStreams[key] = delegate
+        activeStreams[key] = (delegate, scope)
         activeRequestLock.unlock()
     }
 
@@ -489,9 +497,9 @@ final class OpenRouterClient {
         activeRequestLock.unlock()
     }
 
-    private func registerChatTask(_ key: UUID, _ task: URLSessionDataTask) {
+    private func registerChatTask(_ key: UUID, _ task: URLSessionDataTask, _ scope: AIRequestScope) {
         activeRequestLock.lock()
-        activeChatTasks[key] = task
+        activeChatTasks[key] = (task, scope)
         activeRequestLock.unlock()
     }
 
@@ -530,6 +538,7 @@ final class OpenRouterClient {
     /// called with the failure reason).
     @discardableResult
     func sendStreamingMessages(messages: [[String: Any]], tools: [[String: Any]]?, model: String,
+                               scope: AIRequestScope = .assistant,
                                onPart: @escaping (OpenRouterStreamPart) -> Void,
                                completion: @escaping (Result<OpenRouterStreamResult, Error>) -> Void) -> Bool {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -568,7 +577,7 @@ final class OpenRouterClient {
         }
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         delegate.session = session
-        registerStream(key, delegate)
+        registerStream(key, delegate, scope)
         let task = session.dataTask(with: request)
         delegate.task = task
         task.resume()
@@ -587,12 +596,14 @@ final class OpenRouterClient {
             tools: nil, model: model, onPart: onPart, completion: completion)
     }
 
-    /// Cancels an in-flight response — the streaming delegate and the
-    /// non-streaming fallback task alike (e.g. Stop button, window close).
-    func cancelActiveStream() {
+    /// Cancels the in-flight requests of `scope` — streaming delegates and
+    /// non-streaming fallback tasks alike (e.g. Stop button, window close).
+    /// Scoping keeps one window's cancellation from killing another owner's
+    /// requests (closing the Assistant must not abort a running AI scan).
+    func cancelActiveStream(scope: AIRequestScope) {
         activeRequestLock.lock()
-        let streams = Array(activeStreams.values)
-        let tasks = Array(activeChatTasks.values)
+        let streams = activeStreams.filter { $0.value.scope == scope }.values.map(\.stream)
+        let tasks = activeChatTasks.filter { $0.value.scope == scope }.values.map(\.task)
         activeRequestLock.unlock()
         for stream in streams { stream.cancel() }
         for task in tasks { task.cancel() }
@@ -601,16 +612,18 @@ final class OpenRouterClient {
     /// Sends a (non-streaming) chat completion request and returns the
     /// assistant's message content.
     func sendChat(systemPrompt: String, userPrompt: String, model: String,
+                  scope: AIRequestScope = .assistant,
                   completion: @escaping (Result<String, Error>) -> Void) {
         sendChatMessages(messages: [["role": "system", "content": systemPrompt],
                                     ["role": "user", "content": userPrompt]],
-                         model: model, completion: completion)
+                         model: model, scope: scope, completion: completion)
     }
 
     /// Non-streaming counterpart of `sendStreamingMessages` that carries the
     /// full conversation (system + user + assistant + tool messages), so a
     /// fallback retry keeps the same context as the streaming request.
     func sendChatMessages(messages: [[String: Any]], model: String,
+                          scope: AIRequestScope = .assistant,
                           completion: @escaping (Result<String, Error>) -> Void) {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if requiresAPIKey && trimmedKey.isEmpty {
@@ -659,7 +672,7 @@ final class OpenRouterClient {
             let raw = String(data: data, encoding: .utf8) ?? "(unreadable response)"
             completion(.failure(AIError("Unexpected response from the AI endpoint: \(String(raw.prefix(400)))")))
         }
-        registerChatTask(key, task)
+        registerChatTask(key, task, scope)
         task.resume()
     }
 
