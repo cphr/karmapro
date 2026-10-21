@@ -41,18 +41,6 @@ final class AISecurityScanner {
 
     /// A raw finding as the model returns it (keys are kept optional so a
     /// malformed record is skipped rather than failing the whole batch).
-    private struct ParsedFinding: Codable {
-        var line: Int?
-        var category: String?
-        var severity: String?
-        var exploitability: String?
-        var cross_file: Bool?
-        var function: String?
-        var summary: String?
-        var file: String?
-    }
-
-    /// One numbered slice of a source file.
     private struct Card {
         let fileURL: URL
         let relativePath: String
@@ -705,32 +693,32 @@ final class AISecurityScanner {
     }
 
     /// Extracts the JSON array from a model answer (tolerating markdown
-    /// fences), decodes it, and validates every record against the file it
-    /// points at.
+    /// fences), decodes every record individually, and validates each against
+    /// the file it points at — one malformed entry drops only itself.
     private static func parse(_ content: String) -> ParseOutcome {
         var valid: [ValidatedFinding] = []
         var invalid: [(String, String)] = []
-        guard let array = extractJSONArray(from: content),
-              let findings = try? JSONDecoder().decode([ParsedFinding].self, from: array) else {
+        guard let records = extractJSONRecords(from: content) else {
             invalid.append(("batch", "response was not a JSON array: \(String(content.prefix(120)))"))
             return ParseOutcome(valid: [], invalid: invalid)
         }
-        for f in findings {
-            guard let line = f.line, line > 0 else {
-                invalid.append((f.file ?? "?", "missing or invalid line"))
+        for record in records {
+            let file = coerceString(record["file"]) ?? "?"
+            guard let line = coerceLine(record["line"]), line > 0 else {
+                invalid.append((file, "missing or invalid line"))
                 continue
             }
-            let category = normalizedCategory(f.category ?? "")
-            let severity = parseSeverity(f.severity) ?? .high
-            let exploitability = parseSeverity(f.exploitability) ?? severity
-            let function = (f.function ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let summary = (f.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let category = normalizedCategory(coerceString(record["category"]) ?? "")
+            let severity = parseSeverity(coerceString(record["severity"])) ?? .high
+            let exploitability = parseSeverity(coerceString(record["exploitability"])) ?? severity
+            let function = (coerceString(record["function"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let summary = (coerceString(record["summary"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !summary.isEmpty else {
-                invalid.append((f.file ?? "?", "line \(line) had no summary"))
+                invalid.append((file, "line \(line) had no summary"))
                 continue
             }
-            valid.append(ValidatedFinding(card: Card(fileURL: URL(fileURLWithPath: f.file ?? ""),
-                                                     relativePath: f.file ?? "",
+            valid.append(ValidatedFinding(card: Card(fileURL: URL(fileURLWithPath: file),
+                                                     relativePath: file,
                                                      startLine: line,
                                                      numberedText: "",
                                                      digest: ""),
@@ -738,24 +726,11 @@ final class AISecurityScanner {
                                           category: category,
                                           severity: severity,
                                           exploitability: exploitability,
-                                          crossFile: f.cross_file ?? false,
+                                          crossFile: coerceBool(record["cross_file"]) ?? false,
                                           function: function,
                                           summary: summary))
         }
         return ParseOutcome(valid: valid, invalid: invalid)
-    }
-
-    /// Extracts the JSON array from a model answer, tolerating markdown fences
-    /// and prose around it. Candidates are tried in order and the first one that
-    /// decodes wins, so a stray bracket in the surrounding prose cannot swallow
-    /// the real array.
-    private static func extractJSONArray(from content: String) -> Data? {
-        for candidate in jsonCandidates(from: content) {
-            if (try? JSONDecoder().decode([ParsedFinding].self, from: candidate)) != nil {
-                return candidate
-            }
-        }
-        return nil
     }
 
     /// Bracket regions to consider, outermost first: each fenced block, then
@@ -767,6 +742,59 @@ final class AISecurityScanner {
         }
         out.append(contentsOf: balancedArraySlices(in: content))
         return out
+    }
+
+    /// Lenient extraction: JSONSerialization instead of a strict `Codable`
+    /// decode, so a single bad record value (string line number, string
+    /// boolean, …) no longer poisons the whole batch. Escalating repairs cover
+    /// a trailing comma and single-quoted keys.
+    private static func extractJSONRecords(from content: String) -> [[String: Any]]? {
+        for candidate in jsonCandidates(from: content) {
+            if let records = findingsArray(candidate) { return records }
+            for repaired in repairPasses(candidate) {
+                if let records = findingsArray(repaired) { return records }
+            }
+        }
+        return nil
+    }
+
+    private static func findingsArray(_ data: Data) -> [[String: Any]]? {
+        let obj = (try? JSONSerialization.jsonObject(with: data)) ?? nil
+        return obj as? [[String: Any]]
+    }
+
+    private static func repairPasses(_ data: Data) -> [Data] {
+        let s = String(decoding: data, as: UTF8.self)
+        let noCommas = s.replacingOccurrences(of: ",\\s*([\\]}])", with: "$1",
+                                             options: .regularExpression)
+        var passes = [noCommas]
+        if !noCommas.contains("\"") {
+            passes.append(noCommas.replacingOccurrences(of: "'", with: "\""))
+        }
+        return passes.map { Data($0.utf8) }
+    }
+
+    private static func coerceString(_ v: Any?) -> String? {
+        v as? String
+    }
+
+    private static func coerceLine(_ v: Any?) -> Int? {
+        if let n = v as? Int { return n }
+        if let d = v as? Double, d == d.rounded() { return Int(d) }
+        if let s = v as? String { return Int(s.trimmingCharacters(in: .whitespaces)) }
+        return nil
+    }
+
+    private static func coerceBool(_ v: Any?) -> Bool? {
+        if let b = v as? Bool { return b }
+        if let s = v as? String {
+            switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        }
+        return nil
     }
 
     /// Bodies of ```…``` fenced blocks, in order.
