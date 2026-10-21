@@ -122,15 +122,6 @@ final class AISecurityScanner {
     /// Delay before each transport retry (index = retry number - 1).
     private static let transportRetryDelays: [Double] = [2, 8]
 
-    /// Number of batch requests kept in flight at once. Batches are independent
-    /// (each carries its own cards and prompt), so several can be answered
-    /// concurrently to cut wall-clock time on large projects.
-    private static let maxConcurrentBatches = 3
-
-    /// Ollama serves one request per model at a time unless the user raised
-    /// `OLLAMA_NUM_PARALLEL`, so extra workers only queue and risk timing out.
-    private static let maxConcurrentBatchesLocal = 1
-
     /// Categories the model may choose from. Mirrors the labels the built-in
     /// scanner produces so the Category column stays consistent; anything else
     /// maps to "Other".
@@ -169,7 +160,7 @@ final class AISecurityScanner {
                       onPhase: @escaping (AIReviewPhase) -> Void = { _ in }) {
         let client = OpenRouterClient.shared
         let model = client.selectedModel
-        let provider = client.provider.rawValue
+        let provider = client.provider.name
 
         let files = enumerateSourceFiles(in: projectRoot)
         var cards: [Card] = []
@@ -254,8 +245,7 @@ final class AISecurityScanner {
                                        isCancelled: isCancelled,
                                        onPhase: onPhase,
                                        finish: finish,
-                                       maxConcurrent: client.isOllama ? Self.maxConcurrentBatchesLocal
-                                                                     : Self.maxConcurrentBatches)
+                                       maxConcurrent: client.provider.maxConcurrentRequests)
         scheduler.start()
     }
 

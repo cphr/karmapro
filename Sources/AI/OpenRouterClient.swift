@@ -287,44 +287,22 @@ final class OpenRouterStreamDelegate: NSObject, URLSessionDataDelegate {
     }
 }
 
-/// Which AI service the assistant talks to. Both speak the OpenAI-compatible
-/// chat-completions protocol.
-enum AIProvider: String {
-    case openRouter = "OpenRouter"
-    case ollama = "Ollama"
-
-    /// Cloud providers authenticate with a bearer key and send the attribution
-    /// headers; Ollama is a local server and needs neither.
-    var isCloud: Bool { self != .ollama }
-}
-
-/// Minimal OpenRouter API client: chat completions + model listing.
-/// Two providers are supported: the OpenRouter cloud API (API key required)
-/// and a local Ollama server (editable server URL, no key). The provider, the
-/// Ollama server URL, each provider's API key and selected model are persisted
-/// in UserDefaults so they survive relaunches, can be changed at any time from
-/// the AI window, and are kept apart so switching providers never loses a key.
+/// Minimal OpenAI-compatible API client: chat completions + model listing.
+/// The provider list is OpenRouter and Ollama (both shipped, neither editable)
+/// plus any endpoints the user adds in the AI window. Each provider keeps its
+/// own base URL, API key and selected model, persisted in UserDefaults and
+/// keyed by the provider's stable id, so switching providers never loses a key
+/// and renaming one never orphans it.
 final class OpenRouterClient {
     static let shared = OpenRouterClient()
     /// Endpoint used for the OpenRouter provider.
     static let openRouterBaseURLString = "https://openrouter.ai/api/v1"
-    /// Default value of the editable Ollama server field.
+    /// Default value of the Ollama server field.
     static let ollamaBaseURLString = "http://localhost:11434/v1"
 
-    /// Used when the model list cannot be fetched (offline / no key yet).
-    static let fallbackModels: [String] = [
-        "anthropic/claude-3.5-sonnet",
-        "anthropic/claude-3.7-sonnet",
-        "openai/gpt-4o",
-        "openai/gpt-4o-mini",
-        "openai/gpt-4-turbo",
-        "google/gemini-flash-1.5",
-        "google/gemini-pro-1.5",
-        "meta-llama/llama-3.1-70b-instruct",
-        "deepseek/deepseek-chat",
-        "mistralai/mistral-large",
-        "qwen/qwen-2.5-72b-instruct"
-    ]
+    /// Used when the OpenRouter model list cannot be fetched (offline / no key
+    /// yet). Other providers ship no fallback list.
+    static let fallbackModels: [String] = AIProviderConfig.openRouterFallbacks
 
     private let defaults: UserDefaults
 
@@ -333,98 +311,127 @@ final class OpenRouterClient {
         Self.migrateLegacyKeysIfNeeded(defaults)
     }
 
-    /// Earlier builds stored one key and one model under a fixed provider's
-    /// name, so a second key-bearing provider would have shared them. Move the
-    /// stored values to the per-provider keys once, remembering which provider
-    /// they belonged to, then drop the old entries.
+    /// Brings older storage forward. Two shapes existed before the provider
+    /// list became user-extensible: a single key/model under a fixed prefix,
+    /// and (briefly) key/model stored per provider *name*. Both are moved to
+    /// per-provider-id slots, which survive a rename, and the old provider
+    /// selector becomes a provider id. Runs once.
     private static func migrateLegacyKeysIfNeeded(_ defaults: UserDefaults) {
-        guard !defaults.bool(forKey: "AI.perProviderStorageMigrated") else { return }
-        let legacyProvider = AIProvider(rawValue: defaults.string(forKey: "AI.provider") ?? "") ?? .openRouter
-        if let key = defaults.string(forKey: "OpenRouter.apiKey"), !key.isEmpty {
-            defaults.set(key, forKey: "AI.\(legacyProvider.rawValue).apiKey")
+        // Resolve which provider the stored values belonged to. The pre-list
+        // selector held a name ("OpenRouter" / "Ollama"); anything else is a
+        // provider added by a build that has since been replaced, so fall back
+        // to OpenRouter rather than lose the key.
+        let legacyName = defaults.string(forKey: "AI.provider") ?? ""
+        let legacyConfig = AIProviderConfig.builtins.first { $0.name == legacyName } ?? .openRouter
+
+        let migrated = "AI.providerIDMigrationDone"
+        if !defaults.bool(forKey: migrated) {
+            // Shape 1: "OpenRouter.apiKey" / "OpenRouter.model".
+            if let key = defaults.string(forKey: "OpenRouter.apiKey"), !key.isEmpty {
+                defaults.set(key, forKey: "AI.\(legacyConfig.id).apiKey")
+            }
+            if let model = defaults.string(forKey: "OpenRouter.model"), !model.isEmpty {
+                defaults.set(model, forKey: "AI.\(legacyConfig.id).model")
+            }
+            if legacyConfig.isOllama, let url = defaults.string(forKey: "AI.baseURL"), !url.isEmpty {
+                defaults.set(url, forKey: "AI.\(legacyConfig.id).baseURL")
+            }
+            // Shape 2: name-keyed values written by the previous build.
+            for provider in AIProviderConfig.builtins {
+                let oldKeyPrefix = "AI.\(provider.name)."
+                let newKeyPrefix = "AI.\(provider.id)."
+                for field in ["apiKey", "model", "baseURL"] {
+                    if let value = defaults.string(forKey: oldKeyPrefix + field), !value.isEmpty {
+                        // Shape 1 wins if it already wrote this slot.
+                        if defaults.string(forKey: newKeyPrefix + field) == nil {
+                            defaults.set(value, forKey: newKeyPrefix + field)
+                        }
+                    }
+                    defaults.removeObject(forKey: oldKeyPrefix + field)
+                }
+            }
+            defaults.removeObject(forKey: "OpenRouter.apiKey")
+            defaults.removeObject(forKey: "OpenRouter.model")
+            defaults.removeObject(forKey: "AI.baseURL")
+            defaults.set(true, forKey: migrated)
         }
-        if let model = defaults.string(forKey: "OpenRouter.model"), !model.isEmpty {
-            defaults.set(model, forKey: "AI.\(legacyProvider.rawValue).model")
+
+        // Keep the selected provider pointing at a real entry. Written even
+        // when no provider was stored before: a key implies an intent to use
+        // OpenRouter, and leaving the id unset would make the first launch's
+        // selection implicit rather than recorded.
+        let storedID = defaults.string(forKey: "AI.providerID") ?? ""
+        if storedID.isEmpty, !legacyName.isEmpty || defaults.string(forKey: "AI.\(legacyConfig.id).apiKey") != nil {
+            defaults.set(legacyConfig.id, forKey: "AI.providerID")
         }
-        if legacyProvider == .ollama, let url = defaults.string(forKey: "AI.baseURL"), !url.isEmpty {
-            defaults.set(url, forKey: "AI.ollama.baseURL")
-        }
-        defaults.removeObject(forKey: "OpenRouter.apiKey")
-        defaults.removeObject(forKey: "OpenRouter.model")
-        defaults.set(true, forKey: "AI.perProviderStorageMigrated")
     }
 
     /// The stored key for the current provider, so switching providers keeps
-    /// each one's key instead of overwriting a shared slot.
+    /// each one's key instead of overwriting a shared slot. Keyed by the
+    /// provider's stable id, so renaming it keeps the key.
     var apiKey: String {
-        get { defaults.string(forKey: "AI.\(provider.rawValue).apiKey") ?? "" }
-        set { defaults.set(newValue, forKey: "AI.\(provider.rawValue).apiKey") }
+        get { defaults.string(forKey: "AI.\(provider.id).apiKey") ?? "" }
+        set { defaults.set(newValue, forKey: "AI.\(provider.id).apiKey") }
     }
 
     var selectedModel: String {
         get {
-            let stored = defaults.string(forKey: "AI.\(provider.rawValue).model") ?? ""
+            let stored = defaults.string(forKey: "AI.\(provider.id).model") ?? ""
             if !stored.isEmpty { return stored }
-            return Self.fallbackModels[0]
+            return provider.fallbackModels.first ?? ""
         }
-        set { defaults.set(newValue, forKey: "AI.\(provider.rawValue).model") }
+        set { defaults.set(newValue, forKey: "AI.\(provider.id).model") }
     }
 
-    /// The selected provider ("OpenRouter" or "Ollama"), persisted.
-    var provider: AIProvider {
-        get { AIProvider(rawValue: defaults.string(forKey: "AI.provider") ?? "") ?? .openRouter }
-        set { defaults.set(newValue.rawValue, forKey: "AI.provider") }
+    /// The selected provider's id, persisted. Resolves through the store so a
+    /// provider removed while selected falls back to OpenRouter rather than
+    /// leaving the client pointing at a missing endpoint.
+    var providerID: String {
+        get { defaults.string(forKey: "AI.providerID") ?? AIProviderConfig.openRouter.id }
+        set { defaults.set(newValue, forKey: "AI.providerID") }
     }
 
-    /// The Ollama server URL shown in the editable "Connect" field, persisted.
-    /// Normalises common shortcuts (`localhost:11434` gains the required
-    /// `/v1`); an empty value falls back to the default.
+    /// The selected provider's configuration.
+    var provider: AIProviderConfig {
+        get { ProviderStore.shared.provider(id: providerID) ?? .openRouter }
+        set { providerID = newValue.id }
+    }
+
+    /// The Ollama server URL stored for the Ollama preset. Ollama is shipped
+    /// and not user-editable in the provider table, but its URL stays a stored
+    /// value so a self-hosted server keeps working.
     var ollamaServerURLString: String {
         get {
-            let stored = defaults.string(forKey: "AI.ollama.baseURL") ?? ""
-            if let normalized = Self.normalizeBaseURLString(stored) {
+            let stored = defaults.string(forKey: "AI.\(AIProviderConfig.ollama.id).baseURL") ?? ""
+            if let normalized = ProviderStore.normalizeBaseURL(stored) {
                 return normalized
             }
             return Self.ollamaBaseURLString
         }
         set {
-            let normalized = Self.normalizeBaseURLString(newValue) ?? Self.ollamaBaseURLString
-            defaults.set(normalized, forKey: "AI.ollama.baseURL")
+            let normalized = ProviderStore.normalizeBaseURL(newValue) ?? Self.ollamaBaseURLString
+            defaults.set(normalized, forKey: "AI.\(AIProviderConfig.ollama.id).baseURL")
         }
     }
 
-    /// Applies the normalisation rules described on `ollamaServerURLString`.
-    static func normalizeBaseURLString(_ raw: String) -> String? {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { return nil }
-        if !s.contains("://") { s = "http://" + s }
-        guard var url = URL(string: s), let host = url.host, !host.isEmpty else { return nil }
-        // Ollama's OpenAI-compatible routes live under /v1; accept the bare
-        // server address and append it.
-        if url.port == 11434 && !url.path.contains("v1") {
-            url = URL(string: s.hasSuffix("/") ? s + "v1" : s + "/v1") ?? url
-        }
-        return url.absoluteString.hasSuffix("/") ? String(url.absoluteString.dropLast()) : url.absoluteString
-    }
-
-    /// The active endpoint for the current provider.
+    /// The active endpoint for the current provider. Ollama's URL is stored
+    /// (its preset ships one); every other provider carries its own.
     var baseURL: URL {
-        provider == .ollama
-            ? URL(string: ollamaServerURLString) ?? URL(string: Self.ollamaBaseURLString)!
-            : URL(string: Self.openRouterBaseURLString)!
+        let raw = provider.isOllama ? ollamaServerURLString : provider.baseURL
+        return URL(string: raw) ?? URL(string: Self.ollamaBaseURLString)!
     }
 
     /// True when talking to a local Ollama server.
-    var isOllama: Bool { provider == .ollama }
+    var isOllama: Bool { provider.isOllama }
 
-    /// Cloud providers require an API key; the local Ollama server needs none.
-    var requiresAPIKey: Bool { provider.isCloud }
+    /// True when the endpoint demands a bearer key.
+    var requiresAPIKey: Bool { provider.requiresAPIKey }
 
-    /// True when the AI Assistant has a model picked and, for cloud providers,
+    /// True when the AI Assistant has a model picked and, for keyed providers,
     /// an API key entered. Reads the raw stored model (not `selectedModel`) so
     /// an untouched AI Assistant window counts as unconfigured.
     var isConfigured: Bool {
-        guard !(defaults.string(forKey: "AI.\(provider.rawValue).model") ?? "").isEmpty else { return false }
+        guard !(defaults.string(forKey: "AI.\(provider.id).model") ?? "").isEmpty else { return false }
         if requiresAPIKey, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         return true
     }
@@ -471,9 +478,9 @@ final class OpenRouterClient {
         activeRequestLock.unlock()
     }
 
-    /// Applies the endpoint-appropriate auth/identity headers: OpenRouter
-    /// requires the bearer key plus its attribution headers, local servers
-    /// get neither (an empty key simply sends no Authorization header).
+    /// Applies the endpoint-appropriate auth/identity headers: a keyed service
+    /// gets the bearer key (plus OpenRouter's attribution headers, which are
+    /// specific to it), local and other keyless servers get neither.
     private func applyCommonHeaders(to request: URLRequest, acceptSSE: Bool) -> URLRequest {
         var request = request
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -484,7 +491,7 @@ final class OpenRouterClient {
         if acceptSSE {
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         }
-        if requiresAPIKey {
+        if provider.id == AIProviderConfig.openRouter.id {
             request.setValue("https://karmapro.app", forHTTPHeaderField: "HTTP-Referer")
             request.setValue("Karma Pro", forHTTPHeaderField: "X-Title")
         }
@@ -652,6 +659,105 @@ final class OpenRouterClient {
             }
             completion(decoded.data)
         }.resume()
+    }
+
+    /// Probes a provider's connection for the "Test" button, checking the model
+    /// list *and* a one-token chat completion. Both matter: a service can list
+    /// models happily while denying every completion (unactivated account,
+    /// missing entitlement), so a list-only check would report false success.
+    /// Reports the first failure's message, which is what the user needs to act
+    /// on. Never uses the stored key/model — it takes them as arguments so an
+    /// unsaved row can be tested before it is committed.
+    func testConnection(name: String, baseURL: URL, apiKey: String, model: String?,
+                        requiresAPIKey: Bool,
+                        completion: @escaping (Result<Int, Error>) -> Void) {
+        var listRequest = URLRequest(url: baseURL.appendingPathComponent("models"))
+        listRequest.httpMethod = "GET"
+        listRequest.timeoutInterval = 20
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if requiresAPIKey && trimmedKey.isEmpty {
+            completion(.failure(AIError("This provider needs an API key.")))
+            return
+        }
+        if !trimmedKey.isEmpty {
+            listRequest.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        }
+        if name == AIProviderConfig.openRouter.name {
+            listRequest.setValue("https://karmapro.app", forHTTPHeaderField: "HTTP-Referer")
+            listRequest.setValue("Karma Pro", forHTTPHeaderField: "X-Title")
+        }
+
+        URLSession.shared.dataTask(with: listRequest) { data, response, error in
+            if let error = error {
+                completion(.failure(AIError("Could not reach \(baseURL.host ?? "the endpoint"): \(error.localizedDescription)")))
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard let data = data,
+                  let decoded = try? JSONDecoder().decode(OpenRouterModelsResponse.self, from: data) else {
+                completion(.failure(AIError(Self.describeHTTPFailure(status: status, body: data))))
+                return
+            }
+            let count = decoded.data.count
+            guard let model = model, !model.isEmpty else {
+                // No model chosen yet: the list check is all we can prove.
+                completion(.success(count))
+                return
+            }
+            // Confirm the model can actually be used.
+            var chatRequest = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
+            chatRequest.httpMethod = "POST"
+            chatRequest.timeoutInterval = 60
+            if !trimmedKey.isEmpty {
+                chatRequest.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+            }
+            chatRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "model": model,
+                "messages": [["role": "user", "content": "ping"]],
+                "max_tokens": 1,
+                "stream": false
+            ]
+            chatRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            URLSession.shared.dataTask(with: chatRequest) { chatData, chatResponse, chatError in
+                if let chatError = chatError {
+                    completion(.failure(AIError("Model list OK (\(count) models), but the test request failed: \(chatError.localizedDescription)")))
+                    return
+                }
+                let chatStatus = (chatResponse as? HTTPURLResponse)?.statusCode ?? 0
+                if chatStatus == 200, let chatData = chatData,
+                   let decoded = try? JSONDecoder().decode(OpenRouterChatResponse.self, from: chatData),
+                   decoded.choices != nil {
+                    completion(.success(count))
+                    return
+                }
+                let reason = Self.describeHTTPFailure(status: chatStatus, body: chatData)
+                completion(.failure(AIError("Model list OK (\(count) models), but \"\(model)\" was refused: \(reason)")))
+            }.resume()
+        }.resume()
+    }
+
+    /// Turns a failed response into the most specific message available, using
+    /// the API's own error text when it sent one.
+    private static func describeHTTPFailure(status: Int, body: Data?) -> String {
+        if let body = body {
+            if let decoded = try? JSONDecoder().decode(OpenRouterChatResponse.self, from: body),
+               let message = decoded.error?.message {
+                return message
+            }
+            if let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+               let error = object["error"] as? [String: Any],
+               let message = error["message"] as? String {
+                return message
+            }
+        }
+        switch status {
+        case 401: return "The API key was rejected (401)."
+        case 403: return "The key is valid but not allowed to use this model (403)."
+        case 404: return "No such endpoint (404) — check the base URL."
+        case 429: return "Rate limited (429)."
+        default: return "The endpoint returned HTTP \(status)."
+        }
     }
 }
 

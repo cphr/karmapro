@@ -736,7 +736,7 @@ final class MainWindowController: NSWindowController, NSSearchFieldDelegate {
             The built-in scan always runs on both the pull request and its base commit, so new problems can be \
             told apart from inherited ones.
 
-            An AI pass reviews the changed code with \(client.selectedModel) (\(client.provider.rawValue)). This \
+            An AI pass reviews the changed code with \(client.selectedModel) (\(client.provider.name)). This \
             sends that code to your provider and consumes tokens unless you use a local model.
 
             Reviewing the base commit as well doubles the AI cost, and is only worth it when you want inherited \
@@ -1555,7 +1555,7 @@ extension MainWindowController: NSToolbarDelegate {
 
         let client = OpenRouterClient.shared
         let modelName = client.selectedModel
-        let providerName = client.provider.rawValue
+        let providerName = client.provider.name
 
         let ask = NSAlert()
         ask.messageText = "Also run an AI scan?"

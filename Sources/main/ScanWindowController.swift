@@ -30,17 +30,12 @@ final class ScanWindowController: NSWindowController {
     private var triageIndex = 0
     /// Findings whose request has finished (success or failure), for progress.
     private var triageChecked = 0
-    /// Requests currently in flight; triage keeps up to `maxConcurrentTriage`.
+    /// Requests currently in flight; triage keeps up to the provider's limit.
     private var triageInFlight = 0
     private var triageFailed = 0
     private var triageRunning = false
     private var triageCancelled = false
     private var triageColumn: NSTableColumn?
-
-    /// Number of triage requests kept in flight at once. Ollama serves one
-    /// request per model at a time, so extra workers only queue there.
-    private static let maxConcurrentTriage = 3
-    private static let maxConcurrentTriageLocal = 1
 
     /// Extra attempts for a triage request that failed transiently.
     private static let maxTriageRetries = 2
@@ -631,7 +626,7 @@ final class ScanWindowController: NSWindowController {
         let client = OpenRouterClient.shared
         let ask = NSAlert()
         ask.messageText = "Triage with AI"
-        ask.informativeText = "Triage is 60-80% accurate depending on the model used, so it is recommended to also verify the results.\n\nEvery finding in the table will be checked with \(client.selectedModel) (\(client.provider.rawValue)). This sends the finding details to the AI model and consumes tokens / credits from your AI account (unless you use Ollama and a local model)."
+        ask.informativeText = "Triage is 60-80% accurate depending on the model used, so it is recommended to also verify the results.\n\nEvery finding in the table will be checked with \(client.selectedModel) (\(client.provider.name)). This sends the finding details to the AI model and consumes tokens / credits from your AI account (unless you use Ollama and a local model)."
         ask.alertStyle = .informational
         ask.addButton(withTitle: "Triage")
         ask.addButton(withTitle: "Cancel")
@@ -664,7 +659,7 @@ final class ScanWindowController: NSWindowController {
         guard triageRunning, !triageCancelled else { return }
         let client = OpenRouterClient.shared
         let model = client.selectedModel
-        let limit = client.isOllama ? Self.maxConcurrentTriageLocal : Self.maxConcurrentTriage
+        let limit = client.provider.maxConcurrentRequests
         // Keep several requests in flight; each completion re-enters here to
         // either dispatch the next finding or finish once the queue drains.
         while triageInFlight < limit && triageIndex < triageRows.count {
@@ -857,7 +852,7 @@ final class ScanWindowController: NSWindowController {
     /// button; the API-key check below is the only gate.
     private func runAIPhase(folder: URL, heuristic: [ScanFinding]) {
         let client = OpenRouterClient.shared
-        let providerName = client.provider.rawValue
+        let providerName = client.provider.name
 
         guard !client.requiresAPIKey
             || !client.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

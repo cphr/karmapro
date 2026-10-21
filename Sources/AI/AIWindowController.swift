@@ -51,6 +51,8 @@ final class AIWindowController: NSWindowController {
     var projectRootURL: URL?
 
     private var selectedPromptID: String?
+    /// Retains the provider manager while it is open.
+    private var providersSheet: ProviderManagerController?
     private var requestInFlight = false
     /// Set when the user cancels via Stop, so the completion message can say
     /// the response was truncated on purpose.
@@ -269,15 +271,19 @@ final class AIWindowController: NSWindowController {
 
         providerPopup.addItems(withTitles: ["OpenRouter", "Ollama"])
         providerPopup.controlSize = .small
-        providerPopup.toolTip = "Which AI service to use: the OpenRouter cloud API, or a local Ollama server"
+        providerPopup.toolTip = "Which AI service to use: the shipped OpenRouter and Ollama, or an endpoint you added"
         providerPopup.target = self
         providerPopup.action = #selector(providerSelected(_:))
         providerPopup.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(providerPopup)
 
+
         serverField.placeholderString = OpenRouterClient.ollamaBaseURLString
         serverField.font = NSFont.systemFont(ofSize: 12)
         serverField.toolTip = "Ollama server URL, e.g. http://localhost:11434/v1 — edits are remembered"
+        serverField.usesSingleLineMode = true
+        serverField.cell?.wraps = false
+        serverField.cell?.isScrollable = true
         serverField.target = self
         serverField.action = #selector(serverFieldAction(_:))
         serverField.translatesAutoresizingMaskIntoConstraints = false
@@ -410,42 +416,57 @@ final class AIWindowController: NSWindowController {
         updateControlButtons()
     }
 
-    /// Shows the controls for the selected provider: OpenRouter displays the
-    /// API key field, Ollama displays the editable "Connect" server field.
-    /// The inactive provider's constraints are deactivated so both layouts
-    /// can share the same bar without conflicts.
+    /// Shows the controls for the selected provider. OpenRouter shows the API
+    /// key field; Ollama shows the server field; a user-defined endpoint shows
+    /// both (a URL is fixed by the provider entry, so it is shown read-only as
+    /// part of the Connect field, and the key only when the provider needs one).
+    /// The inactive layouts' constraints are deactivated so they can share the
+    /// same bar without conflicts.
     private func updateProviderUI() {
         let client = OpenRouterClient.shared
+        let provider = client.provider
+        let showKey = provider.requiresAPIKey
+        let showServer = provider.isOllama
+
         NSLayoutConstraint.deactivate(providerBarConstraints)
         providerBarConstraints.removeAll()
 
-        if client.provider == .openRouter {
+        keyLabel.isHidden = !showKey
+        apiKeyField.isHidden = !showKey
+        connectLabel.isHidden = !showServer
+        serverField.isHidden = !showServer
+
+        // Anchor the first visible control, then chain the rest after it.
+        var previous: NSView = providerPopup
+        var gap: CGFloat = 14
+        if showKey {
             keyLabel.isHidden = false
             apiKeyField.isHidden = false
-            connectLabel.isHidden = true
-            serverField.isHidden = true
-            providerBarConstraints = [
-                keyLabel.leadingAnchor.constraint(equalTo: providerPopup.trailingAnchor, constant: 14),
+            providerBarConstraints.append(contentsOf: [
+                keyLabel.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: gap),
                 keyLabel.centerYAnchor.constraint(equalTo: modelPopup.centerYAnchor),
                 apiKeyField.leadingAnchor.constraint(equalTo: keyLabel.trailingAnchor, constant: 6),
                 apiKeyField.centerYAnchor.constraint(equalTo: modelPopup.centerYAnchor),
-                apiKeyField.widthAnchor.constraint(equalToConstant: 140),
-                connectButton.leadingAnchor.constraint(equalTo: apiKeyField.trailingAnchor, constant: 6)
-            ]
-        } else {
-            keyLabel.isHidden = true
-            apiKeyField.isHidden = true
+                apiKeyField.widthAnchor.constraint(equalToConstant: 140)
+            ])
+            previous = apiKeyField
+            gap = 8
+        }
+        if showServer {
             connectLabel.isHidden = false
             serverField.isHidden = false
-            providerBarConstraints = [
-                connectLabel.leadingAnchor.constraint(equalTo: providerPopup.trailingAnchor, constant: 14),
+            providerBarConstraints.append(contentsOf: [
+                connectLabel.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: gap),
                 connectLabel.centerYAnchor.constraint(equalTo: modelPopup.centerYAnchor),
                 serverField.leadingAnchor.constraint(equalTo: connectLabel.trailingAnchor, constant: 6),
                 serverField.centerYAnchor.constraint(equalTo: modelPopup.centerYAnchor),
-                serverField.widthAnchor.constraint(equalToConstant: 210),
-                connectButton.leadingAnchor.constraint(equalTo: serverField.trailingAnchor, constant: 6)
-            ]
+                serverField.widthAnchor.constraint(equalToConstant: 210)
+            ])
+            previous = serverField
+            gap = 8
         }
+        providerBarConstraints.append(
+            connectButton.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: gap))
         NSLayoutConstraint.activate(providerBarConstraints)
     }
 
@@ -679,7 +700,7 @@ final class AIWindowController: NSWindowController {
 
     private func loadSettings() {
         let client = OpenRouterClient.shared
-        providerPopup.selectItem(withTitle: client.provider.rawValue)
+        reloadProviderPopup()
         serverField.stringValue = client.ollamaServerURLString
         apiKeyField.stringValue = client.apiKey
         updateProviderUI()
@@ -689,22 +710,70 @@ final class AIWindowController: NSWindowController {
         }
     }
 
+    /// Rebuilds the provider dropdown from the store, keeping the current
+    /// selection when it still exists. Each item carries the provider's id so
+    /// selection survives renames and additions.
+    private func reloadProviderPopup() {
+        let client = OpenRouterClient.shared
+        providerPopup.removeAllItems()
+        for provider in ProviderStore.shared.providers {
+            providerPopup.addItem(withTitle: provider.name)
+            providerPopup.lastItem?.representedObject = provider.id
+        }
+        // Item that opens the endpoint manager; selecting it doesn't switch
+        // providers, it just shows the modal.
+        providerPopup.addItem(withTitle: "Add custom...")
+        providerPopup.lastItem?.representedObject = "__add_custom__"
+        let wanted = client.providerID
+        if let item = providerPopup.itemArray.first(where: { ($0.representedObject as? String) == wanted && $0.representedObject as? String != "__add_custom__" }) {
+            providerPopup.select(item)
+        } else {
+            // The selected provider was removed: fall back to OpenRouter.
+            client.provider = .openRouter
+            if let item = providerPopup.itemArray.first(where: { ($0.representedObject as? String) == AIProviderConfig.openRouter.id }) {
+                providerPopup.select(item)
+            } else {
+                providerPopup.selectItem(at: 0)
+            }
+        }
+        // User providers are marked so the dropdown explains where they came from.
+        for item in providerPopup.itemArray {
+            if let id = item.representedObject as? String,
+               id != "__add_custom__",
+               ProviderStore.shared.provider(id: id)?.isBuiltin == false {
+                item.title = "\(item.title)  (custom)"
+            }
+        }
+    }
+
     /// Switches provider (remembered across relaunches), swaps the visible
     /// controls, and refreshes the model list for the new provider.
     @objc private func providerSelected(_ sender: NSPopUpButton) {
         let client = OpenRouterClient.shared
-        guard let name = sender.titleOfSelectedItem,
-              let newProvider = AIProvider(rawValue: name),
-              newProvider != client.provider else { return }
+        guard let id = sender.selectedItem?.representedObject as? String else { return }
+        if id == "__add_custom__" {
+            // Don't change the selection; open the manager and allow the user
+            // to pick an actual provider after closing it.
+            sender.selectItem(withTitle: client.provider.name)
+            for item in sender.itemArray {
+                if let rid = item.representedObject as? String, rid == client.providerID {
+                    sender.select(item)
+                }
+            }
+            manageProvidersClicked(nil)
+            return
+        }
+        guard let newProvider = ProviderStore.shared.provider(id: id),
+              newProvider.id != client.providerID else { return }
         client.provider = newProvider
         updateProviderUI()
         // Show the newly selected provider's own key and server, not the
         // previous provider's left-over field contents.
         apiKeyField.stringValue = client.apiKey
         serverField.stringValue = client.ollamaServerURLString
-        setStatus(newProvider == .ollama
+        setStatus(newProvider.isOllama
                   ? "Using Ollama at \(client.ollamaServerURLString)"
-                  : "Using \(newProvider.rawValue)",
+                  : "Using \(newProvider.name)",
                   color: .secondaryLabelColor)
         refreshModelList()
     }
@@ -713,9 +782,9 @@ final class AIWindowController: NSWindowController {
     /// every Ollama request and on Enter so edits take effect immediately.
     @discardableResult
     private func syncServer() -> Bool {
-        guard OpenRouterClient.shared.provider == .ollama else { return true }
+        guard OpenRouterClient.shared.provider.isOllama else { return true }
         let raw = serverField.stringValue
-        guard let normalized = OpenRouterClient.normalizeBaseURLString(raw) else {
+        guard let normalized = ProviderStore.normalizeBaseURL(raw) else {
             setStatus("Invalid server URL — e.g. http://localhost:11434/v1", color: .systemRed)
             return false
         }
@@ -733,18 +802,20 @@ final class AIWindowController: NSWindowController {
         refreshModelList()
     }
 
-    /// Populates the model dropdown immediately with the fallback list, then
-    /// replaces it with the live catalog when the fetch completes
-    /// (asynchronously — never blocks the UI). Ollama has no useful fallback
-    /// list, so it shows just the saved model until the live fetch answers.
+    /// Populates the model dropdown immediately with the provider's fallback
+    /// list, then replaces it with the live catalog when the fetch completes
+    /// (asynchronously — never blocks the UI). Ollama and user-defined
+    /// endpoints ship no fallback list, so they show the saved model until the
+    /// live fetch answers.
     private func refreshModelList() {
         syncServer()
         let client = OpenRouterClient.shared
         let saved = client.selectedModel
-        if client.isOllama {
-            applyModelItems([saved], keeping: saved)
+        let fallbacks = client.provider.fallbackModels
+        if fallbacks.isEmpty {
+            applyModelItems(saved.isEmpty ? [] : [saved], keeping: saved)
         } else {
-            applyModelItems(OpenRouterClient.fallbackModels, keeping: saved)
+            applyModelItems(fallbacks, keeping: saved)
         }
         if client.requiresAPIKey && client.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
         client.fetchModels { [weak self] live in
@@ -778,12 +849,29 @@ final class AIWindowController: NSWindowController {
         setStatus("Model list refreshed.", color: .secondaryLabelColor)
     }
 
+    /// Opens the endpoint manager. It reports back whenever the provider list
+    /// changes, so the dropdown and the visible controls stay in step.
+    @objc private func manageProvidersClicked(_ sender: Any?) {
+        let manager = ProviderManagerController()
+        manager.onChange = { [weak self] in
+            guard let self = self else { return }
+            self.reloadProviderPopup()
+            self.apiKeyField.stringValue = OpenRouterClient.shared.apiKey
+            self.serverField.stringValue = OpenRouterClient.shared.ollamaServerURLString
+            self.updateProviderUI()
+            self.refreshModelList()
+        }
+        providersSheet = manager
+        manager.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc private func connectClicked(_ sender: Any?) {
         let client = OpenRouterClient.shared
         guard syncServer() else { return }
         let key = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if client.requiresAPIKey && key.isEmpty {
-            setStatus("Enter your \(client.provider.rawValue) API key first.", color: .systemRed)
+            setStatus("Enter your \(client.provider.name) API key first.", color: .systemRed)
             return
         }
         client.apiKey = key
@@ -802,6 +890,28 @@ final class AIWindowController: NSWindowController {
                     }
                     self.setStatus("Connected to Ollama — \(models.count) model(s) available.", color: .systemGreen)
                     self.refreshModelList()
+                }
+            }
+            return
+        }
+
+        if client.provider.id != AIProviderConfig.openRouter.id {
+            // A user-defined endpoint: probe models and a real completion, so
+            // an account that lists models but refuses them is caught here.
+            let name = client.provider.name
+            setStatus("Connecting to \(name)…", color: .secondaryLabelColor)
+            client.testConnection(name: name, baseURL: client.baseURL, apiKey: key,
+                                  model: client.selectedModel,
+                                  requiresAPIKey: client.requiresAPIKey) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    switch result {
+                    case .success(let count):
+                        self.setStatus("Connected to \(name) — \(count) model(s) available.", color: .systemGreen)
+                        self.refreshModelList()
+                    case .failure(let error):
+                        self.setStatus("\(name): \(error.localizedDescription)", color: .systemRed)
+                    }
                 }
             }
             return
@@ -847,7 +957,7 @@ final class AIWindowController: NSWindowController {
         guard syncServer() else { return }
         if OpenRouterClient.shared.requiresAPIKey
             && OpenRouterClient.shared.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setStatus("Enter your \(OpenRouterClient.shared.provider.rawValue) API key and click Connect.", color: .systemRed)
+            setStatus("Enter your \(OpenRouterClient.shared.provider.name) API key and click Connect.", color: .systemRed)
             return
         }
 
@@ -881,7 +991,7 @@ final class AIWindowController: NSWindowController {
         guard syncServer() else { return }
         if OpenRouterClient.shared.requiresAPIKey
             && OpenRouterClient.shared.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setStatus("Enter your \(OpenRouterClient.shared.provider.rawValue) API key and click Connect.", color: .systemRed)
+            setStatus("Enter your \(OpenRouterClient.shared.provider.name) API key and click Connect.", color: .systemRed)
             return
         }
         runUserTurn(content: "Your previous response was interrupted. Continue exactly where you stopped — do not repeat text you already produced, and complete the remaining work.",
