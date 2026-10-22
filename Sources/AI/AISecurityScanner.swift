@@ -767,8 +767,13 @@ final class AISecurityScanner {
     private static func parse(_ content: String) -> ParseOutcome {
         var valid: [ValidatedFinding] = []
         var invalid: [(String, String)] = []
+        // An empty answer means the model had nothing to report for this
+        // batch. It is not a malformed answer and must not be reported as one.
+        if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ParseOutcome(valid: [], invalid: [], salvaged: false)
+        }
         guard let extracted = extractJSONRecords(from: content) else {
-            invalid.append(("batch", "response was not a JSON array: \(String(content.prefix(120)))"))
+            invalid.append(("batch", "the answer was not a JSON array: \(String(content.prefix(120)))"))
             return ParseOutcome(valid: [], invalid: invalid, salvaged: false)
         }
         for record in extracted.records {
