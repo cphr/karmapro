@@ -103,6 +103,11 @@ final class AISecurityScanner {
     /// conversation history) up to this many times before giving up on a batch.
     private static let maxContinuations = 2
 
+    /// Bumped whenever the way a finding is attached to a file changes, so
+    /// cache entries written by an older build are not reused: they may name
+    /// the wrong file.
+    private static let cacheVersion = 2
+
     /// Extra attempts for a batch whose request failed with a transient
     /// transport/provider error. The batch is otherwise dropped for the run.
     private static let maxTransportRetries = 2
@@ -130,9 +135,23 @@ final class AISecurityScanner {
         "Remote Code Execution", "Denial of Service", "CSRF", "Prototype Pollution", "Other"
     ]
 
-    private static let cardCharBudget = 6_000
-    private static let batchCharBudget = 11_000
+    /// One card is one contiguous slice of one file, handed to the model as
+    /// its own unit of code. 24k characters usually hold a whole function, so
+    /// a vulnerability whose source and sink sit in it usually arrives in one
+    /// piece.
+    private static let cardCharBudget = 24_000
+    /// How much code one request may carry: two full cards.
+    private static let batchCharBudget = 48_000
+    /// How many files one request may carry. A project routinely holds many
+    /// files of the same name, and the model mixes them up when it sees many
+    /// at once, so a request stays small even when the files are.
+    private static let maxCardsPerBatch = 4
     private static let maxFileChars = 1_000_000   // mirrors VulnerabilityScanner's guard
+
+    /// Per-request budget for one batch. A local model may need minutes to
+    /// produce its first token and minutes more to finish a long answer.
+    private static let firstByteTimeout: Double = 120
+    private static let totalTimeout: Double = 600
 
     // MARK: - Public entry point
 
@@ -202,7 +221,8 @@ final class AISecurityScanner {
         var pending: [Card] = []
         var pendingChars = 0
         for card in cards {
-            if !pending.isEmpty && pendingChars + card.numberedText.count > batchCharBudget {
+            if !pending.isEmpty && (pending.count >= maxCardsPerBatch
+                                    || pendingChars + card.numberedText.count > batchCharBudget) {
                 batches.append(pending)
                 pending = []
                 pendingChars = 0
@@ -215,8 +235,10 @@ final class AISecurityScanner {
         let state = BatchState()
 
         let finish = { (cancelled: Bool) in
-            let deduped = dedupe(state.findings, against: existingFindings)
-            completion(AIRunResult(findings: deduped,
+            // The built-in scanner's rows and the AI's rows are merged, so a
+            // vulnerability both engines found is one row naming both.
+            let merged = mergeEngines(dedupe(state.findings), into: existingFindings)
+            completion(AIRunResult(findings: merged,
                                    cardsProcessed: state.processedCards,
                                    cardsTotal: totalCards,
                                    errors: state.errors,
@@ -382,15 +404,22 @@ final class AISecurityScanner {
                         // absolute line numbers alone match every file's first
                         // chunk, so the resolved path is what keeps cached
                         // findings attributed to the right file next time.
-                        let resolved = collector.valid.compactMap {
-                            AISecurityScanner.resolveValidated($0, batch: batch, cardRanges: self.cardRanges)
+                        var ambiguousCount = 0
+                        let resolved = collector.valid.compactMap { v -> ValidatedFinding? in
+                            guard let r = AISecurityScanner.resolveValidated(v, batch: batch,
+                                                                           cardRanges: self.cardRanges) else { return nil }
+                            if r.ambiguous { ambiguousCount += 1 }
+                            return r.finding
                         }
                         if !resolved.isEmpty {
                             AISecurityScanner.storeCachedFindings(resolved, for: batch,
                                                                   provider: self.provider, model: self.model)
                             var collected: [ScanFinding] = []
                             AISecurityScanner.appendValidated(findings: &collected, from: resolved,
-                                                              batch: batch, cardRanges: self.cardRanges)
+                                                             batch: batch, cardRanges: self.cardRanges)
+                            if ambiguousCount > 0 {
+                                self.recordError("\(batchLabel): \(ambiguousCount) finding(s) named a file that exists in several directories and could not be told apart - attached to the closest match.")
+                            }
                             self.state.addFindings(collected)
                         }
                         self.state.completedBatch(batch.count)
@@ -442,6 +471,8 @@ final class AISecurityScanner {
             tools: nil,
             model: model,
             scope: .scanner,
+            firstByteTimeout: Self.firstByteTimeout,
+            totalTimeout: Self.totalTimeout,
             onPart: { part in
                 switch part {
                 case .reasoning:
@@ -464,6 +495,9 @@ final class AISecurityScanner {
             completion: { result in
                 switch result {
                 case .failure(let error):
+                    // A cancelled request is not an error: the scan was stopped
+                    // or a sibling request was aborted.
+                    if Self.isCancellation(error) { onCancel(); return }
                     // A transient refusal (rate limit, upstream 5xx, dropped
                     // connection) is retried with backoff rather than dropping
                     // the batch; a permanent error is reported immediately.
@@ -498,11 +532,19 @@ final class AISecurityScanner {
                     let content = stream.content
                     let parsed = parse(content)
                     collector.valid.append(contentsOf: parsed.valid)
+                    if parsed.salvaged && !stream.interrupted && continuation == 0 && !parsed.valid.isEmpty {
+                        recordError("\(batchLabel): the answer was cut off - recovered \(parsed.valid.count) finding(s) from the part that arrived.")
+                    }
                     if !parsed.invalid.isEmpty {
                         let dropped = parsed.invalid.map { "\($0.file): \($0.error)" }
                         recordError("\(batchLabel): dropped \(dropped.count) invalid AI finding(s): \(dropped.prefix(3).joined(separator: ", "))")
                     }
                     if quickLooksComplete(content) {
+                        onDone()
+                    } else if stream.interrupted {
+                        // The connection died mid-answer: keep what arrived
+                        // rather than paying for another request to continue.
+                        recordError("\(batchLabel): the connection dropped mid-answer - kept the \(parsed.valid.count) finding(s) that had arrived.")
                         onDone()
                     } else if continuation < Self.maxContinuations {
                         var next = messages
@@ -549,6 +591,23 @@ final class AISecurityScanner {
     /// A missing/unauthorised key, a bad model name or exhausted credits are
     /// permanent and are not retried.
     private static func isTransientFailure(_ error: Error) -> Bool {
+        // Transport errors carry the reason in the code, which the message
+        // alone does not: "Could not connect to the server." (-1004) and
+        // "…hostname could not be found." (-1003) are both worth a retry.
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorTimedOut, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost,
+                 NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed,
+                 NSURLErrorNotConnectedToInternet, NSURLErrorDataNotAllowed,
+                 NSURLErrorSecureConnectionFailed:
+                return true
+            case NSURLErrorCancelled:
+                return false
+            default:
+                break
+            }
+        }
         let lower = error.localizedDescription.lowercased()
         if lower.contains("credit") || lower.contains("insufficient") || lower.contains("balance")
             || lower.contains("402") || lower.contains("unauthorized") || lower.contains("401")
@@ -567,6 +626,13 @@ final class AISecurityScanner {
             return true
         }
         return false
+    }
+
+    /// True when the failure is only the request being cancelled (the scan was
+    /// stopped, or a sibling request was aborted), not a real error.
+    private static func isCancellation(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
     }
 
     /// Turns transport/model failures into user-facing messages. A rate limit
@@ -607,7 +673,7 @@ final class AISecurityScanner {
         - "line" must be the EXACT absolute line number of the vulnerable statement/expression, present verbatim in the snippets. Different vulnerabilities in different statements MUST use their own line numbers — never report several distinct issues against the same line unless they are genuinely the very same statement.
         - "file" must be COPIED VERBATIM from the "### FILE:" header that the line belongs to, including any directory path exactly as written there. Never shorten it to just the file name. If two snippets share a file name, only the full path distinguishes them.
         - "category" is a short, descriptive title naming the vulnerability (e.g. "SQL Injection", "Hardcoded Secret", "Command Injection"). Prefer one of these canonical names when it fits: \(ontology). If none fits, invent a concise, specific title that names the problem — never use "Other".
-        - "function" is the enclosing function/method/class name, or an empty string if unknown.
+        - "function" is the enclosing function/method/class name exactly as it is spelled in the code, or an empty string if unknown.
         - "summary" is one concrete sentence, specific to this code.
         - "cross_file" is true only when the dangerous input clearly originates from a symbol declared in a different file than the snippet.
         - Report each distinct vulnerability exactly once — never duplicate.
@@ -690,6 +756,9 @@ final class AISecurityScanner {
     private struct ParseOutcome {
         let valid: [ValidatedFinding]
         let invalid: [(file: String, error: String)]
+        /// True when the answer was not a JSON array and the records were
+        /// salvaged from the complete objects it did contain.
+        let salvaged: Bool
     }
 
     /// Extracts the JSON array from a model answer (tolerating markdown
@@ -698,11 +767,11 @@ final class AISecurityScanner {
     private static func parse(_ content: String) -> ParseOutcome {
         var valid: [ValidatedFinding] = []
         var invalid: [(String, String)] = []
-        guard let records = extractJSONRecords(from: content) else {
+        guard let extracted = extractJSONRecords(from: content) else {
             invalid.append(("batch", "response was not a JSON array: \(String(content.prefix(120)))"))
-            return ParseOutcome(valid: [], invalid: invalid)
+            return ParseOutcome(valid: [], invalid: invalid, salvaged: false)
         }
-        for record in records {
+        for record in extracted.records {
             let file = coerceString(record["file"]) ?? "?"
             guard let line = coerceLine(record["line"]), line > 0 else {
                 invalid.append((file, "missing or invalid line"))
@@ -730,7 +799,7 @@ final class AISecurityScanner {
                                           function: function,
                                           summary: summary))
         }
-        return ParseOutcome(valid: valid, invalid: invalid)
+        return ParseOutcome(valid: valid, invalid: invalid, salvaged: extracted.salvaged)
     }
 
     /// Bracket regions to consider, outermost first: each fenced block, then
@@ -744,18 +813,79 @@ final class AISecurityScanner {
         return out
     }
 
+    /// The records of a model answer, plus whether they had to be salvaged
+    /// from an answer that was not a complete JSON array.
+    private struct ExtractedRecords {
+        let records: [[String: Any]]
+        /// True when the answer was not a JSON array and the records came from
+        /// the complete objects it did contain.
+        let salvaged: Bool
+    }
+
     /// Lenient extraction: JSONSerialization instead of a strict `Codable`
     /// decode, so a single bad record value (string line number, string
     /// boolean, …) no longer poisons the whole batch. Escalating repairs cover
-    /// a trailing comma and single-quoted keys.
-    private static func extractJSONRecords(from content: String) -> [[String: Any]]? {
+    /// a trailing comma and single-quoted keys. An answer that is not an array
+    /// (a cut-off array, or a continuation returning bare objects) is salvaged
+    /// object by object, so the records it did contain are not lost.
+    private static func extractJSONRecords(from content: String) -> ExtractedRecords? {
         for candidate in jsonCandidates(from: content) {
-            if let records = findingsArray(candidate) { return records }
+            if let records = findingsArray(candidate) {
+                return ExtractedRecords(records: records, salvaged: false)
+            }
             for repaired in repairPasses(candidate) {
-                if let records = findingsArray(repaired) { return records }
+                if let records = findingsArray(repaired) {
+                    return ExtractedRecords(records: records, salvaged: false)
+                }
             }
         }
-        return nil
+        var recovered: [[String: Any]] = []
+        for slice in looseObjectSlices(in: content) {
+            if let record = (try? JSONSerialization.jsonObject(with: slice)) as? [String: Any] {
+                recovered.append(record)
+            }
+        }
+        return recovered.isEmpty ? nil : ExtractedRecords(records: recovered, salvaged: true)
+    }
+
+    /// Every balanced top-level `{` … `}` span, so the complete objects of a
+    /// cut-off answer can be decoded one by one. Nested objects belong to
+    /// their parent and are not returned separately.
+    private static func looseObjectSlices(in content: String) -> [Data] {
+        let chars = Array(content)
+        var slices: [Data] = []
+        var start = 0
+        while start < chars.count {
+            guard chars[start] == "{" else { start += 1; continue }
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var end = start
+            var closed = false
+            while end < chars.count {
+                let c = chars[end]
+                if inString {
+                    if escaped { escaped = false }
+                    else if c == "\\" { escaped = true }
+                    else if c == "\"" { inString = false }
+                } else if c == "\"" {
+                    inString = true
+                } else if c == "{" {
+                    depth += 1
+                } else if c == "}" {
+                    depth -= 1
+                    if depth == 0 {
+                        slices.append(Data(String(chars[start...end]).utf8))
+                        closed = true
+                        break
+                    }
+                }
+                end += 1
+            }
+            if !closed { break }   // the tail was cut off
+            start = end + 1
+        }
+        return slices
     }
 
     private static func findingsArray(_ data: Data) -> [[String: Any]]? {
@@ -884,7 +1014,7 @@ final class AISecurityScanner {
                                         batch: [Card],
                                         cardRanges: [CardRange]) {
         for v in parsed {
-            guard let range = resolveRange(for: v, batch: batch, cardRanges: cardRanges) else { continue }
+            guard let range = resolveRange(for: v, batch: batch, cardRanges: cardRanges)?.range else { continue }
             let card = range.card
             let function = v.function.isEmpty ? card.fileURL.lastPathComponent : v.function
             findings.append(ScanFinding(
@@ -907,31 +1037,48 @@ final class AISecurityScanner {
 
     /// Marks a validated finding with the relative path of the card it truly
     /// belongs to, so caching can persist a stable file identity. Unresolvable
-    /// findings (line outside every sent card) return nil.
+    /// findings (line outside every sent card) return nil. The second value
+    /// says whether the file had to be guessed.
     private static func resolveValidated(_ v: ValidatedFinding,
                                          batch: [Card],
-                                         cardRanges: [CardRange]) -> ValidatedFinding? {
-        guard let range = resolveRange(for: v, batch: batch, cardRanges: cardRanges) else { return nil }
-        return ValidatedFinding(card: v.card,
-                                line: clampedLine(v.line, to: range),
-                                category: v.category,
-                                severity: v.severity,
-                                exploitability: v.exploitability,
-                                crossFile: v.crossFile,
-                                function: v.function,
-                                summary: v.summary,
-                                resolvedPath: range.card.relativePath)
+                                         cardRanges: [CardRange]) -> (finding: ValidatedFinding, ambiguous: Bool)? {
+        guard let match = resolveRange(for: v, batch: batch, cardRanges: cardRanges) else { return nil }
+        let range = match.range
+        let finding = ValidatedFinding(card: v.card,
+                                       line: clampedLine(v.line, to: range),
+                                       category: v.category,
+                                       severity: v.severity,
+                                       exploitability: v.exploitability,
+                                       crossFile: v.crossFile,
+                                       function: v.function,
+                                       summary: v.summary,
+                                       resolvedPath: range.card.relativePath)
+        return (finding, match.ambiguous)
+    }
+
+    /// A validated finding matched to the card it belongs to.
+    private struct RangeMatch {
+        let range: CardRange
+        /// True when several same-named files matched and neither the line nor
+        /// the function name separated them, so one of them was guessed.
+        let ambiguous: Bool
     }
 
     /// Finds the card a validated finding refers to, within the current batch.
-    /// The model names files loosely (usually by bare basename), so a name can
-    /// match several same-named files. Only a name selecting ONE file is
-    /// trustworthy; a name matching several is resolved by the line only if the
-    /// line lands in exactly one of them, and is otherwise dropped rather than
-    /// guessed at — guessing attaches the finding to a file it does not describe.
+    ///
+    /// The path the model named decides, and on its own: a finding whose path
+    /// IS a card's relative path (or a path ending with it, as an absolute
+    /// path does) belongs to that card, never to a same-named file elsewhere.
+    /// Projects routinely hold many files of the same name, and the reported
+    /// line cannot tell them apart because every file starts at line 1 - so
+    /// falling back to the file name alone is what used to pile a whole
+    /// batch's findings onto whichever same-named file came first.
+    ///
+    /// Only a bare file name leaves the choice open, and then the reported
+    /// line and the reported function name pick between the files sharing it.
     private static func resolveRange(for v: ValidatedFinding,
                                      batch: [Card],
-                                     cardRanges: [CardRange]) -> CardRange? {
+                                     cardRanges: [CardRange]) -> RangeMatch? {
         let batchRanges = cardRanges.filter { range in
             batch.contains(where: { card in
                 card.fileURL == range.card.fileURL
@@ -939,21 +1086,88 @@ final class AISecurityScanner {
                     && card.relativePath == range.card.relativePath
             })
         }
-        let hint = (v.resolvedPath ?? v.card.relativePath).trimmingCharacters(in: .whitespacesAndNewlines)
+        let hint = normalizedHint(v.resolvedPath ?? v.card.relativePath)
         guard !hint.isEmpty else { return nil }
 
-        let named = batchRanges.filter { matchesName($0.card, hint: hint) }
-        guard !named.isEmpty else { return nil }
+        // The path the model named, exactly.
+        let exact = batchRanges.filter { $0.card.relativePath == hint }
+        if !exact.isEmpty { return pick(v, in: exact) }
 
-        // The line decides only when it falls inside exactly one candidate file.
-        let covering = named.filter { v.line >= $0.card.startLine && v.line <= $0.endLine }
-        if let only = covering.first, namesOneFile(covering) {
-            return only
+        // The same path written from a parent directory, or as an absolute one.
+        let byPath = batchRanges.filter { namesPath(hint, $0.card.relativePath) }
+        if !byPath.isEmpty {
+            // The most specific match wins: "src/util.c" over "a/src/util.c".
+            let longest = byPath.map { $0.card.relativePath.count }.max() ?? 0
+            return pick(v, in: byPath.filter { $0.card.relativePath.count == longest })
         }
 
-        // Otherwise the name alone must pick out one file.
-        guard namesOneFile(named) else { return nil }
-        return named.min { distance(from: v.line, to: $0) < distance(from: v.line, to: $1) }
+        // Only a bare file name was given: the files that share it.
+        let base = URL(fileURLWithPath: hint).lastPathComponent
+        let named = batchRanges.filter { $0.card.fileURL.lastPathComponent == base }
+        guard !named.isEmpty else { return nil }
+        return pick(v, in: named)
+    }
+
+    /// Picks the card a finding belongs to among candidates that may come from
+    /// several files: the reported line picks the file that holds it, the
+    /// reported function name the file that declares it. When neither
+    /// separates them the closest span wins and the guess is reported.
+    private static func pick(_ v: ValidatedFinding, in ranges: [CardRange]) -> RangeMatch {
+        let covering = ranges.filter { v.line >= $0.card.startLine && v.line <= $0.endLine }
+        let byLine = covering.isEmpty ? ranges : covering
+        if namesOneFile(byLine) {
+            return RangeMatch(range: closest(to: v.line, in: byLine), ambiguous: false)
+        }
+        let byFunction = byLine.filter { declares($0.card, function: v.function) }
+        if namesOneFile(byFunction) {
+            return RangeMatch(range: closest(to: v.line, in: byFunction), ambiguous: false)
+        }
+        let declaring = ranges.filter { declares($0.card, function: v.function) }
+        if namesOneFile(declaring) {
+            return RangeMatch(range: closest(to: v.line, in: declaring), ambiguous: false)
+        }
+        return RangeMatch(range: closest(to: v.line, in: byLine), ambiguous: !namesOneFile(byLine))
+    }
+
+    /// True when the card's code declares (or calls) the named function. This
+    /// is what tells two same-named files apart when the model gave only the
+    /// file name.
+    private static func declares(_ card: Card, function: String) -> Bool {
+        guard !function.isEmpty else { return false }
+        let pattern = "\\b" + NSRegularExpression.escapedPattern(for: function) + "\\s*\\("
+        return card.numberedText.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// The path the model named, cleaned up: quotes and whitespace removed and
+    /// a leading "./" dropped, so it compares with a card's relative path.
+    private static func normalizedHint(_ raw: String) -> String {
+        var hint = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        hint = hint.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+        hint = hint.trimmingCharacters(in: .whitespacesAndNewlines)
+        while hint.hasPrefix("./") { hint.removeFirst(2) }
+        return hint
+    }
+
+    /// True when the path the model named is the card's path, or ends with it
+    /// (the model may answer with an absolute path). The comparison ignores
+    /// case, as a file system does.
+    private static func namesPath(_ hint: String, _ path: String) -> Bool {
+        if hint == path { return true }
+        guard !path.isEmpty else { return false }
+        let h = hint.lowercased()
+        let p = path.lowercased()
+        return h == p || h.hasSuffix("/" + p)
+    }
+
+    /// The candidate whose span is nearest the reported line, the path
+    /// breaking ties so the same answer always lands on the same file.
+    private static func closest(to line: Int, in ranges: [CardRange]) -> CardRange {
+        ranges.sorted { lhs, rhs in
+            let dl = distance(from: line, to: lhs)
+            let dr = distance(from: line, to: rhs)
+            if dl != dr { return dl < dr }
+            return lhs.card.relativePath < rhs.card.relativePath
+        }[0]
     }
 
     /// True when every candidate card belongs to the same file, so the name
@@ -976,35 +1190,68 @@ final class AISecurityScanner {
         min(max(line, range.card.startLine), range.endLine)
     }
 
-    /// True when a card is the file the model named — same relative path or same
-    /// basename (the model may give only the file name).
-    private static func matchesName(_ card: Card, hint: String) -> Bool {
-        if card.relativePath == hint { return true }
-        let hintBase = URL(fileURLWithPath: hint).lastPathComponent
-        return card.fileURL.lastPathComponent == hintBase || card.relativePath.hasSuffix("/" + hintBase)
-    }
+    // MARK: - De-duplication & engine merge
 
-    // MARK: - De-duplication
-
-    /// Drops AI findings that target a line the built-in scanner already reported
-    /// (same file AND same line — regardless of category, so nothing is shown
-    /// twice), then removes AI-vs-AI duplicates keeping the first occurrence.
-    /// Paths are canonicalised (symlinks + standardisation) so a subtle path
-    /// representation difference between the scanner and the AI runner can
-    /// never defeat the de-duplication.
-    static func dedupe(_ ai: [ScanFinding], against existing: [ScanFinding]) -> [ScanFinding] {
-        let occupiedLines = Set(existing.map { locationKey($0) })
+    /// Removes AI-vs-AI duplicates (same file, line, category and function),
+    /// keeping the first occurrence. Paths are canonicalised (symlinks +
+    /// standardisation) so a subtle path representation difference between
+    /// two answers cannot defeat the de-duplication.
+    static func dedupe(_ ai: [ScanFinding]) -> [ScanFinding] {
         var seen = Set<String>()
         var result: [ScanFinding] = []
         for f in ai {
-            let location = locationKey(f)
-            if occupiedLines.contains(location) { continue }
             let key = findingKey(f)
             guard !seen.contains(key) else { continue }
             seen.insert(key)
             result.append(f)
         }
         return result
+    }
+
+    /// Merges the AI's findings into the built-in scanner's rows: a
+    /// vulnerability both engines reported (same file, line and category)
+    /// becomes a single row whose engine label names both, e.g.
+    /// "Heuristic, AI". AI findings the built-in scanner did not report are
+    /// kept as rows of their own.
+    static func mergeEngines(_ ai: [ScanFinding], into builtIn: [ScanFinding]) -> [ScanFinding] {
+        var rows = builtIn
+        var indexByLocation: [String: [Int]] = [:]
+        for (index, f) in rows.enumerated() where f.scanningSource != "AI" {
+            indexByLocation[locationKey(f), default: []].append(index)
+        }
+        var credited = Set<Int>()
+        var aiOnly: [ScanFinding] = []
+        for f in ai {
+            guard let candidates = indexByLocation[locationKey(f)] else {
+                aiOnly.append(f)
+                continue
+            }
+            guard let index = candidates.first(where: { sameIssue(rows[$0].category, f.category) }) else {
+                aiOnly.append(f)
+                continue
+            }
+            guard !credited.contains(index) else { continue }   // that row already names the AI
+            credited.insert(index)
+            rows[index].scanningSource = engineLabel(rows[index].scanningSource, f.scanningSource)
+        }
+        return rows + aiOnly
+    }
+
+    /// True when both labels name the same kind of issue, so the two rows are
+    /// one finding reported by two engines.
+    private static func sameIssue(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if a == b { return true }
+        return !a.isEmpty && !b.isEmpty && (a.contains(b) || b.contains(a))
+    }
+
+    /// Adds an engine to a row's label, keeping the order the engines were
+    /// found in and never naming the same one twice.
+    private static func engineLabel(_ existing: String, _ adding: String) -> String {
+        let parts = existing.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        if parts.contains(where: { $0.caseInsensitiveCompare(adding) == .orderedSame }) { return existing }
+        return existing.isEmpty ? adding : existing + ", " + adding
     }
 
     /// Canonical key for "this line in this file": identical for both scanner
@@ -1046,7 +1293,9 @@ final class AISecurityScanner {
         let modelDir = dir.appendingPathComponent(modelSlug(model), isDirectory: true)
         try? FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
         let digests = batch.map { $0.digest }.joined(separator: "-")
-        return modelDir.appendingPathComponent("\(provider)-\(sha256(digests)).json")
+        // The version is part of the name: entries written by an older build may
+        // name the wrong file and must not be reused.
+        return modelDir.appendingPathComponent("\(provider)-v\(cacheVersion)-\(sha256(digests)).json")
     }
 
     private static func storeCachedFindings(_ valid: [ValidatedFinding], for batch: [Card], provider: String, model: String) {

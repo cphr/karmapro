@@ -116,10 +116,10 @@ final class PRReviewSession {
         let heuristic = VulnerabilityScanner.scan(projectRoot: headRoot,
                                                   isCancelled: { self.scanCancelled })
         guard wantsAI, !scanCancelled else { return heuristic }
-        return heuristic + aiPass(projectRoot: headRoot,
-                                  existing: heuristic,
-                                  label: "the pull request",
-                                  progress: progress)
+        return aiPass(projectRoot: headRoot,
+                      existing: heuristic,
+                      label: "the pull request",
+                      progress: progress)
     }
 
     /// The AI pass for one side of the comparison.
@@ -134,20 +134,22 @@ final class PRReviewSession {
                         progress: (String) -> Void) -> [ScanFinding] {
         progress("AI pass on \(label)…")
         let semaphore = DispatchSemaphore(value: 0)
-        var aiFindings: [ScanFinding] = []
+        var findings: [ScanFinding] = existing
         AISecurityScanner.runAI(projectRoot: projectRoot,
                                 existingFindings: existing,
                                 progress: { _ in },
                                 isCancelled: { self.scanCancelled },
                                 completion: { result in
-            aiFindings = AISecurityScanner.dedupe(result.findings, against: existing)
+            // runAI merges the AI rows with the built-in ones, so a finding
+            // both engines reported is a single row naming both.
+            findings = result.findings
             semaphore.signal()
         },
                                 onPhase: { _ in })
         while semaphore.wait(timeout: .now() + 0.05) == .timedOut {
-            if scanCancelled { return [] }
+            if scanCancelled { return existing }
         }
-        return aiFindings
+        return findings
     }
 
     /// Re-points findings scanned in one checkout at another root.
@@ -228,10 +230,10 @@ final class PRReviewSession {
         let heuristic = VulnerabilityScanner.scan(projectRoot: scratch,
                                                    isCancelled: { self.scanCancelled })
         guard wantsAI, !scanCancelled else { return heuristic }
-        return heuristic + aiPass(projectRoot: scratch,
-                                  existing: heuristic,
-                                  label: "the base commit",
-                                  progress: progress)
+        return aiPass(projectRoot: scratch,
+                      existing: heuristic,
+                      label: "the base commit",
+                      progress: progress)
     }
 
     /// Removes the checkout. Called when the user closes the review.

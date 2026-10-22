@@ -1111,10 +1111,16 @@ final class AIWindowController: NSWindowController {
         setStreamingUI(false)
         spinner.stopAnimation(nil)
         if let sr = success {
-            finalizeAssistantTurn(content: sr.content, interrupted: cancelRequested)
+            // A stream that died mid-answer arrives as a success carrying the
+            // part that arrived, marked as interrupted.
+            let cutShort = sr.interrupted && !sr.content.isEmpty
+            finalizeAssistantTurn(content: sr.content, interrupted: cancelRequested || cutShort)
             if cancelRequested {
                 lastTaskInterrupted = true
                 setStatus("Stopped — press Continue to resume with context, or type a new prompt.", color: .secondaryLabelColor)
+            } else if cutShort {
+                lastTaskInterrupted = true
+                setStatus("The connection dropped before the answer was finished — press Continue to resume with context.", color: .secondaryLabelColor)
             } else {
                 lastTaskInterrupted = false
                 setStatus("Done.", color: .secondaryLabelColor)

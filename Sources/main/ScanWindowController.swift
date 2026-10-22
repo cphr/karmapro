@@ -364,7 +364,7 @@ final class ScanWindowController: NSWindowController {
         if !wantsAI, let cached = ScanWindowController.cachedFolder, cached.standardizedFileURL == folder.standardizedFileURL {
             aiPhaseActive = false
             setAIThinking(false)
-            let cachedFindings = enforceNoScannerDuplicates(ScanWindowController.cachedFindings)
+            let cachedFindings = ScanWindowController.cachedFindings
             findings = applyIgnoredFilter(cachedFindings)
             applySorting()
             resetTriage()
@@ -417,10 +417,10 @@ final class ScanWindowController: NSWindowController {
                 return
             }
             // Same post-processing a project scan gets, so the two tables are
-            // presented identically: the same duplicate guard, the same sort,
+            // presented identically: the same engine merge, the same sort,
             // and rows coloured by the same per-column rules. The "In PR?"
             // column is the only difference a pull-request scan adds.
-            let merged = self.enforceNoScannerDuplicates(session.findings.map(\.finding))
+            let merged = session.findings.map(\.finding)
             self.findings = self.applyIgnoredFilter(merged)
             self.applySorting()
             self.rebuildAwareness()
@@ -479,20 +479,9 @@ final class ScanWindowController: NSWindowController {
         return input.filter { !ignored.contains(ignoredKey(for: $0)) }
     }
 
-    /// Hard guarantee for the results table: an AI finding is shown only if the
-    /// built-in scanner (AST/Heuristic) did NOT already report the same file on
-    /// the same line. Applied every time rows are assembled, including cached
-    /// scans, so duplicates can never reappear.
-    private func enforceNoScannerDuplicates(_ input: [ScanFinding]) -> [ScanFinding] {
-        let scannerOccupied = Set(input
-            .filter { $0.scanningSource != "AI" }
-            .map { AISecurityScanner.locationKey($0) })
-        return input.filter { finding in
-            if finding.scanningSource == "AI" {
-                return !scannerOccupied.contains(AISecurityScanner.locationKey(finding))
-            }
-            return true
-        }
+    /// True when the row names the AI as one of the engines that reported it.
+    private func isAIRow(_ f: ScanFinding) -> Bool {
+        f.scanningSource.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "AI" }
     }
 
     /// Builds a stable key identifying a single finding across scans.
@@ -837,7 +826,7 @@ final class ScanWindowController: NSWindowController {
                 self.findings = self.applyIgnoredFilter(result)
                 self.applySorting()
                 self.tableView.reloadData()
-                self.updateStatus(heuristicCount: result.count, aiCount: 0)
+                self.updateStatus(totalCount: result.count, aiCount: 0)
                 guard self.wantsAI, !self.scanCancelled else {
                     self.rescanButton.isEnabled = true
                     return
@@ -863,7 +852,7 @@ final class ScanWindowController: NSWindowController {
             missing.alertStyle = .warning
             missing.addButton(withTitle: "OK")
             missing.runModal()
-            updateStatus(heuristicCount: heuristic.count, aiCount: 0, aiSkipped: true)
+            updateStatus(totalCount: heuristic.count, aiCount: 0, aiSkipped: true)
             rescanButton.isEnabled = true
             return
         }
@@ -895,10 +884,10 @@ final class ScanWindowController: NSWindowController {
                     self.aiPhaseActive = false
                     self.setAIThinking(false)
                     guard !self.scanCancelled else { return }
-                    // Safety net: never let an AI row appear where the built-in
-                    // scanner already reported the same file and line.
-                    let aiFindings = AISecurityScanner.dedupe(result.findings, against: heuristic)
-                    let merged = self.enforceNoScannerDuplicates(heuristic + aiFindings)
+                    // The AI pass merges its findings with the built-in
+                    // scanner's rows: a vulnerability both engines found is one
+                    // row whose engine column names both.
+                    let merged = result.findings
                     ScanWindowController.cachedFindings = merged
                     self.findings = self.applyIgnoredFilter(merged)
                     self.applySorting()
@@ -907,7 +896,8 @@ final class ScanWindowController: NSWindowController {
                     self.progressBar.doubleValue = 1
                     self.progressBar.isHidden = true
                     self.progressBar.stopAnimation(nil)
-                    self.updateStatus(heuristicCount: heuristic.count, aiCount: aiFindings.count,
+                    self.updateStatus(totalCount: merged.count,
+                                      aiCount: merged.filter { self.isAIRow($0) }.count,
                                       aiCancelled: result.cancelled,
                                       aiIssues: result.errors)
                     self.rescanButton.isEnabled = true
@@ -952,13 +942,13 @@ final class ScanWindowController: NSWindowController {
         }
     }
 
-    private func updateStatus(heuristicCount: Int,
+    private func updateStatus(totalCount: Int,
                               aiCount: Int,
                               aiSkipped: Bool = false,
                               aiCancelled: Bool = false,
                               aiIssues: [String] = []) {
         let plural = { (n: Int) in n == 1 ? "" : "s" }
-        if heuristicCount == 0 && aiCount == 0 {
+        if totalCount == 0 {
             if aiSkipped {
                 statusLabel.stringValue = "Scan complete: no issues found. (AI analysis skipped — no source files were reported.)"
             } else {
@@ -966,7 +956,7 @@ final class ScanWindowController: NSWindowController {
             }
             return
         }
-        var text = "Scan complete: \(heuristicCount + aiCount) potential issue\(plural(heuristicCount + aiCount)) found"
+        var text = "Scan complete: \(totalCount) potential issue\(plural(totalCount)) found"
         if aiCount > 0 {
             text += " (\(aiCount) via AI)"
         }
@@ -1091,7 +1081,7 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             cellView.textField?.stringValue = fnText
             cellView.textField?.toolTip = f.reachable ? "Function is reachable from an entry point." : "Function is NOT reachable from an entry point in this file."
         case "file":
-            cellView.textField?.stringValue = f.fileURL.lastPathComponent
+            cellView.textField?.stringValue = displayPath(for: f)
             cellView.textField?.toolTip = f.fileURL.path
         case "line":
             // A "Fixed" row is a finding from the base scan, so its line number
@@ -1110,18 +1100,25 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             }
             cellView.textField?.alignment = .right
         case "src":
-            cellView.textField?.stringValue = f.scanningSource
             cellView.textField?.alignment = .center
-            if f.scanningSource == "AST" {
-                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-                cellView.textField?.textColor = .systemGreen
+            // A row both engines reported names them all, each in its colour.
+            let engines = f.scanningSource.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            let attributed = NSMutableAttributedString()
+            for (index, engine) in engines.enumerated() {
+                if index > 0 { attributed.append(NSAttributedString(string: ", ")) }
+                let color: NSColor = engine == "AI" ? .systemPurple : (engine == "AST" ? .systemGreen : .systemBlue)
+                let weight: NSFont.Weight = (engine == "AI" || engine == "AST") ? .bold : .semibold
+                attributed.append(NSAttributedString(string: engine, attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: weight),
+                    .foregroundColor: color]))
+            }
+            cellView.textField?.attributedStringValue = attributed
+            if engines.count > 1 {
+                cellView.textField?.toolTip = "Reported by \(f.scanningSource)."
             } else if f.scanningSource == "AI" {
-                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-                cellView.textField?.textColor = .systemPurple
                 cellView.textField?.toolTip = "Found by the AI assistant model during the AI deep scan phase."
             } else {
-                cellView.textField?.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-                cellView.textField?.textColor = .systemBlue
+                cellView.textField?.toolTip = nil
             }
         case "crossfile":
             cellView.textField?.stringValue = f.crossFile ? "Yes" : "No"
@@ -1185,6 +1182,17 @@ extension ScanWindowController: NSTableViewDataSource, NSTableViewDelegate {
             cellView.textField?.stringValue = ""
         }
         return cellView
+    }
+
+    /// The file as the reader knows it: its path relative to the scanned
+    /// folder, so two files of the same name in different directories are told
+    /// apart instead of both showing as "vuln.c".
+    private func displayPath(for f: ScanFinding) -> String {
+        let path = f.fileURL.standardizedFileURL.path
+        if let root = scannedFolder?.standardizedFileURL.path, path.hasPrefix(root + "/") {
+            return String(path.dropFirst(root.count + 1))
+        }
+        return f.fileURL.lastPathComponent
     }
 
     private func columnWidth(for id: String) -> CGFloat {

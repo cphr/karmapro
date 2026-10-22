@@ -35,6 +35,9 @@ struct OpenRouterStreamResult {
     var reasoning: String = ""
     var content: String = ""
     var toolCalls: [OpenRouterToolCall] = []
+    /// True when the stream was cut short (timeout, dropped connection) after
+    /// part of the answer had already arrived.
+    var interrupted: Bool = false
     var isEmpty: Bool { content.isEmpty && reasoning.isEmpty && toolCalls.isEmpty }
 }
 
@@ -77,10 +80,12 @@ final class OpenRouterStreamDelegate: NSObject, URLSessionDataDelegate {
         self.onFinish = onFinish
     }
 
-    /// Arms a timer that force-fails the request when no response headers
-    /// arrive within `seconds` (e.g. a firewall silently dropping the
-    /// connection), so the UI never waits forever.
-    func startWatchdog(seconds: Double = 30) {
+    /// Arms a timer that force-fails the request when nothing has arrived
+    /// within `seconds` (a firewall dropping the connection, or a local server
+    /// still loading its model), so the UI never waits forever. CFNetwork
+    /// hands over the response together with the first body byte, so this is
+    /// in practice a first-token budget.
+    func startWatchdog(seconds: Double = 60) {
         watchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self = self, !self.finished, !self.gotResponse else { return }
@@ -150,13 +155,16 @@ final class OpenRouterStreamDelegate: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error = error {
-            // Cancelled: report what streamed so far (if anything) so the
-            // partial response is kept in the UI.
-            if (error as NSError).code == NSURLErrorCancelled,
-               !contentAssembled.isEmpty || !reasoningAssembled.isEmpty || !toolAccums.isEmpty {
+            // Keep whatever streamed so far: a timed-out or dropped connection
+            // still carries the part of the answer that did arrive, which the
+            // scanner salvages into findings instead of losing the batch.
+            let ns = error as NSError
+            let cancelled = ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
+            if !contentAssembled.isEmpty || !reasoningAssembled.isEmpty || !toolAccums.isEmpty {
                 finish(.success(OpenRouterStreamResult(reasoning: reasoningAssembled,
                                                        content: contentAssembled,
-                                                       toolCalls: assembledToolCalls())))
+                                                       toolCalls: assembledToolCalls(),
+                                                       interrupted: !cancelled)))
             } else {
                 finish(.failure(error))
             }
@@ -539,6 +547,8 @@ final class OpenRouterClient {
     @discardableResult
     func sendStreamingMessages(messages: [[String: Any]], tools: [[String: Any]]?, model: String,
                                scope: AIRequestScope = .assistant,
+                               firstByteTimeout: Double = 60,
+                               totalTimeout: Double = 300,
                                onPart: @escaping (OpenRouterStreamPart) -> Void,
                                completion: @escaping (Result<OpenRouterStreamResult, Error>) -> Void) -> Bool {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -549,7 +559,7 @@ final class OpenRouterClient {
 
         var request = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
+        request.timeoutInterval = totalTimeout
         request = applyCommonHeaders(to: request, acceptSSE: true)
 
         var body: [String: Any] = [
@@ -581,7 +591,7 @@ final class OpenRouterClient {
         let task = session.dataTask(with: request)
         delegate.task = task
         task.resume()
-        delegate.startWatchdog()
+        delegate.startWatchdog(seconds: firstByteTimeout)
         return true
     }
 
