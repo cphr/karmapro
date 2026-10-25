@@ -1238,6 +1238,8 @@ final class AISecurityScanner {
             guard !credited.contains(index) else { continue }   // that row already names the AI
             credited.insert(index)
             rows[index].scanningSource = engineLabel(rows[index].scanningSource, f.scanningSource)
+            // Prefer the AI's wording for the shared row; the built-in taint path stays.
+            if !f.message.isEmpty { rows[index].message = f.message }
         }
         return rows + aiOnly
     }
