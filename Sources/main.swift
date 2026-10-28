@@ -50,6 +50,19 @@ final class HelpMenuTarget: NSObject {
 
 let helpTarget = HelpMenuTarget()
 
+final class FindMenuTarget: NSObject {
+    /// ⌘F opens the find bar of the main window's source viewer. Ignored while
+    /// another window (scan, AI, help…) is key, so it never acts in the background.
+    @objc func findInFile(_ sender: Any?) {
+        guard let delegate = NSApp.delegate as? AppDelegate,
+              let windowController = delegate.mainWindowController,
+              NSApp.keyWindow === windowController.window else { return }
+        windowController.showFindInFile()
+    }
+}
+
+let findTarget = FindMenuTarget()
+
 final class LicensingMenuTarget: NSObject {
     private var licensingController: LicensingWindowController?
 
@@ -135,6 +148,12 @@ func makeMainMenu() -> NSMenu {
     editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
     editMenu.addItem(NSMenuItem(title: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: ""))
     editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+    editMenu.addItem(NSMenuItem.separator())
+    let findItem = NSMenuItem(title: "Find in File…",
+                              action: #selector(FindMenuTarget.findInFile(_:)),
+                              keyEquivalent: "f")
+    findItem.target = findTarget
+    editMenu.addItem(findItem)
     editMenuItem.submenu = editMenu
 
     let licensingMenuItem = NSMenuItem()

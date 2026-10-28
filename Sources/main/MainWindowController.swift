@@ -1397,6 +1397,11 @@ extension MainWindowController: NSToolbarDelegate {
     }
 
     @objc private func findInFileClicked() {
+        showFindInFile()
+    }
+
+    /// Shows the find-in-file bar in the source viewer (toolbar button and ⌘F).
+    @objc func showFindInFile() {
         sourceViewer?.activateFind()
     }
 
