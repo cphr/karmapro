@@ -33,7 +33,8 @@ public final class FileNode {
 
         nodes.sort { a, b in
             if a.isDirectory != b.isDirectory { return a.isDirectory }
-            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            // Numeric-aware, like Finder: "100" after "99", not after "10".
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
         }
         children = nodes
     }
