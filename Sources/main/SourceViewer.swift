@@ -287,7 +287,9 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
             searchBar.leadingAnchor.constraint(equalTo: topContainer.leadingAnchor, constant: 12),
             matchCountLabel.centerYAnchor.constraint(equalTo: searchBar.centerYAnchor),
             matchCountLabel.leadingAnchor.constraint(equalTo: searchBar.trailingAnchor, constant: 10),
-            matchCountLabel.trailingAnchor.constraint(lessThanOrEqualTo: topContainer.trailingAnchor, constant: -12),
+            // Equality, so the field's width is determined instead of left to the
+            // solver - it stretched while there was room and collapsed when narrow.
+            matchCountLabel.trailingAnchor.constraint(equalTo: topContainer.trailingAnchor, constant: -12),
             scrollView.bottomAnchor.constraint(equalTo: topContainer.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: topContainer.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: topContainer.trailingAnchor)
@@ -296,6 +298,11 @@ final class SourceViewer: NSViewController, NSTextViewDelegate, NSSearchFieldDel
         let top = scrollView.topAnchor.constraint(equalTo: topContainer.topAnchor)
         top.isActive = true
         scrollTopConstraint = top
+
+        // Breakable floor: a narrow pane shrinks the match label, never the field.
+        let minFindWidth = searchBar.widthAnchor.constraint(greaterThanOrEqualToConstant: 240)
+        minFindWidth.priority = .defaultHigh
+        minFindWidth.isActive = true
 
         // --- Bottom: dataflow pane ---
         let bottom = NSView()
