@@ -160,7 +160,7 @@ SOURCES=(
   Sources/pr/PRReportWindowController.swift
   Sources/pr/AccountsWindowController.swift
   Sources/pr/MonitoredReposWindowController.swift
-)
+  ) 
 
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
