@@ -164,9 +164,11 @@ final class AISecurityScanner {
                       progress: @escaping (Double) -> Void,
                       isCancelled: @escaping () -> Bool,
                       completion: @escaping (AIRunResult) -> Void,
-                      onPhase: @escaping (AIReviewPhase) -> Void = { _ in }) {
+                      onPhase: @escaping (AIReviewPhase) -> Void = { _ in },
+                      modelOverride: String? = nil) {
         let client = OpenRouterClient.shared
-        let model = client.selectedModel
+        let override = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let model = override.isEmpty ? client.selectedModel : override
         let provider = client.provider.name
 
         let files = enumerateSourceFiles(in: projectRoot)

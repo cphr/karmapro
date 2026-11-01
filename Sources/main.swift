@@ -35,6 +35,20 @@ final class AboutMenuItemTarget: NSObject {
 
 let aboutTarget = AboutMenuItemTarget()
 
+final class SettingsMenuTarget: NSObject {
+    private var controller: MCPSettingsWindowController?
+
+    @objc func showSettings(_ sender: Any?) {
+        let controller = self.controller ?? MCPSettingsWindowController()
+        self.controller = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+let settingsTarget = SettingsMenuTarget()
+
 final class HelpMenuTarget: NSObject {
     private var helpController: HelpWindowController?
 
@@ -119,6 +133,12 @@ func makeMainMenu() -> NSMenu {
                                 keyEquivalent: "")
     aboutItem.target = aboutTarget
     appMenu.addItem(aboutItem)
+
+    let settingsItem = NSMenuItem(title: "Settings…",
+                                  action: #selector(SettingsMenuTarget.showSettings(_:)),
+                                  keyEquivalent: ",")
+    settingsItem.target = settingsTarget
+    appMenu.addItem(settingsItem)
 
     // Update support. The check item disables itself while a request is in
     // flight so a double-click cannot start two; the automatic item is a

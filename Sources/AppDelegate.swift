@@ -30,6 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // opted in, so a fresh install contacts GitHub for nothing.
         updateTarget.install()
 
+        // The MCP service is opt-in, so only a saved preference starts it.
+        if MCPService.shared.autoStart {
+            try? MCPService.shared.start()
+        }
+
         // Show the "Karma Pro" splash for 3 seconds before revealing the main window.
         let splash = SplashWindowController()
         splashController = splash
@@ -76,6 +81,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let openStatuses: Set<String> = ["Open", "In Progress"]
         let openBugs = BugStore.shared.allBugs().filter { openStatuses.contains($0.status) }.count
         NSApp.dockTile.badgeLabel = openBugs > 0 ? "\(openBugs)" : ""
+    }
+
+    /// Closing the app must not leave the listener or its SSE connections open.
+    func applicationWillTerminate(_ notification: Notification) {
+        MCPService.shared.stop()
     }
 
     func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool {

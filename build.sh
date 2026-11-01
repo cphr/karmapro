@@ -124,6 +124,12 @@ SOURCES=(
   Sources/tools/WikiEditorWindowController.swift
   Sources/tools/WikiWindowController.swift
   Sources/tools/PackageDetector.swift
+  Sources/mcp/MCPMessage.swift
+  Sources/mcp/MCPHTTPServer.swift
+  Sources/mcp/MCPTools.swift
+  Sources/mcp/ScanJobs.swift
+  Sources/mcp/MCPService.swift
+  Sources/main/MCPSettingsWindowController.swift
   Sources/tools/PackageLockParsers.swift
   Sources/tools/PackageManifestParsers.swift
   Sources/tools/OSVClient.swift
