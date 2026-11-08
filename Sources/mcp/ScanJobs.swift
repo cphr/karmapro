@@ -52,6 +52,8 @@ final class ScanJob {
     let path: String
     let engine: ScanEngine
     let model: String?
+    /// Forces the AI pass to ignore cached batches, like the Rescan button.
+    let ignoreCache: Bool
     let createdAt = Date()
 
     fileprivate var status: Status = .queued
@@ -63,11 +65,12 @@ final class ScanJob {
     fileprivate var finishedAt: Date?
     fileprivate var cancelRequested = false
 
-    init(id: String, path: String, engine: ScanEngine, model: String?) {
+    init(id: String, path: String, engine: ScanEngine, model: String?, ignoreCache: Bool) {
         self.id = id
         self.path = path
         self.engine = engine
         self.model = model
+        self.ignoreCache = ignoreCache
     }
 
     var isFinished: Bool { status == .completed || status == .failed || status == .cancelled }
@@ -89,6 +92,7 @@ final class ScanJob {
             "created_at": ISO8601DateFormatter().string(from: createdAt)
         ]
         if let model { out["model"] = model }
+        if ignoreCache { out["rescan"] = true }
         if let summary { out["summary"] = summary.json }
         if let error { out["error"] = error }
         if let sarif {
@@ -120,8 +124,9 @@ final class ScanJobRunner {
 
     // MARK: - Submission
 
-    func submit(path: String, engine: ScanEngine, model: String?) -> ScanJob {
-        let job = ScanJob(id: Self.makeID(), path: path, engine: engine, model: model)
+    func submit(path: String, engine: ScanEngine, model: String?, ignoreCache: Bool = false) -> ScanJob {
+        let job = ScanJob(id: Self.makeID(), path: path, engine: engine,
+                          model: model, ignoreCache: ignoreCache)
         // Synchronous so the job is queryable the moment this returns; no
         // callback here re-enters the runner.
         queue.sync {
@@ -269,7 +274,8 @@ final class ScanJobRunner {
                     $0.stage = phase == .thinking ? "AI thinking" : "AI answering"
                 }
             },
-            modelOverride: job.model)
+            modelOverride: job.model,
+            ignoreCache: job.ignoreCache)
     }
 
     private func finish(_ job: ScanJob, _ status: ScanJob.Status,

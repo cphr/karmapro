@@ -70,6 +70,7 @@ final class MCPTools {
             "instructions": """
                 Karma Pro scans a directory with its own analysis engines and returns SARIF 2.1.0.
                 Use scan_directory (path must be a directory, engine: static | ai | both).
+                AI scans reuse cached results for unchanged code; pass rescan: true to force a fresh pass.
                 AI scans can take minutes: the call returns a job_id, then poll get_scan.
                 """
         ]
@@ -129,11 +130,13 @@ final class MCPTools {
             return Self.failure("AI scans are turned off for MCP in Karma Pro's Settings.")
         }
         let model = (args["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rescan = args["rescan"] as? Bool ?? false
         let wait = min(max(args["wait_seconds"] as? Double ?? 10, 0), 120)
 
         let job = ScanJobRunner.shared.submit(path: path,
                                               engine: engine,
-                                              model: (model?.isEmpty ?? true) ? nil : model)
+                                              model: (model?.isEmpty ?? true) ? nil : model,
+                                              ignoreCache: rescan)
         onScanSubmitted?(job, session, progressToken)
         if wait > 0 { waitForCompletion(job.id, seconds: wait) }
 
@@ -314,6 +317,7 @@ final class MCPTools {
             "title": "Scan a directory",
             "description": "Scans every source file under a directory and returns SARIF 2.1.0. "
                 + "engine: static (AST/heuristic, fast), ai (configured AI model), both (static then merged with AI). "
+                + "Set rescan to bypass cached AI results. "
                 + "AI scans usually need polling: use get_scan with the returned job_id.",
             "inputSchema": [
                 "type": "object",
@@ -328,6 +332,11 @@ final class MCPTools {
                     "model": [
                         "type": "string",
                         "description": "Optional model id for AI scans; defaults to the model selected in Karma Pro."
+                    ],
+                    "rescan": [
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Ignore cached AI results for unchanged code and re-ask the model, like the Rescan button."
                     ],
                     "wait_seconds": [
                         "type": "number",

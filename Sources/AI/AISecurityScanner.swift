@@ -158,6 +158,7 @@ final class AISecurityScanner {
     /// Runs the AI discovery pass over `projectRoot` using the model currently
     /// selected in the AI Assistant window. Findings already produced by the
     /// built-in scanner (`existingFindings`) are used to suppress duplicates.
+    /// `ignoreCache` forces every batch to the model, for Rescan.
     /// Completion fires on a background queue.
     static func runAI(projectRoot: URL,
                       existingFindings: [ScanFinding],
@@ -165,7 +166,8 @@ final class AISecurityScanner {
                       isCancelled: @escaping () -> Bool,
                       completion: @escaping (AIRunResult) -> Void,
                       onPhase: @escaping (AIReviewPhase) -> Void = { _ in },
-                      modelOverride: String? = nil) {
+                      modelOverride: String? = nil,
+                      ignoreCache: Bool = false) {
         let client = OpenRouterClient.shared
         let override = modelOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let model = override.isEmpty ? client.selectedModel : override
@@ -257,6 +259,7 @@ final class AISecurityScanner {
                                        isCancelled: isCancelled,
                                        onPhase: onPhase,
                                        finish: finish,
+                                       ignoreCache: ignoreCache,
                                        maxConcurrent: client.provider.maxConcurrentRequests)
         scheduler.start()
     }
@@ -279,6 +282,7 @@ final class AISecurityScanner {
         private let onPhase: (AIReviewPhase) -> Void
         private let finish: (Bool) -> Void
         private let maxConcurrent: Int
+        private let ignoreCache: Bool
 
         private let queue = DispatchQueue(label: "app.karmapro.ai.security-scan")
         private var nextIndex = 0
@@ -290,7 +294,7 @@ final class AISecurityScanner {
         init(batches: [[Card]], cardRanges: [CardRange], model: String, provider: String,
              state: BatchState, totalCards: Int, progress: @escaping (Double) -> Void,
              isCancelled: @escaping () -> Bool, onPhase: @escaping (AIReviewPhase) -> Void,
-             finish: @escaping (Bool) -> Void, maxConcurrent: Int) {
+             finish: @escaping (Bool) -> Void, ignoreCache: Bool, maxConcurrent: Int) {
             self.batches = batches
             self.cardRanges = cardRanges
             self.model = model
@@ -301,6 +305,7 @@ final class AISecurityScanner {
             self.isCancelled = isCancelled
             self.onPhase = onPhase
             self.finish = finish
+            self.ignoreCache = ignoreCache
             self.maxConcurrent = max(1, min(maxConcurrent, max(batches.count, 1)))
         }
 
@@ -359,8 +364,10 @@ final class AISecurityScanner {
         private func runBatch(_ index: Int) {
             let batch = batches[index]
 
-            // Honour the on-disk cache first so unchanged code is not billed twice.
-            if let cached = AISecurityScanner.loadCachedFindings(for: batch, provider: provider, model: model) {
+            // Honour the on-disk cache first so unchanged code is not billed twice,
+            // unless the caller asked for a fresh pass.
+            if !ignoreCache,
+               let cached = AISecurityScanner.loadCachedFindings(for: batch, provider: provider, model: model) {
                 var collected: [ScanFinding] = []
                 AISecurityScanner.appendValidated(findings: &collected, from: cached,
                                                   batch: batch, cardRanges: cardRanges)
@@ -423,6 +430,11 @@ final class AISecurityScanner {
                                 self.recordError("\(batchLabel): \(ambiguousCount) finding(s) named a file that exists in several directories and could not be told apart - attached to the closest match.")
                             }
                             self.state.addFindings(collected)
+                        } else {
+                            // A clean answer must not leave an older cached result
+                            // behind for the next cached scan to serve.
+                            AISecurityScanner.removeCachedFindings(for: batch,
+                                                                   provider: self.provider, model: self.model)
                         }
                         self.state.completedBatch(batch.count)
                         self.progress(Double(self.state.processedCards) / Double(self.totalCards))
@@ -1316,6 +1328,13 @@ final class AISecurityScanner {
         let payload = ["cards": batch.map(\.digest), "findings": entries] as [String: Any]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         try? data.write(to: url, options: .atomic)
+    }
+
+    /// Drops a batch's entry when a fresh answer found nothing, so a stale
+    /// result cannot be served by a later cached scan.
+    private static func removeCachedFindings(for batch: [Card], provider: String, model: String) {
+        guard let url = cacheFileURL(batch: batch, provider: provider, model: model) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// Returns the cached, validated findings for a batch, or nil when there is

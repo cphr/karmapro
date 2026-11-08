@@ -385,7 +385,10 @@ final class ScanWindowController: NSWindowController {
     /// Reviews a pull request instead of a plain folder: scans both the PR and its
     /// base, then shows every finding with an "In PR?" column so the user can
     /// see at a glance which problems this change is responsible for.
-    func loadPullRequestReview(_ session: PRReviewSession, wantsAI: Bool, wantsAIBase: Bool = false) {
+    func loadPullRequestReview(_ session: PRReviewSession,
+                               wantsAI: Bool,
+                               wantsAIBase: Bool = false,
+                               ignoreAICache: Bool = false) {
         cancelAutoTriage()
         prSession = session
         self.wantsAI = wantsAI
@@ -402,7 +405,8 @@ final class ScanWindowController: NSWindowController {
         progressBar.isHidden = false
         progressBar.startAnimation(nil)
 
-        session.scan(wantsAI: wantsAI, wantsAIBase: wantsAIBase, progress: { [weak self] message in
+        session.scan(wantsAI: wantsAI, wantsAIBase: wantsAIBase, ignoreAICache: ignoreAICache,
+                     progress: { [weak self] message in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.statusLabel.stringValue = message
@@ -432,7 +436,7 @@ final class ScanWindowController: NSWindowController {
 
     private func rescanPullRequest(session: PRReviewSession) {
         session.cancelScan()
-        loadPullRequestReview(session, wantsAI: wantsAI)
+        loadPullRequestReview(session, wantsAI: wantsAI, ignoreAICache: true)
     }
 
     private func showPRColumn(_ visible: Bool) {
@@ -594,7 +598,9 @@ final class ScanWindowController: NSWindowController {
             return
         }
         guard let folder = scannedFolder else { return }
-        performScan(folder: folder)
+        // A rescan answers the same question again, so the AI pass must not be
+        // served cached batch results.
+        performScan(folder: folder, ignoreAICache: true)
     }
 
     // MARK: - Triage (AI)
@@ -786,7 +792,7 @@ final class ScanWindowController: NSWindowController {
     /// shared cache, and shows results on the main thread. If the window is
     /// closed while the scan is running, the scan is cancelled and the results
     /// are discarded.
-    private func performScan(folder: URL) {
+    private func performScan(folder: URL, ignoreAICache: Bool = false) {
         // A fresh scan supersedes any triage pass over the previous rows.
         cancelAutoTriage()
         resetTriage()
@@ -831,7 +837,7 @@ final class ScanWindowController: NSWindowController {
                     self.rescanButton.isEnabled = true
                     return
                 }
-                self.runAIPhase(folder: folder, heuristic: result)
+                self.runAIPhase(folder: folder, heuristic: result, ignoreCache: ignoreAICache)
             }
         }
     }
@@ -840,7 +846,7 @@ final class ScanWindowController: NSWindowController {
     /// over the remaining 60% of the bar and merging any additional findings.
     /// The user already authorised token consumption at the Security Scanner
     /// button; the API-key check below is the only gate.
-    private func runAIPhase(folder: URL, heuristic: [ScanFinding]) {
+    private func runAIPhase(folder: URL, heuristic: [ScanFinding], ignoreCache: Bool = false) {
         let client = OpenRouterClient.shared
         let providerName = client.provider.name
 
@@ -908,7 +914,8 @@ final class ScanWindowController: NSWindowController {
                     guard let self = self, self.aiPhaseActive, !self.scanCancelled else { return }
                     self.setAIThinking(phase == .thinking)
                 }
-            })
+            },
+            ignoreCache: ignoreCache)
         }
     }
 

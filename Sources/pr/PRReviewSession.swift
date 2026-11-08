@@ -58,6 +58,7 @@ final class PRReviewSession {
     ///   inherited code examined by the same detector that judged the new code.
     func scan(wantsAI: Bool,
               wantsAIBase: Bool = false,
+              ignoreAICache: Bool = false,
               progress: @escaping (String) -> Void,
               completion: @escaping (Bool) -> Void) {
         scanCancelled = false
@@ -71,11 +72,13 @@ final class PRReviewSession {
             // inherited-code comparison runs against real files rather than a
             // diff-only guess.
             progress("Comparing against \(self.checkout.baseRefShort)…")
-            let baseFindings = self.scanBase(wantsAI: wantsAIBase, progress: progress)
+            let baseFindings = self.scanBase(wantsAI: wantsAIBase, ignoreAICache: ignoreAICache,
+                                             progress: progress)
             if self.scanCancelled { completion(false); return }
 
             progress("Scanning the pull request…")
-            let headFindings = self.scanHead(wantsAI: wantsAI, progress: progress)
+            let headFindings = self.scanHead(wantsAI: wantsAI, ignoreAICache: ignoreAICache,
+                                             progress: progress)
             if self.scanCancelled { completion(false); return }
 
             // Base findings are re-pointed at the head workspace before they are
@@ -111,7 +114,7 @@ final class PRReviewSession {
     // MARK: - Scanning
 
     /// Scans the PR head: local detectors, then the AI pass if requested.
-    private func scanHead(wantsAI: Bool, progress: (String) -> Void) -> [ScanFinding] {
+    private func scanHead(wantsAI: Bool, ignoreAICache: Bool, progress: (String) -> Void) -> [ScanFinding] {
         let headRoot = checkout.workspace
         let heuristic = VulnerabilityScanner.scan(projectRoot: headRoot,
                                                   isCancelled: { self.scanCancelled })
@@ -119,7 +122,8 @@ final class PRReviewSession {
         return aiPass(projectRoot: headRoot,
                       existing: heuristic,
                       label: "the pull request",
-                      progress: progress)
+                      progress: progress,
+                      ignoreCache: ignoreAICache)
     }
 
     /// The AI pass for one side of the comparison.
@@ -131,7 +135,8 @@ final class PRReviewSession {
     private func aiPass(projectRoot: URL,
                         existing: [ScanFinding],
                         label: String,
-                        progress: (String) -> Void) -> [ScanFinding] {
+                        progress: (String) -> Void,
+                        ignoreCache: Bool = false) -> [ScanFinding] {
         progress("AI pass on \(label)…")
         let semaphore = DispatchSemaphore(value: 0)
         var findings: [ScanFinding] = existing
@@ -145,7 +150,8 @@ final class PRReviewSession {
             findings = result.findings
             semaphore.signal()
         },
-                                onPhase: { _ in })
+                                onPhase: { _ in },
+                                ignoreCache: ignoreCache)
         while semaphore.wait(timeout: .now() + 0.05) == .timedOut {
             if scanCancelled { return existing }
         }
@@ -201,7 +207,7 @@ final class PRReviewSession {
     /// With `wantsAI` the base is also handed to the AI scanner, so inherited
     /// code is judged by the same detector that judged the new code. That costs
     /// a second AI pass.
-    private func scanBase(wantsAI: Bool, progress: (String) -> Void) -> [ScanFinding] {
+    private func scanBase(wantsAI: Bool, ignoreAICache: Bool, progress: (String) -> Void) -> [ScanFinding] {
         // The same value `baseRoot` reports, so the rebase that runs afterwards
         // cannot drift from the directory that was actually scanned.
         let scratch = baseRoot
@@ -233,7 +239,8 @@ final class PRReviewSession {
         return aiPass(projectRoot: scratch,
                       existing: heuristic,
                       label: "the base commit",
-                      progress: progress)
+                      progress: progress,
+                      ignoreCache: ignoreAICache)
     }
 
     /// Removes the checkout. Called when the user closes the review.
